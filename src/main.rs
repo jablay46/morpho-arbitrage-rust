@@ -50,21 +50,39 @@ impl VenueCache {
         let mut v3_idx = Vec::new();
         let mut v3_pools = Vec::new();
         for (idx, venue) in cfg.venues.iter().enumerate() {
+            // Auto-resolve the pool from the venue's factory when the
+            // config says "auto" (pair = Address::ZERO).
+            let pool = if venue.pair == Address::ZERO {
+                let pool = morpho_arbitrage_bot::dex::resolve_pool(
+                    provider,
+                    venue.kind,
+                    venue.factory,
+                    venue.router,
+                    cfg.loan_token,
+                    cfg.quote_token,
+                    venue.stable,
+                    venue.fee_tier,
+                )
+                .await?;
+                info!(venue = idx, pool = %pool, kind = ?venue.kind, "pool auto-resolved");
+                pool
+            } else {
+                venue.pair
+            };
             let tokens = if venue.kind == VenueKind::UniswapV3 {
                 v3_idx.push(idx);
-                v3_pools.push(venue.pair);
-                fetch_v3_pair_tokens(provider, venue.pair).await?
+                v3_pools.push(pool);
+                fetch_v3_pair_tokens(provider, pool).await?
             } else {
                 v2_idx.push(idx);
-                v2_pairs.push(venue.pair);
-                fetch_pair_tokens(provider, venue.pair).await?
+                v2_pairs.push(pool);
+                fetch_pair_tokens(provider, pool).await?
             };
             // Fail fast on misconfigured venues: the loan token must be in
             // the pair, otherwise orientation would error on every scan.
             if cfg.loan_token != tokens.token0 && cfg.loan_token != tokens.token1 {
                 eyre::bail!(
-                    "venue {idx} pair {} does not contain loan token {}",
-                    venue.pair,
+                    "venue {idx} pool {pool} does not contain loan token {}",
                     cfg.loan_token
                 );
             }

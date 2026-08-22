@@ -19,12 +19,15 @@ pub enum VenueKind {
 
 /// One tradable venue: a pool plus its swap router and fee model.
 pub struct Venue {
+    /// Pool/pair address, or Address::ZERO to auto-resolve from the factory
+    /// at startup (requires `factory`).
     pub pair: Address,
     pub router: Address,
     pub kind: VenueKind,
     /// Pool fee in basis points charged on the input amount (30 = 0.3%).
     pub fee_bps: u64,
-    /// Aerodrome pool factory (Address::ZERO = router default). Unused for V2/V3/V4.
+    /// Pool factory. Required when `pair` is zero (auto-resolve);
+    /// Address::ZERO for Aerodrome means the router's default factory.
     pub factory: Address,
     /// Aerodrome stable-pool flag. Unused for V2/V3/V4.
     pub stable: bool,
@@ -192,9 +195,20 @@ impl Config {
                 if parts.next().is_some() {
                     return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
                 }
+                // "auto" = resolve the pool from the factory at startup.
+                let pair = if pair.trim().eq_ignore_ascii_case("auto") {
+                    if factory == Address::ZERO && kind != VenueKind::Aerodrome {
+                        return Err(eyre!(
+                            "DEX_VENUES '{entry}': 'auto' pool requires a factory address"
+                        ));
+                    }
+                    Address::ZERO
+                } else {
+                    Address::from_str(pair.trim())
+                        .map_err(|e| eyre!("invalid pair in DEX_VENUES '{entry}': {e}"))?
+                };
                 Ok::<_, eyre::Report>(Venue {
-                    pair: Address::from_str(pair.trim())
-                        .map_err(|e| eyre!("invalid pair in DEX_VENUES '{entry}': {e}"))?,
+                    pair,
                     router: Address::from_str(router.trim())
                         .map_err(|e| eyre!("invalid router in DEX_VENUES '{entry}': {e}"))?,
                     kind,

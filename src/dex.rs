@@ -28,6 +28,26 @@ sol! {
         function token1() external view returns (address);
     }
 
+    #[sol(rpc)]
+    interface IUniswapV2Factory {
+        function getPair(address tokenA, address tokenB) external view returns (address pair);
+    }
+
+    #[sol(rpc)]
+    interface IAerodromeFactory {
+        function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
+    }
+
+    #[sol(rpc)]
+    interface IUniswapV3Factory {
+        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+    }
+
+    // Aerodrome router can resolve its default factory.
+    #[sol(rpc)]
+    interface IAerodromeRouter {
+        function defaultFactory() external view returns (address);
+    }
 }
 
 /// Reserves of a V2-style pool, normalized so `reserve_in` always corresponds
@@ -52,6 +72,63 @@ pub async fn fetch_pair_tokens<P: Provider>(provider: &P, pair: Address) -> Resu
     let token0 = pool.token0().call().await?;
     let token1 = pool.token1().call().await?;
     Ok(PairTokens { token0, token1 })
+}
+
+/// Resolve the pool address for a token pair from a venue's factory.
+/// `venue` must describe the DEX; `factory` of zero for Aerodrome means the
+/// router's default factory (resolved on-chain).
+pub async fn resolve_pool<P: Provider>(
+    provider: &P,
+    kind: crate::config::VenueKind,
+    factory: Address,
+    router: Address,
+    token_a: Address,
+    token_b: Address,
+    stable: bool,
+    fee_tier: u32,
+) -> Result<Address> {
+    use crate::config::VenueKind;
+    let pool = match kind {
+        VenueKind::UniswapV2 => {
+            IUniswapV2Factory::new(factory, provider)
+                .getPair(token_a, token_b)
+                .call()
+                .await?
+        }
+        VenueKind::Aerodrome => {
+            let factory = if factory == Address::ZERO {
+                IAerodromeRouter::new(router, provider)
+                    .defaultFactory()
+                    .call()
+                    .await?
+            } else {
+                factory
+            };
+            IAerodromeFactory::new(factory, provider)
+                .getPool(token_a, token_b, stable)
+                .call()
+                .await?
+        }
+        VenueKind::UniswapV3 => {
+            IUniswapV3Factory::new(factory, provider)
+                .getPool(
+                    token_a,
+                    token_b,
+                    alloy::primitives::Uint::<24, 1>::from(fee_tier),
+                )
+                .call()
+                .await?
+        }
+        VenueKind::UniswapV4 => {
+            return Err(eyre::eyre!("V4 pool auto-resolution is not supported"));
+        }
+    };
+    if pool == Address::ZERO {
+        return Err(eyre::eyre!(
+            "factory {factory} has no pool for {token_a}/{token_b}"
+        ));
+    }
+    Ok(pool)
 }
 
 /// Orient raw reserves relative to `token_in` using cached pair tokens.
