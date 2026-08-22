@@ -19,6 +19,8 @@ pub struct Opportunity {
     /// Venue index where the quote token is swapped back to the loan token.
     pub second: usize,
     pub loan_amount: U256,
+    /// Simulated quote-token output of leg 1; used to bound leg 1 slippage.
+    pub quote_out: U256,
     /// Loan-token amount returned after both swaps, before any fees.
     pub amount_out: U256,
     /// `amount_out - loan_amount` (Morpho Blue flash loans are fee-free).
@@ -66,6 +68,7 @@ pub fn find_opportunity(
                 first: first.venue,
                 second: second.venue,
                 loan_amount,
+                quote_out,
                 amount_out,
                 profit,
             };

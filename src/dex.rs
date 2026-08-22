@@ -43,7 +43,9 @@ pub fn get_amount_out(
     Some(numerator / denominator)
 }
 
-/// Fetch live reserves for `pair`, oriented relative to `token_in`.
+/// Fetch live reserves for `pair`, oriented relative to `token_in`. Fails if
+/// `token_in` is not one of the pool's two tokens, instead of silently
+/// assuming the orientation.
 pub async fn fetch_reserves<P: Provider>(
     provider: &P,
     pair: Address,
@@ -52,12 +54,21 @@ pub async fn fetch_reserves<P: Provider>(
     let pool = IUniswapV2Pair::new(pair, provider);
     let reserves = pool.getReserves().call().await?;
     let token0 = pool.token0().call().await?;
+    let token1 = pool.token1().call().await?;
 
     let (r0, r1) = (
         U256::from(reserves.reserve0),
         U256::from(reserves.reserve1),
     );
-    let (reserve_in, reserve_out) = if token0 == token_in { (r0, r1) } else { (r1, r0) };
+    let (reserve_in, reserve_out) = if token_in == token0 {
+        (r0, r1)
+    } else if token_in == token1 {
+        (r1, r0)
+    } else {
+        return Err(eyre::eyre!(
+            "pair {pair} does not contain token {token_in} (token0={token0}, token1={token1})"
+        ));
+    };
     Ok(PoolReserves {
         reserve_in,
         reserve_out,

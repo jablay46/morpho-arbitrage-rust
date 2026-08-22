@@ -31,6 +31,10 @@ Contract mendukung dua keluarga router lewat `SwapLeg.kind`:
   Pancakeswap V2.
 - `1` = Aerodrome-style (`Route[]{from,to,stable,factory}`).
 
+Setiap leg membawa `minOut` (dihitung dari simulasi dikali
+`1 - SLIPPAGE_BPS`) untuk membatasi slippage dan mempersulit sandwich;
+cek `minProfit` di akhir tetap menjadi backstop.
+
 Catatan: pool Aerodrome **stable** memakai kurva x^3y+y^3x, bukan constant
 product; simulasi off-chain bot ini hanya akurat untuk pool volatile (vAMM).
 
