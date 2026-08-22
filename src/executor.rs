@@ -14,6 +14,8 @@ sol! {
         address factory;
         bool stable;
         uint256 minOut;
+        uint24 feeTier;
+        bytes32 poolId;
     }
 
     struct ArbParams {
@@ -39,6 +41,8 @@ fn build_leg(venue: &Venue, min_out: U256) -> SwapLeg {
         factory: venue.factory,
         stable: venue.stable,
         minOut: min_out,
+        feeTier: alloy::primitives::Uint::<24, 1>::from(venue.fee_tier),
+        poolId: alloy::primitives::FixedBytes(venue.pool_id),
     }
 }
 
@@ -84,6 +88,18 @@ pub async fn simulate<P: Provider>(
     Ok(())
 }
 
+/// Estimate gas for `execute` via eth_estimateGas.
+pub async fn estimate_gas<P: Provider>(
+    provider: &P,
+    contract: Address,
+    params: ArbParams,
+) -> Result<U256> {
+    let arb = IFlashArbitrage::new(contract, provider);
+    let owner = arb.owner().call().await?;
+    let gas = arb.execute(params).from(owner).estimate_gas().await?;
+    Ok(U256::from(gas))
+}
+
 /// Broadcast `execute` and wait for the receipt.
 pub async fn execute(
     rpc_url: &str,
@@ -112,7 +128,7 @@ mod tests {
     // ABI encoder (`cast calldata`), covering both SwapLeg kinds. Regression
     // guard: the alloy `sol!` binding must decode and re-encode it identically.
     const CANONICAL_CALLDATA: &str = concat!(
-        "f2121286",
+        "c0b54622",
         "0000000000000000000000001111111111111111111111111111111111111111",
         "0000000000000000000000002222222222222222222222222222222222222222",
         "0000000000000000000000000000000000000000000000000de0b6b3a7640000",
@@ -121,11 +137,15 @@ mod tests {
         "0000000000000000000000000000000000000000000000000000000000000000",
         "0000000000000000000000000000000000000000000000000000000000000000",
         "0000000000000000000000000000000000000000000000000000000000000384",
+        "0000000000000000000000000000000000000000000000000000000000000bb8",
+        "0000000000000000000000000000000000000000000000000000000000000000",
         "0000000000000000000000004444444444444444444444444444444444444444",
         "0000000000000000000000000000000000000000000000000000000000000001",
         "0000000000000000000000005555555555555555555555555555555555555555",
         "0000000000000000000000000000000000000000000000000000000000000001",
         "00000000000000000000000000000000000000000000000000000000000003e9",
+        "0000000000000000000000000000000000000000000000000000000000000bb8",
+        "0000000000000000000000000000000000000000000000000000000000000000",
         "0000000000000000000000000000000000000000000000000000000000003039",
     );
 
@@ -174,9 +194,12 @@ mod tests {
             fee_bps: 30,
             factory: Address::ZERO,
             stable: false,
+            fee_tier: 3000,
+            pool_id: [0u8; 32],
         };
         let cfg = Config {
             rpc_url: String::new(),
+            wss_url: None,
             private_key: String::new(),
             morpho: Address::ZERO,
             arb_contract: Address::ZERO,
@@ -185,6 +208,7 @@ mod tests {
             venues: vec![venue(VenueKind::UniswapV2), venue(VenueKind::Aerodrome)],
             loan_amounts: vec![],
             min_profit: U256::ZERO,
+            gas_price_wei: None,
             slippage_bps: 50,
             poll_interval_ms: 0,
             dry_run: true,

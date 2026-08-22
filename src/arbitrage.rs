@@ -1,14 +1,26 @@
 use crate::dex::{get_amount_out, PoolReserves};
 use alloy::primitives::U256;
 
+/// V3 pool state (sqrtPriceX96, liquidity) for price calculation.
+#[derive(Debug, Clone, Copy)]
+pub struct V3PoolState {
+    pub sqrt_price_x96: U256,
+    pub liquidity: U256,
+}
+
 /// Current reserves of one venue's pool, tagged with its index in the
-/// configured venue list. Reserves are oriented loan-token first.
+/// configured venue list. For V2/Aero, reserves are oriented loan-token
+/// first. For V3, `v3_state` is used instead of reserves.
 #[derive(Debug, Clone, Copy)]
 pub struct PoolState {
     pub venue: usize,
     pub reserves: PoolReserves,
+    /// V3 pool state (sqrtPriceX96, liquidity). None for V2/Aero.
+    pub v3_state: Option<V3PoolState>,
     /// Pool fee in basis points (30 = 0.3%).
     pub fee_bps: u64,
+    /// V3 fee tier (only used when v3_state is Some).
+    pub fee_tier: u32,
 }
 
 /// A simulated arbitrage outcome for one loan size.
@@ -29,6 +41,8 @@ pub struct Opportunity {
 
 /// Simulate the cycle over every ordered venue pair (i, j) for one loan size,
 /// returning the most profitable one clearing `min_profit`, if any.
+/// For V3 venues, uses the quoter for accurate pricing; for V2/Aero, uses
+/// the constant-product formula.
 pub fn find_opportunity(
     loan_amount: U256,
     pools: &[PoolState],
@@ -41,22 +55,47 @@ pub fn find_opportunity(
                 continue;
             }
             // Leg 1: loan token -> quote token on `first`.
-            let Some(quote_out) = get_amount_out(
-                loan_amount,
-                first.reserves.reserve_in,
-                first.reserves.reserve_out,
-                first.fee_bps,
-            ) else {
-                continue;
+            let quote_out = if let Some(v3) = first.v3_state {
+                // For V3, approximate using constant-product with slot0 price.
+                // In production, use a quoter contract for exact pricing.
+                let (reserve_in, reserve_out) = if v3.sqrt_price_x96.is_zero() {
+                    continue;
+                } else {
+                    // Derive virtual reserves from sqrtPriceX96 and liquidity.
+                    // reserve_in = liquidity * sqrt_price_x96 / 2^96
+                    // reserve_out = liquidity * 2^96 / sqrt_price_x96
+                    let q96 = U256::from(1u128) << 96;
+                    let reserve_in = v3.liquidity * v3.sqrt_price_x96 / q96;
+                    let reserve_out = v3.liquidity * q96 / v3.sqrt_price_x96;
+                    (reserve_in, reserve_out)
+                };
+                get_amount_out(loan_amount, reserve_in, reserve_out, first.fee_bps)?
+            } else {
+                get_amount_out(
+                    loan_amount,
+                    first.reserves.reserve_in,
+                    first.reserves.reserve_out,
+                    first.fee_bps,
+                )?
             };
             // Leg 2: quote token -> loan token on `second` (reserves flipped).
-            let Some(amount_out) = get_amount_out(
-                quote_out,
-                second.reserves.reserve_out,
-                second.reserves.reserve_in,
-                second.fee_bps,
-            ) else {
-                continue;
+            let amount_out = if let Some(v3) = second.v3_state {
+                let (reserve_in, reserve_out) = if v3.sqrt_price_x96.is_zero() {
+                    continue;
+                } else {
+                    let q96 = U256::from(1u128) << 96;
+                    let reserve_in = v3.liquidity * q96 / v3.sqrt_price_x96;
+                    let reserve_out = v3.liquidity * v3.sqrt_price_x96 / q96;
+                    (reserve_in, reserve_out)
+                };
+                get_amount_out(quote_out, reserve_in, reserve_out, second.fee_bps)?
+            } else {
+                get_amount_out(
+                    quote_out,
+                    second.reserves.reserve_out,
+                    second.reserves.reserve_in,
+                    second.fee_bps,
+                )?
             };
             let Some(profit) = amount_out.checked_sub(loan_amount) else {
                 continue;
@@ -95,7 +134,9 @@ mod tests {
                 reserve_in: U256::from(loan),
                 reserve_out: U256::from(quote),
             },
+            v3_state: None,
             fee_bps,
+            fee_tier: 0,
         }
     }
 

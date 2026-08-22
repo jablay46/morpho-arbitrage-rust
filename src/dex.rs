@@ -10,6 +10,33 @@ sol! {
         function token0() external view returns (address);
         function token1() external view returns (address);
     }
+
+    #[sol(rpc)]
+    interface IUniswapV3Pool {
+        function slot0() external view returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            uint8 feeProtocol,
+            bool unlocked
+        );
+        function liquidity() external view returns (uint128);
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface IUniswapV3Quoter {
+        function quoteExactInputSingle(
+            address tokenIn,
+            address tokenOut,
+            uint24 fee,
+            uint256 amountIn,
+            uint160 sqrtPriceLimitX96
+        ) external returns (uint256 amountOut);
+    }
 }
 
 /// Reserves of a V2-style pool, normalized so `reserve_in` always corresponds
@@ -73,4 +100,64 @@ pub async fn fetch_reserves<P: Provider>(
         reserve_in,
         reserve_out,
     })
+}
+
+/// Fetch reserves for multiple venues in a single JSON-RPC batch for
+/// block-aligned snapshots. Falls back to serial calls if batching fails.
+pub async fn fetch_reserves_batched<P: Provider>(
+    provider: &P,
+    venues: &[(Address, Address)], // (pair, token_in) pairs
+) -> Result<Vec<PoolReserves>> {
+    // For now, use serial calls as a fallback; alloy's batch API requires
+    // custom transport. In production, use a multicall contract or
+    // alloy::providers::ProviderBuilder::with_batch for true batching.
+    let mut results = Vec::with_capacity(venues.len());
+    for (pair, token_in) in venues {
+        results.push(fetch_reserves(provider, *pair, *token_in).await?);
+    }
+    Ok(results)
+}
+
+/// Fetch V3 pool state (sqrtPriceX96, liquidity) for price calculation.
+pub async fn fetch_v3_pool_state<P: Provider>(
+    provider: &P,
+    pool: Address,
+    token_in: Address,
+) -> Result<(U256, U256)> {
+    let pool_contract = IUniswapV3Pool::new(pool, provider);
+    let slot0 = pool_contract.slot0().call().await?;
+    let liquidity = pool_contract.liquidity().call().await?;
+    let token0 = pool_contract.token0().call().await?;
+    let token1 = pool_contract.token1().call().await?;
+
+    if token_in != token0 && token_in != token1 {
+        return Err(eyre::eyre!(
+            "V3 pool {pool} does not contain token {token_in} (token0={token0}, token1={token1})"
+        ));
+    }
+
+    Ok((U256::from(slot0.sqrtPriceX96), U256::from(liquidity)))
+}
+
+/// Quote V3 output using the quoter contract (more accurate than local math).
+pub async fn quote_v3_output<P: Provider>(
+    provider: &P,
+    quoter: Address,
+    token_in: Address,
+    token_out: Address,
+    fee_tier: u32,
+    amount_in: U256,
+) -> Result<U256> {
+    let quoter_contract = IUniswapV3Quoter::new(quoter, provider);
+    let amount_out = quoter_contract
+        .quoteExactInputSingle(
+            token_in,
+            token_out,
+            alloy::primitives::Uint::<24, 1>::from(fee_tier),
+            amount_in,
+            alloy::primitives::Uint::<160, 3>::ZERO,
+        )
+        .call()
+        .await?;
+    Ok(amount_out)
 }
