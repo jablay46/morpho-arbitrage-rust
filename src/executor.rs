@@ -1,9 +1,7 @@
 use crate::arbitrage::Opportunity;
 use crate::config::{Config, Venue};
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, TxHash, U256};
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::providers::Provider;
 use alloy::sol;
 use eyre::Result;
 
@@ -52,7 +50,12 @@ fn with_slippage(expected: U256, slippage_bps: u64) -> U256 {
 }
 
 /// Resolve the chosen venue pair to its swap legs and build the calldata.
-pub fn build_params(cfg: &Config, opp: &Opportunity) -> ArbParams {
+/// `min_profit` is the on-chain backstop; callers should pass the
+/// gas-adjusted threshold (cfg.min_profit + gas cost in loan-token units)
+/// so the contract reverts trades that would be unprofitable after gas,
+/// instead of letting a gross-positive-but-net-negative trade broadcast
+/// and revert later (wasted gas).
+pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbParams {
     // Leg 2's input is leg 1's *actual* output, which may legitimately land
     // as low as legA.minOut (= quote_out * (1-s)). Leg 2's output then scales
     // down proportionally to ~amount_out * (1-s), so a single-slippage bound
@@ -69,7 +72,7 @@ pub fn build_params(cfg: &Config, opp: &Opportunity) -> ArbParams {
         amount: opp.loan_amount,
         legA: build_leg(&cfg.venues[opp.first], leg_a_min),
         legB: build_leg(&cfg.venues[opp.second], leg_b_min),
-        minProfit: cfg.min_profit,
+        minProfit: min_profit,
     }
 }
 
@@ -100,19 +103,16 @@ pub async fn estimate_gas<P: Provider>(
     Ok(U256::from(gas))
 }
 
-/// Broadcast `execute` and wait for the receipt.
-pub async fn execute(
-    rpc_url: &str,
-    private_key: &str,
+/// Broadcast `execute` and wait for the receipt. Reuses the caller's
+/// wallet-enabled provider instead of opening a fresh connection per
+/// trade (a dropped/misconfigured RPC_URL must not break broadcasting
+/// when the scan provider is healthy, and vice versa).
+pub async fn execute<P: Provider>(
+    provider: &P,
     contract: Address,
     params: ArbParams,
 ) -> Result<TxHash> {
-    let signer: PrivateKeySigner = private_key.parse()?;
-    let wallet = EthereumWallet::from(signer);
-    let provider = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(rpc_url.parse()?);
-    let arb = IFlashArbitrage::new(contract, &provider);
+    let arb = IFlashArbitrage::new(contract, provider);
     let pending = arb.execute(params).send().await?;
     let receipt = pending.get_receipt().await?;
     Ok(receipt.transaction_hash)
@@ -223,9 +223,10 @@ mod tests {
             profit: U256::from(100u64),
         };
 
-        let params = build_params(&cfg, &opp);
+        let params = build_params(&cfg, &opp, cfg.min_profit);
         // Leg A tolerates one slippage interval: 20000 * 0.995 = 19900.
         assert_eq!(params.legA.minOut, U256::from(19_900u64));
+        assert_eq!(params.minProfit, U256::ZERO);
         // Leg B tolerates two compounded intervals (its own input may have
         // drifted down by the leg-A tolerance): floor(10100 * 0.995^2).
         let expected_b = U256::from(10_100u64) * U256::from(9_950u64) / U256::from(10_000u64)
