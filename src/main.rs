@@ -1,9 +1,12 @@
 use alloy::primitives::{Address, U256};
 use clap::{Parser, Subcommand};
 use eyre::Result;
-use morpho_arbitrage_bot::arbitrage::{find_opportunity, PoolState};
+use morpho_arbitrage_bot::arbitrage::{find_opportunity, PoolState, V3PoolState};
 use morpho_arbitrage_bot::config::{Config, VenueKind};
-use morpho_arbitrage_bot::dex::{fetch_reserves, fetch_reserves_batched, fetch_v3_pool_state};
+use morpho_arbitrage_bot::dex::{
+    fetch_pair_tokens, fetch_scan_snapshot, fetch_v3_pair_tokens, orient_reserves, PairTokens,
+    PoolReserves,
+};
 use morpho_arbitrage_bot::executor;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -23,6 +26,62 @@ enum Command {
     Scan,
 }
 
+/// Immutable per-venue metadata resolved once at startup, so per-scan RPC
+/// traffic is only getReserves / slot0+liquidity / gasPrice (token0/token1
+/// and the contract owner never change).
+struct VenueCache {
+    /// (token0, token1) per venue, aligned with cfg.venues.
+    pair_tokens: Vec<PairTokens>,
+    /// V2/Aero venue indices and their pair addresses, for the snapshot batch.
+    v2_idx: Vec<usize>,
+    v2_pairs: Vec<Address>,
+    /// V3 venue indices and their pool addresses.
+    v3_idx: Vec<usize>,
+    v3_pools: Vec<Address>,
+    /// Contract owner, used as `from` in simulations/gas estimates.
+    owner: Address,
+}
+
+impl VenueCache {
+    async fn build<P: alloy::providers::Provider>(provider: &P, cfg: &Config) -> Result<Self> {
+        let mut pair_tokens = Vec::with_capacity(cfg.venues.len());
+        let mut v2_idx = Vec::new();
+        let mut v2_pairs = Vec::new();
+        let mut v3_idx = Vec::new();
+        let mut v3_pools = Vec::new();
+        for (idx, venue) in cfg.venues.iter().enumerate() {
+            let tokens = if venue.kind == VenueKind::UniswapV3 {
+                v3_idx.push(idx);
+                v3_pools.push(venue.pair);
+                fetch_v3_pair_tokens(provider, venue.pair).await?
+            } else {
+                v2_idx.push(idx);
+                v2_pairs.push(venue.pair);
+                fetch_pair_tokens(provider, venue.pair).await?
+            };
+            // Fail fast on misconfigured venues: the loan token must be in
+            // the pair, otherwise orientation would error on every scan.
+            if cfg.loan_token != tokens.token0 && cfg.loan_token != tokens.token1 {
+                eyre::bail!(
+                    "venue {idx} pair {} does not contain loan token {}",
+                    venue.pair,
+                    cfg.loan_token
+                );
+            }
+            pair_tokens.push(tokens);
+        }
+        let owner = executor::fetch_owner(provider, cfg.arb_contract).await?;
+        Ok(Self {
+            pair_tokens,
+            v2_idx,
+            v2_pairs,
+            v3_idx,
+            v3_pools,
+            owner,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -31,9 +90,20 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = Config::from_env()?;
+
+    // Broadcast provider with the signing wallet attached, built once and
+    // reused across scans (executor no longer opens a fresh connection per
+    // trade).
+    let broadcaster = build_broadcaster(&cfg)?;
+
+    // One-off startup resolution: pair tokens for orientation/validation and
+    // the contract owner for simulations. ~3 RPC calls per venue, once.
+    let cache = VenueCache::build(&broadcaster, &cfg).await?;
+
     info!(
         morpho = %cfg.morpho,
         arb_contract = %cfg.arb_contract,
+        owner = %cache.owner,
         loan_token = %cfg.loan_token,
         quote_token = %cfg.quote_token,
         venues = cfg.venues.len(),
@@ -41,21 +111,16 @@ async fn main() -> Result<()> {
         "bot configured"
     );
 
-    // Broadcast provider with the signing wallet attached, built once and
-    // reused across scans (executor no longer opens a fresh connection per
-    // trade).
-    let broadcaster = build_broadcaster(&cfg)?;
-
     match cli.command {
-        Command::Once => run_once(&cfg, &broadcaster).await?,
+        Command::Once => run_once(&cfg, &cache, &broadcaster).await?,
         Command::Scan => {
             if let Some(wss_url) = &cfg.wss_url {
                 info!(wss = %wss_url, "starting event-driven scanning via WebSocket");
-                run_event_driven(&cfg, wss_url, &broadcaster).await?;
+                run_event_driven(&cfg, &cache, wss_url, &broadcaster).await?;
             } else {
                 info!(poll_ms = cfg.poll_interval_ms, "starting polling-based scanning");
                 loop {
-                    if let Err(e) = run_once(&cfg, &broadcaster).await {
+                    if let Err(e) = run_once(&cfg, &cache, &broadcaster).await {
                         warn!(error = %e, "scan iteration failed");
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms)).await;
@@ -67,9 +132,7 @@ async fn main() -> Result<()> {
 }
 
 /// Build the wallet-enabled HTTP provider used to broadcast trades.
-fn build_broadcaster(
-    cfg: &Config,
-) -> Result<impl alloy::providers::Provider> {
+fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider> {
     use alloy::network::EthereumWallet;
     use alloy::signers::local::PrivateKeySigner;
 
@@ -85,6 +148,7 @@ fn build_broadcaster(
 /// keeps running (a dropped WSS connection must not kill the process).
 async fn run_event_driven<B: alloy::providers::Provider>(
     cfg: &Config,
+    cache: &VenueCache,
     wss_url: &str,
     broadcaster: &B,
 ) -> Result<()> {
@@ -100,108 +164,24 @@ async fn run_event_driven<B: alloy::providers::Provider>(
     let mut stream = sub.into_stream();
     while let Some(header) = stream.next().await {
         info!(block = header.number, "new block; scanning");
-        if let Err(e) = run_once_with_provider(cfg, &provider, broadcaster).await {
+        if let Err(e) = run_once_with_provider(cfg, cache, &provider, broadcaster).await {
             warn!(error = %e, "event-driven scan failed");
         }
     }
     warn!("block subscription ended; falling back to polling");
     loop {
-        if let Err(e) = run_once(cfg, broadcaster).await {
+        if let Err(e) = run_once(cfg, cache, broadcaster).await {
             warn!(error = %e, "scan iteration failed");
         }
         tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms)).await;
     }
 }
 
-/// Fetch pool state for all venues. V2/Aero reserves are fetched in one
-/// JSON-RPC batch when possible; V3 venues are excluded (V3 pools have no
-/// getReserves()) and get their state via fetch_v3_pool_state instead.
-async fn fetch_all_reserves<P: alloy::providers::Provider>(
-    provider: &P,
-    cfg: &Config,
-) -> Result<Vec<PoolState>> {
-    use morpho_arbitrage_bot::dex::PoolReserves;
-
-    // V2/Aero venues get reserves; V3 venues get slot0+liquidity.
-    let v2_idx: Vec<usize> = cfg
-        .venues
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.kind != VenueKind::UniswapV3)
-        .map(|(i, _)| i)
-        .collect();
-    let v2_pairs: Vec<(Address, Address)> = v2_idx
-        .iter()
-        .map(|&i| (cfg.venues[i].pair, cfg.loan_token))
-        .collect();
-
-    // Try batched fetch first; fall back to serial per-venue fetches that
-    // skip a dead venue instead of aborting the whole scan (one bad pair
-    // must not blind the bot to opportunities elsewhere).
-    let mut reserve_by_idx: Vec<Option<PoolReserves>> = vec![None; cfg.venues.len()];
-    match fetch_reserves_batched(provider, &v2_pairs).await {
-        Ok(r) => {
-            info!(count = r.len(), "reserves fetched via JSON-RPC batch");
-            for (j, &i) in v2_idx.iter().enumerate() {
-                reserve_by_idx[i] = Some(r[j]);
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "batched fetch failed; falling back to serial");
-            for &i in &v2_idx {
-                match fetch_reserves(provider, cfg.venues[i].pair, cfg.loan_token).await {
-                    Ok(r) => reserve_by_idx[i] = Some(r),
-                    Err(e) => {
-                        warn!(venue = i, pair = %cfg.venues[i].pair, error = %e,
-                            "venue reserve fetch failed; skipping venue");
-                    }
-                }
-            }
-        }
-    }
-
-    let mut pools = Vec::with_capacity(cfg.venues.len());
-    for (idx, venue) in cfg.venues.iter().enumerate() {
-        if venue.kind == VenueKind::UniswapV3 {
-            match fetch_v3_pool_state(provider, venue.pair, cfg.loan_token).await {
-                Ok((sqrt_price_x96, liquidity)) => pools.push(PoolState {
-                    venue: idx,
-                    reserves: PoolReserves {
-                        reserve_in: U256::ZERO,
-                        reserve_out: U256::ZERO,
-                    },
-                    v3_state: Some(morpho_arbitrage_bot::arbitrage::V3PoolState {
-                        sqrt_price_x96,
-                        liquidity,
-                    }),
-                    fee_bps: venue.fee_bps,
-                    fee_tier: venue.fee_tier,
-                }),
-                Err(e) => {
-                    warn!(venue = idx, pair = %venue.pair, error = %e,
-                        "V3 pool state fetch failed; skipping venue");
-                }
-            }
-            continue;
-        }
-        let Some(reserves) = reserve_by_idx[idx] else {
-            // Venue failed in both batch and serial paths; skip it.
-            continue;
-        };
-        pools.push(PoolState {
-            venue: idx,
-            reserves,
-            v3_state: None,
-            fee_bps: venue.fee_bps,
-            fee_tier: venue.fee_tier,
-        });
-    }
-    Ok(pools)
-}
-
-/// Run one scan iteration with a given provider.
+/// Run one scan iteration with a given provider. All chain reads are served
+/// by ONE JSON-RPC batch (reserves + V3 state + gas price).
 async fn run_once_with_provider<P, B>(
     cfg: &Config,
+    cache: &VenueCache,
     provider: &P,
     broadcaster: &B,
 ) -> Result<()>
@@ -209,15 +189,41 @@ where
     P: alloy::providers::Provider,
     B: alloy::providers::Provider,
 {
-    let pools = fetch_all_reserves(provider, cfg).await?;
+    let snapshot = fetch_scan_snapshot(provider, &cache.v2_pairs, &cache.v3_pools).await?;
+    let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
 
-    // Fetch gas price for cost calculation. A missing/again-zero gas price
-    // must not silently zero out the gas term (that would re-admit
-    // false-positive trades), so propagate RPC failures instead.
-    let gas_price = match cfg.gas_price_wei {
-        Some(gp) => gp,
-        None => U256::from(provider.get_gas_price().await?),
-    };
+    let mut pools: Vec<PoolState> = Vec::with_capacity(cfg.venues.len());
+    for (j, &idx) in cache.v2_idx.iter().enumerate() {
+        let (r0, r1) = snapshot.v2_raw[j];
+        let venue = &cfg.venues[idx];
+        match orient_reserves(r0, r1, &cache.pair_tokens[idx], venue.pair, cfg.loan_token) {
+            Ok(reserves) => pools.push(PoolState {
+                venue: idx,
+                reserves,
+                v3_state: None,
+                fee_bps: venue.fee_bps,
+                fee_tier: venue.fee_tier,
+            }),
+            Err(e) => warn!(venue = idx, error = %e, "skipping venue"),
+        }
+    }
+    for (j, &idx) in cache.v3_idx.iter().enumerate() {
+        let (sqrt_price_x96, liquidity) = snapshot.v3_raw[j];
+        let venue = &cfg.venues[idx];
+        pools.push(PoolState {
+            venue: idx,
+            reserves: PoolReserves {
+                reserve_in: U256::ZERO,
+                reserve_out: U256::ZERO,
+            },
+            v3_state: Some(V3PoolState {
+                sqrt_price_x96,
+                liquidity,
+            }),
+            fee_bps: venue.fee_bps,
+            fee_tier: venue.fee_tier,
+        });
+    }
 
     let best = cfg
         .loan_amounts
@@ -239,20 +245,25 @@ where
     // Two-stage build: estimate gas with a provisional params (minProfit
     // barely affects calldata size/gas), then rebuild with the on-chain
     // backstop raised to min_profit + gas so the contract itself reverts
-    // net-unprofitable trades before they waste gas on-chain.
-    let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
-    let gas_estimate =
-        executor::estimate_gas(provider, cfg.arb_contract, provisional).await?;
-    let gas_cost_wei = gas_estimate * gas_price;
-    let gas_cost_loan = if cfg.loan_token == cfg.wrapped_native {
-        gas_cost_wei
-    } else {
-        warn!(
-            loan_token = %cfg.loan_token,
-            wrapped_native = %cfg.wrapped_native,
-            "loan token is not wrapped native; gas cost conversion unavailable, comparing gross profit"
-        );
+    // net-unprofitable trades before they waste gas on-chain. Skipped
+    // entirely in dry-run mode (no trade will be sent anyway).
+    let gas_cost_loan = if cfg.dry_run {
         U256::ZERO
+    } else {
+        let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
+        let gas_estimate =
+            executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional).await?;
+        let gas_cost_wei = gas_estimate * gas_price;
+        if cfg.loan_token == cfg.wrapped_native {
+            gas_cost_wei
+        } else {
+            warn!(
+                loan_token = %cfg.loan_token,
+                wrapped_native = %cfg.wrapped_native,
+                "loan token is not wrapped native; gas cost conversion unavailable, comparing gross profit"
+            );
+            U256::ZERO
+        }
     };
 
     let net_profit = opp.profit.saturating_sub(gas_cost_loan);
@@ -278,7 +289,7 @@ where
         "opportunity found"
     );
 
-    executor::simulate(provider, cfg.arb_contract, params.clone()).await?;
+    executor::simulate(provider, cfg.arb_contract, cache.owner, params.clone()).await?;
 
     if cfg.dry_run {
         info!("dry-run enabled; skipping broadcast");
@@ -291,8 +302,12 @@ where
 }
 
 /// Run one scan iteration (convenience wrapper for polling mode).
-async fn run_once<B: alloy::providers::Provider>(cfg: &Config, broadcaster: &B) -> Result<()> {
+async fn run_once<B: alloy::providers::Provider>(
+    cfg: &Config,
+    cache: &VenueCache,
+    broadcaster: &B,
+) -> Result<()> {
     let provider = alloy::providers::ProviderBuilder::new()
         .connect_http(cfg.rpc_url.parse()?);
-    run_once_with_provider(cfg, &provider, broadcaster).await
+    run_once_with_provider(cfg, cache, &provider, broadcaster).await
 }

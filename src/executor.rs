@@ -32,6 +32,14 @@ sol! {
     }
 }
 
+/// Read the contract owner once at startup; the owner never changes, so
+/// per-scan simulations/gas estimates reuse the cached value instead of an
+/// extra RPC call per opportunity.
+pub async fn fetch_owner<P: Provider>(provider: &P, contract: Address) -> Result<Address> {
+    let arb = IFlashArbitrage::new(contract, provider);
+    Ok(arb.owner().call().await?)
+}
+
 fn build_leg(venue: &Venue, min_out: U256) -> SwapLeg {
     SwapLeg {
         router: venue.router,
@@ -77,16 +85,15 @@ pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbPar
 }
 
 /// Simulate `execute` via eth_call without broadcasting. The call must carry
-/// `from` = the contract owner, otherwise the contract's `onlyOwner` guard
-/// reverts the simulation. The owner is read on-chain so simulation works in
-/// dry-run mode without a valid private key.
+/// `from` = the contract owner (cached at startup), otherwise the contract's
+/// `onlyOwner` guard reverts the simulation.
 pub async fn simulate<P: Provider>(
     provider: &P,
     contract: Address,
+    owner: Address,
     params: ArbParams,
 ) -> Result<()> {
     let arb = IFlashArbitrage::new(contract, provider);
-    let owner = arb.owner().call().await?;
     arb.execute(params).from(owner).call().await?;
     Ok(())
 }
@@ -95,10 +102,10 @@ pub async fn simulate<P: Provider>(
 pub async fn estimate_gas<P: Provider>(
     provider: &P,
     contract: Address,
+    owner: Address,
     params: ArbParams,
 ) -> Result<U256> {
     let arb = IFlashArbitrage::new(contract, provider);
-    let owner = arb.owner().call().await?;
     let gas = arb.execute(params).from(owner).estimate_gas().await?;
     Ok(U256::from(gas))
 }
