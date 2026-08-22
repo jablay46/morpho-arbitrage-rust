@@ -39,10 +39,49 @@ pub struct Opportunity {
     pub profit: U256,
 }
 
+/// Widen-multiply then divide without overflowing U256:
+/// `a * b / den` computed via U512 intermediates. Returns None when the
+/// result does not fit back into U256 (or den is zero).
+fn mul_div(a: U256, b: U256, den: U256) -> Option<U256> {
+    use alloy::primitives::U512;
+    if den.is_zero() {
+        return None;
+    }
+    let product = a.widening_mul::<256, 4, 512, 8>(b);
+    let (quotient, _) = product.div_rem(U512::from_limbs_slice(den.as_limbs()));
+    // quotient fits U256 only if its high half is zero.
+    let limbs = quotient.as_limbs();
+    if limbs[4..].iter().any(|&l| l != 0) {
+        return None;
+    }
+    Some(U256::from_limbs_slice(&limbs[..4]))
+}
+
+/// Derive virtual constant-product reserves for a V3 pool from slot0 state.
+/// reserve_in = liquidity * sqrtPriceX96 / 2^96, reserve_out = liquidity * 2^96 / sqrtPriceX96.
+/// This is only a rough approximation (ignores tick boundaries and active-liquidity
+/// depletion); a quoter-based path should replace it for production V3 routing.
+fn v3_virtual_reserves(v3: V3PoolState) -> Option<(U256, U256)> {
+    if v3.sqrt_price_x96.is_zero() {
+        return None;
+    }
+    let q96 = U256::from(1u128) << 96;
+    let reserve_in = mul_div(v3.liquidity, v3.sqrt_price_x96, q96)?;
+    let reserve_out = mul_div(v3.liquidity, q96, v3.sqrt_price_x96)?;
+    Some((reserve_in, reserve_out))
+}
+
+/// Same derivation with in/out orientation flipped (for the return leg).
+fn v3_virtual_reserves_flipped(v3: V3PoolState) -> Option<(U256, U256)> {
+    let (r_in, r_out) = v3_virtual_reserves(v3)?;
+    Some((r_out, r_in))
+}
+
 /// Simulate the cycle over every ordered venue pair (i, j) for one loan size,
 /// returning the most profitable one clearing `min_profit`, if any.
-/// For V3 venues, uses the quoter for accurate pricing; for V2/Aero, uses
-/// the constant-product formula.
+/// For V3 venues, prices are approximated from slot0 via virtual
+/// constant-product reserves; for V2/Aero, the exact constant-product
+/// formula is used. Unpriceable pairs are skipped individually.
 pub fn find_opportunity(
     loan_amount: U256,
     pools: &[PoolState],
@@ -56,46 +95,43 @@ pub fn find_opportunity(
             }
             // Leg 1: loan token -> quote token on `first`.
             let quote_out = if let Some(v3) = first.v3_state {
-                // For V3, approximate using constant-product with slot0 price.
-                // In production, use a quoter contract for exact pricing.
-                let (reserve_in, reserve_out) = if v3.sqrt_price_x96.is_zero() {
+                let Some((reserve_in, reserve_out)) = v3_virtual_reserves(v3) else {
                     continue;
-                } else {
-                    // Derive virtual reserves from sqrtPriceX96 and liquidity.
-                    // reserve_in = liquidity * sqrt_price_x96 / 2^96
-                    // reserve_out = liquidity * 2^96 / sqrt_price_x96
-                    let q96 = U256::from(1u128) << 96;
-                    let reserve_in = v3.liquidity * v3.sqrt_price_x96 / q96;
-                    let reserve_out = v3.liquidity * q96 / v3.sqrt_price_x96;
-                    (reserve_in, reserve_out)
                 };
-                get_amount_out(loan_amount, reserve_in, reserve_out, first.fee_bps)?
+                let Some(out) = get_amount_out(loan_amount, reserve_in, reserve_out, first.fee_bps) else {
+                    continue;
+                };
+                out
             } else {
-                get_amount_out(
+                let Some(out) = get_amount_out(
                     loan_amount,
                     first.reserves.reserve_in,
                     first.reserves.reserve_out,
                     first.fee_bps,
-                )?
+                ) else {
+                    continue;
+                };
+                out
             };
             // Leg 2: quote token -> loan token on `second` (reserves flipped).
             let amount_out = if let Some(v3) = second.v3_state {
-                let (reserve_in, reserve_out) = if v3.sqrt_price_x96.is_zero() {
+                let Some((reserve_in, reserve_out)) = v3_virtual_reserves_flipped(v3) else {
                     continue;
-                } else {
-                    let q96 = U256::from(1u128) << 96;
-                    let reserve_in = v3.liquidity * q96 / v3.sqrt_price_x96;
-                    let reserve_out = v3.liquidity * v3.sqrt_price_x96 / q96;
-                    (reserve_in, reserve_out)
                 };
-                get_amount_out(quote_out, reserve_in, reserve_out, second.fee_bps)?
+                let Some(out) = get_amount_out(quote_out, reserve_in, reserve_out, second.fee_bps) else {
+                    continue;
+                };
+                out
             } else {
-                get_amount_out(
+                let Some(out) = get_amount_out(
                     quote_out,
                     second.reserves.reserve_out,
                     second.reserves.reserve_in,
                     second.fee_bps,
-                )?
+                ) else {
+                    continue;
+                };
+                out
             };
             let Some(profit) = amount_out.checked_sub(loan_amount) else {
                 continue;
@@ -238,6 +274,50 @@ mod tests {
             .expect("four venues should still find a pair");
         assert!(opp.profit > U256::ZERO);
         assert!(opp.first == 1 || opp.second == 1);
+    }
+
+    #[test]
+    fn mul_div_handles_large_intermediates_without_overflow() {
+        // liquidity ~2^120, sqrtPriceX96 ~2^100 -> product ~2^220 fits U256.
+        let liq = U256::from(1u128) << 120;
+        let px = U256::from(1u128) << 100;
+        let q96 = U256::from(1u128) << 96;
+        let r = mul_div(liq, px, q96).expect("fits");
+        assert_eq!(r, U256::from(1u128) << 124);
+    }
+
+    #[test]
+    fn mul_div_wide_product_exceeding_u256_still_computes() {
+        // Realistic V3 magnitudes: liquidity ~2^120, sqrtPriceX96 ~2^157
+        // (mid-range price). The raw product ~2^277 overflows U256, but the
+        // U512 intermediate keeps it exact and the quotient fits.
+        let liq = U256::from(1u128) << 120;
+        let px = U256::from(1u128) << 157;
+        let q96 = U256::from(1u128) << 96;
+        let r = mul_div(liq, px, q96).expect("quotient fits U256");
+        assert_eq!(r, U256::from(1u128) << 181);
+    }
+
+    #[test]
+    fn mul_div_returns_none_on_zero_denominator_or_oversize_quotient() {
+        assert!(mul_div(U256::from(1u64), U256::from(1u64), U256::ZERO).is_none());
+        // quotient ~2^256 does not fit U256.
+        assert!(mul_div(U256::MAX, U256::MAX, U256::from(1u64)).is_none());
+    }
+
+    #[test]
+    fn unpriceable_pool_skips_only_that_pair() {
+        // Venue 1 has zero reserves (unpriceable); venues 0 and 2 are
+        // dislocated, so an opportunity must still be found between them.
+        let pools = vec![
+            pool(0, 1_000_000, 1_000_000),
+            pool(1, 0, 0),
+            pool(2, 1_100_000, 900_000),
+        ];
+        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO)
+            .expect("one dead pool must not abort the search");
+        assert!(opp.profit > U256::ZERO);
+        assert!(opp.first != 1 && opp.second != 1);
     }
 
     #[test]

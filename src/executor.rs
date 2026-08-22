@@ -205,6 +205,7 @@ mod tests {
             arb_contract: Address::ZERO,
             loan_token: Address::ZERO,
             quote_token: Address::ZERO,
+            wrapped_native: Address::ZERO,
             venues: vec![venue(VenueKind::UniswapV2), venue(VenueKind::Aerodrome)],
             loan_amounts: vec![],
             min_profit: U256::ZERO,

@@ -55,6 +55,9 @@ pub struct Config {
     pub loan_token: Address,
     /// Intermediate token used for the cross-DEX swap legs.
     pub quote_token: Address,
+    /// Wrapped native token (e.g. WETH on Base); used to convert gas cost
+    /// (paid in ETH) into loan-token units.
+    pub wrapped_native: Address,
     /// All DEX venues arbitraged against each other (at least two).
     pub venues: Vec<Venue>,
     /// Flash loan sizes to probe, in loan_token base units.
@@ -91,6 +94,19 @@ impl Config {
         let arb_contract = parse_addr("ARB_CONTRACT")?;
         let loan_token = parse_addr("LOAN_TOKEN")?;
         let quote_token = parse_addr("QUOTE_TOKEN")?;
+        // Used to price gas (paid in ETH) into loan-token units.
+        let wrapped_native = env::var("WRAPPED_NATIVE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                Address::from_str(&s).map_err(|e| eyre!("invalid WRAPPED_NATIVE: {e}"))
+            })
+            .transpose()?
+            .unwrap_or_else(|| {
+                // WETH on Base mainnet.
+                Address::from_str("0x4200000000000000000000000000000000000006")
+                    .expect("valid constant address")
+            });
         if loan_token == quote_token {
             return Err(eyre!("LOAN_TOKEN and QUOTE_TOKEN must differ"));
         }
@@ -249,6 +265,7 @@ impl Config {
             arb_contract,
             loan_token,
             quote_token,
+            wrapped_native,
             venues,
             loan_amounts,
             min_profit,

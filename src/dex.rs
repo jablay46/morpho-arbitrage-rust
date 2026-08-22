@@ -28,16 +28,6 @@ sol! {
         function token1() external view returns (address);
     }
 
-    #[sol(rpc)]
-    interface IUniswapV3Quoter {
-        function quoteExactInputSingle(
-            address tokenIn,
-            address tokenOut,
-            uint24 fee,
-            uint256 amountIn,
-            uint160 sqrtPriceLimitX96
-        ) external returns (uint256 amountOut);
-    }
 }
 
 /// Reserves of a V2-style pool, normalized so `reserve_in` always corresponds
@@ -188,25 +178,4 @@ pub async fn fetch_v3_pool_state<P: Provider>(
     Ok((U256::from(slot0.sqrtPriceX96), U256::from(liquidity)))
 }
 
-/// Quote V3 output using the quoter contract (more accurate than local math).
-pub async fn quote_v3_output<P: Provider>(
-    provider: &P,
-    quoter: Address,
-    token_in: Address,
-    token_out: Address,
-    fee_tier: u32,
-    amount_in: U256,
-) -> Result<U256> {
-    let quoter_contract = IUniswapV3Quoter::new(quoter, provider);
-    let amount_out = quoter_contract
-        .quoteExactInputSingle(
-            token_in,
-            token_out,
-            alloy::primitives::Uint::<24, 1>::from(fee_tier),
-            amount_in,
-            alloy::primitives::Uint::<160, 3>::ZERO,
-        )
-        .call()
-        .await?;
-    Ok(amount_out)
-}
+
