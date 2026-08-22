@@ -54,8 +54,10 @@ contract FlashArbitrage {
         uint8 kind;      // 0 = UniswapV2-style, 1 = Aerodrome-style
         address factory; // Aerodrome pool factory (kind 1 only; zero = default)
         bool stable;     // Aerodrome stable pool flag (kind 1 only)
-        uint256 minOut;  // Minimum output; bounds slippage and raises the cost
-                         // of sandwiching (final profit check is the backstop).
+        uint256 minOut;  // Minimum output; bounds slippage from price drift
+                         // between simulation and inclusion (Base has a private
+                         // sequencer mempool, so no sandwiching; the final
+                         // profit check is the backstop).
     }
 
     struct ArbParams {
