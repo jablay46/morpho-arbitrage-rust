@@ -1,0 +1,13 @@
+[package]
+name = "morpho-arbitrage-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive"] }
