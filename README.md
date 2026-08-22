@@ -31,6 +31,16 @@ Contract mendukung dua keluarga router lewat `SwapLeg.kind`:
   Pancakeswap V2.
 - `1` = Aerodrome-style (`Route[]{from,to,stable,factory}`).
 
+Setiap leg membawa `minOut` (dihitung dari simulasi dikali
+`1 - SLIPPAGE_BPS`) untuk membatasi slippage akibat drift harga antara
+simulasi dan inklusi; toleransi leg B dikompound dua kali karena input-nya
+adalah output aktual leg A; cek `minProfit` di akhir tetap menjadi backstop.
+
+Catatan MEV di Base: sequencer terpusat dengan mempool privat, jadi tidak
+ada sandwich/frontrunning. Risiko nyata adalah kalah balapan dengan bot arb
+lain (copycat/backrunning) — tx yang kalah revert dan rugi gas. Mitigasi:
+RPC latensi rendah, poll interval cepat, simulasi tepat sebelum kirim.
+
 Catatan: pool Aerodrome **stable** memakai kurva x^3y+y^3x, bukan constant
 product; simulasi off-chain bot ini hanya akurat untuk pool volatile (vAMM).
 

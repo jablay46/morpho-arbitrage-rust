@@ -42,6 +42,10 @@ pub struct Config {
     pub loan_amounts: Vec<U256>,
     /// Minimum net profit (in loan_token base units) required to execute.
     pub min_profit: U256,
+    /// Slippage tolerance per swap leg, in basis points (50 = 0.5%). The
+    /// simulated leg output scaled by (1 - slippage) becomes the on-chain
+    /// `minOut`, bounding price drift and raising the cost of sandwiching.
+    pub slippage_bps: u64,
     /// Poll interval between scans, milliseconds.
     pub poll_interval_ms: u64,
     /// If true, never broadcast transactions; only log simulated results.
@@ -65,6 +69,9 @@ impl Config {
         let arb_contract = parse_addr("ARB_CONTRACT")?;
         let loan_token = parse_addr("LOAN_TOKEN")?;
         let quote_token = parse_addr("QUOTE_TOKEN")?;
+        if loan_token == quote_token {
+            return Err(eyre!("LOAN_TOKEN and QUOTE_TOKEN must differ"));
+        }
 
         // DEX venues as comma-separated entries:
         //   <pair>:<router>[:<kind>[:<fee_bps>[:<factory>[:<stable>]]]]
@@ -139,6 +146,10 @@ impl Config {
                     .map_err(|e| eyre!("invalid LOAN_AMOUNTS entry '{s}': {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
+        // Morpho Blue rejects zero-asset flash loans.
+        if loan_amounts.iter().any(|a| a.is_zero()) {
+            return Err(eyre!("LOAN_AMOUNTS must not contain zero"));
+        }
 
         let min_profit = env::var("MIN_PROFIT")
             .ok()
@@ -146,6 +157,18 @@ impl Config {
             .transpose()
             .map_err(|e| eyre!("invalid MIN_PROFIT: {e}"))?
             .unwrap_or(U256::ZERO);
+
+        let slippage_bps = env::var("SLIPPAGE_BPS")
+            .ok()
+            .map(|s| {
+                s.parse::<u64>()
+                    .map_err(|e| eyre!("invalid SLIPPAGE_BPS: {e}"))
+            })
+            .transpose()?
+            .unwrap_or(50);
+        if slippage_bps >= 10_000 {
+            return Err(eyre!("SLIPPAGE_BPS {slippage_bps} too high"));
+        }
 
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .ok()
@@ -166,6 +189,7 @@ impl Config {
             venues,
             loan_amounts,
             min_profit,
+            slippage_bps,
             poll_interval_ms,
             dry_run,
         })

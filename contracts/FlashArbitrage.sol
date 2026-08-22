@@ -54,6 +54,10 @@ contract FlashArbitrage {
         uint8 kind;      // 0 = UniswapV2-style, 1 = Aerodrome-style
         address factory; // Aerodrome pool factory (kind 1 only; zero = default)
         bool stable;     // Aerodrome stable pool flag (kind 1 only)
+        uint256 minOut;  // Minimum output; bounds slippage from price drift
+                         // between simulation and inclusion (Base has a private
+                         // sequencer mempool, so no sandwiching; the final
+                         // profit check is the backstop).
     }
 
     struct ArbParams {
@@ -131,7 +135,7 @@ contract FlashArbitrage {
             path[0] = from;
             path[1] = to;
             uint256[] memory amounts = IUniswapV2Router(leg.router).swapExactTokensForTokens(
-                amountIn, 0, path, address(this), block.timestamp
+                amountIn, leg.minOut, path, address(this), block.timestamp
             );
             return amounts[amounts.length - 1];
         }
@@ -139,7 +143,7 @@ contract FlashArbitrage {
             IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](1);
             routes[0] = IAerodromeRouter.Route(from, to, leg.stable, leg.factory);
             uint256[] memory amounts = IAerodromeRouter(leg.router).swapExactTokensForTokens(
-                amountIn, 0, routes, address(this), block.timestamp
+                amountIn, leg.minOut, routes, address(this), block.timestamp
             );
             return amounts[amounts.length - 1];
         }
