@@ -1,7 +1,9 @@
 # Morpho Flashloan Arbitrage Bot
 
-Bot arbitrage dua-DEX berbasis **Morpho Blue flash loan** (fee-free), ditulis
-dalam Rust menggunakan [alloy](https://github.com/alloy-rs/alloy).
+Bot arbitrage multi-DEX berbasis **Morpho Blue flash loan** (fee-free), ditulis
+dalam Rust menggunakan [alloy](https://github.com/alloy-rs/alloy). Mendukung
+jumlah venue bebas (2..N) — misalnya Uniswap, Sushiswap, Aerodrome,
+Pancakeswap — dengan memindai semua pasangan arah terurut.
 
 ## Arsitektur
 
@@ -16,11 +18,13 @@ contracts/
   FlashArbitrage.sol # receiver flashloan Morpho; mengeksekusi 2 swap on-chain
 ```
 
-Alur: bot membaca reserve dua pool V2, mensimulasikan cycle
-`loan -> quote -> loan` untuk dua arah dan beberapa ukuran pinjaman, memilih
-profit maksimum, menyimulasikannya lewat `eth_call`, lalu (jika tidak dry-run)
-memanggil `FlashArbitrage.execute(...)`. Profit divalidasi on-chain
-(`minProfit`) dan di-sweep ke owner.
+Alur: bot membaca reserve semua pool V2 yang dikonfigurasi di `DEX_VENUES`
+(format `<pair>:<router>`, dipisah koma), mensimulasikan cycle
+`loan -> quote -> loan` untuk setiap pasangan venue terurut (i, j), i != j,
+dan beberapa ukuran pinjaman, memilih profit maksimum, menyimulasikannya
+lewat `eth_call`, lalu (jika tidak dry-run) memanggil
+`FlashArbitrage.execute(...)`. Profit divalidasi on-chain (`minProfit`) dan
+di-sweep ke owner. Contract tidak perlu diubah karena router diparameterkan.
 
 ## Menjalankan
 

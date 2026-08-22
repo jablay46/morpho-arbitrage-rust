@@ -3,20 +3,24 @@ use eyre::{eyre, Result};
 use std::env;
 use std::str::FromStr;
 
+/// One tradable venue: a Uniswap-V2-style pool plus its swap router.
+pub struct Venue {
+    pub pair: Address,
+    pub router: Address,
+}
+
 /// Bot configuration loaded from environment variables / .env file.
 pub struct Config {
     pub rpc_url: String,
     pub private_key: String,
     pub morpho: Address,
     pub arb_contract: Address,
-    /// Token being flash-borrowed and arbitraged across two DEXes.
+    /// Token being flash-borrowed and arbitraged across DEXes.
     pub loan_token: Address,
     /// Intermediate token used for the cross-DEX swap legs.
     pub quote_token: Address,
-    /// First Uniswap-V2-style pair contract containing (loan_token, quote_token).
-    pub pair_a: Address,
-    /// Second Uniswap-V2-style pair contract containing (loan_token, quote_token).
-    pub pair_b: Address,
+    /// All DEX venues arbitraged against each other (at least two).
+    pub venues: Vec<Venue>,
     /// Flash loan sizes to probe, in loan_token base units.
     pub loan_amounts: Vec<U256>,
     /// Minimum net profit (in loan_token base units) required to execute.
@@ -44,8 +48,29 @@ impl Config {
         let arb_contract = parse_addr("ARB_CONTRACT")?;
         let loan_token = parse_addr("LOAN_TOKEN")?;
         let quote_token = parse_addr("QUOTE_TOKEN")?;
-        let pair_a = parse_addr("PAIR_A")?;
-        let pair_b = parse_addr("PAIR_B")?;
+
+        // DEX venues as comma-separated `pair:router` entries, e.g.
+        // DEX_VENUES=0xPair1:0xRouter1,0xPair2:0xRouter2,...
+        let venues_raw =
+            env::var("DEX_VENUES").map_err(|_| eyre!("missing env var DEX_VENUES"))?;
+        let venues = venues_raw
+            .split(',')
+            .map(|entry| {
+                let entry = entry.trim();
+                let (pair, router) = entry.split_once(':').ok_or_else(|| {
+                    eyre!("invalid DEX_VENUES entry '{entry}', expected <pair>:<router>")
+                })?;
+                Ok::<_, eyre::Report>(Venue {
+                    pair: Address::from_str(pair.trim())
+                        .map_err(|e| eyre!("invalid pair in DEX_VENUES '{entry}': {e}"))?,
+                    router: Address::from_str(router.trim())
+                        .map_err(|e| eyre!("invalid router in DEX_VENUES '{entry}': {e}"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if venues.len() < 2 {
+            return Err(eyre!("DEX_VENUES needs at least two venues"));
+        }
 
         let loan_amounts = env::var("LOAN_AMOUNTS")
             .unwrap_or_else(|_| "1000000000000000000".to_string())
@@ -79,8 +104,7 @@ impl Config {
             arb_contract,
             loan_token,
             quote_token,
-            pair_a,
-            pair_b,
+            venues,
             loan_amounts,
             min_profit,
             poll_interval_ms,

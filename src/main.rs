@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
         arb_contract = %cfg.arb_contract,
         loan_token = %cfg.loan_token,
         quote_token = %cfg.quote_token,
+        venues = cfg.venues.len(),
         dry_run = cfg.dry_run,
         "bot configured"
     );
@@ -56,14 +57,20 @@ async fn run_once(cfg: &Config) -> Result<()> {
         .connect_http(cfg.rpc_url.parse()?);
 
     // Reserves are oriented with the loan token first; find_opportunity
-    // flips them for the return leg as needed per direction.
-    let reserves_a = fetch_reserves(&provider, cfg.pair_a, cfg.loan_token).await?;
-    let reserves_b = fetch_reserves(&provider, cfg.pair_b, cfg.loan_token).await?;
+    // flips them for the return leg as needed per venue pair.
+    let mut pools = Vec::with_capacity(cfg.venues.len());
+    for (idx, venue) in cfg.venues.iter().enumerate() {
+        let reserves = fetch_reserves(&provider, venue.pair, cfg.loan_token).await?;
+        pools.push(morpho_arbitrage_bot::arbitrage::PoolState {
+            venue: idx,
+            reserves,
+        });
+    }
 
     let best = cfg
         .loan_amounts
         .iter()
-        .filter_map(|&size| find_opportunity(size, reserves_a, reserves_b, cfg.min_profit))
+        .filter_map(|&size| find_opportunity(size, &pools, cfg.min_profit))
         .max_by_key(|o| o.profit);
 
     let Some(opp) = best else {
@@ -72,15 +79,14 @@ async fn run_once(cfg: &Config) -> Result<()> {
     };
 
     info!(
-        direction = ?opp.direction,
+        first = opp.first,
+        second = opp.second,
         loan = %opp.loan_amount,
         profit = %opp.profit,
         "opportunity found"
     );
 
-    // Routers must point at the venues' swap routers accepted by the contract;
-    // pair addresses are used as placeholders until configured by the operator.
-    let params = executor::build_params(cfg, &opp, cfg.pair_a, cfg.pair_b);
+    let params = executor::build_params(cfg, &opp);
 
     executor::simulate(&provider, cfg.arb_contract, params.clone()).await?;
 

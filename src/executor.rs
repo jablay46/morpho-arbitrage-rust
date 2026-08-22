@@ -1,4 +1,4 @@
-use crate::arbitrage::{Direction, Opportunity};
+use crate::arbitrage::Opportunity;
 use crate::config::Config;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, TxHash};
@@ -24,23 +24,13 @@ sol! {
     }
 }
 
-/// Map a simulated direction to the on-chain router ordering.
-/// Router ordering is resolved against the configured pair router addresses.
-pub fn build_params(
-    cfg: &Config,
-    opp: &Opportunity,
-    router_a: Address,
-    router_b: Address,
-) -> ArbParams {
-    let (router_first, router_second) = match opp.direction {
-        Direction::ASellBSell => (router_a, router_b),
-        Direction::BSellASell => (router_b, router_a),
-    };
+/// Resolve the chosen venue pair to its routers and build the calldata.
+pub fn build_params(cfg: &Config, opp: &Opportunity) -> ArbParams {
     ArbParams {
         token: cfg.loan_token,
         amount: opp.loan_amount,
-        routerA: router_first,
-        routerB: router_second,
+        routerA: cfg.venues[opp.first].router,
+        routerB: cfg.venues[opp.second].router,
         pathA: vec![cfg.loan_token, cfg.quote_token],
         pathB: vec![cfg.quote_token, cfg.loan_token],
         minProfit: cfg.min_profit,

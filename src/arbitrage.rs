@@ -1,21 +1,21 @@
 use crate::dex::{get_amount_out, PoolReserves};
 use alloy::primitives::U256;
 
-/// Which direction to run the two-hop cycle.
-///
-/// Start with `amount` of the loan token.
-/// - `ASellBSell`: sell loan token on A for quote token, sell quote token on B back to loan token.
-/// - `BSellASell`: the mirror image (sell on B first, buy back on A).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    ASellBSell,
-    BSellASell,
+/// Current reserves of one venue's pool, tagged with its index in the
+/// configured venue list. Reserves are oriented loan-token first.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolState {
+    pub venue: usize,
+    pub reserves: PoolReserves,
 }
 
 /// A simulated arbitrage outcome for one loan size.
 #[derive(Debug, Clone, Copy)]
 pub struct Opportunity {
-    pub direction: Direction,
+    /// Venue index where the loan token is sold for the quote token.
+    pub first: usize,
+    /// Venue index where the quote token is swapped back to the loan token.
+    pub second: usize,
     pub loan_amount: U256,
     /// Loan-token amount returned after both swaps, before any fees.
     pub amount_out: U256,
@@ -23,51 +23,67 @@ pub struct Opportunity {
     pub profit: U256,
 }
 
-/// Simulate both cycle directions for a given loan size and pool states,
-/// returning the profitable one with the highest profit, if any.
-///
-/// `reserves_a` / `reserves_b` are oriented with the loan token as `reserve_in`.
+/// Simulate the cycle over every ordered venue pair (i, j) for one loan size,
+/// returning the most profitable one clearing `min_profit`, if any.
 pub fn find_opportunity(
     loan_amount: U256,
-    reserves_a: PoolReserves,
-    reserves_b: PoolReserves,
+    pools: &[PoolState],
     min_profit: U256,
 ) -> Option<Opportunity> {
-    let try_direction = |direction: Direction| -> Option<U256> {
-        let (first, second) = match direction {
-            Direction::ASellBSell => (reserves_a, reserves_b),
-            Direction::BSellASell => (reserves_b, reserves_a),
-        };
-        // Leg 1: loan token -> quote token on `first`.
-        let quote_out = get_amount_out(loan_amount, first.reserve_in, first.reserve_out)?;
-        // Leg 2: quote token -> loan token on `second` (reserves swapped).
-        get_amount_out(quote_out, second.reserve_out, second.reserve_in)
-    };
-
-    let candidates = [Direction::ASellBSell, Direction::BSellASell]
-        .into_iter()
-        .filter_map(|direction| {
-            let amount_out = try_direction(direction)?;
-            let profit = amount_out.checked_sub(loan_amount)?;
-            (profit >= min_profit && !profit.is_zero()).then_some(Opportunity {
-                direction,
+    let mut best: Option<Opportunity> = None;
+    for first in pools {
+        for second in pools {
+            if first.venue == second.venue {
+                continue;
+            }
+            // Leg 1: loan token -> quote token on `first`.
+            let Some(quote_out) = get_amount_out(
+                loan_amount,
+                first.reserves.reserve_in,
+                first.reserves.reserve_out,
+            ) else {
+                continue;
+            };
+            // Leg 2: quote token -> loan token on `second` (reserves flipped).
+            let Some(amount_out) = get_amount_out(
+                quote_out,
+                second.reserves.reserve_out,
+                second.reserves.reserve_in,
+            ) else {
+                continue;
+            };
+            let Some(profit) = amount_out.checked_sub(loan_amount) else {
+                continue;
+            };
+            if profit.is_zero() || profit < min_profit {
+                continue;
+            }
+            let opp = Opportunity {
+                first: first.venue,
+                second: second.venue,
                 loan_amount,
                 amount_out,
                 profit,
-            })
-        });
-
-    candidates.max_by_key(|o| o.profit)
+            };
+            if best.is_none_or(|b| opp.profit > b.profit) {
+                best = Some(opp);
+            }
+        }
+    }
+    best
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pool(loan: u128, quote: u128) -> PoolReserves {
-        PoolReserves {
-            reserve_in: U256::from(loan),
-            reserve_out: U256::from(quote),
+    fn pool(venue: usize, loan: u128, quote: u128) -> PoolState {
+        PoolState {
+            venue,
+            reserves: PoolReserves {
+                reserve_in: U256::from(loan),
+                reserve_out: U256::from(quote),
+            },
         }
     }
 
@@ -93,49 +109,73 @@ mod tests {
 
     #[test]
     fn balanced_pools_have_no_opportunity() {
-        let p = pool(1_000_000, 1_000_000);
-        let opp = find_opportunity(U256::from(10_000u64), p, p, U256::ZERO);
+        let pools = vec![pool(0, 1_000_000, 1_000_000), pool(1, 1_000_000, 1_000_000)];
+        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO);
         assert!(opp.is_none(), "identical pools must not be profitable");
     }
 
     #[test]
     fn price_dislocation_yields_profit_in_one_direction() {
-        // Same nominal pools but quote token priced differently: B has more
-        // loan token per quote token, so selling loan on A and buying back on B wins.
-        let a = pool(1_000_000, 1_000_000);
-        let b = pool(1_100_000, 900_000);
-        let opp = find_opportunity(U256::from(10_000u64), a, b, U256::ZERO)
+        let pools = vec![
+            pool(0, 1_000_000, 1_000_000),
+            pool(1, 1_100_000, 900_000),
+        ];
+        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO)
             .expect("dislocated pools should yield an opportunity");
-        assert_eq!(opp.direction, Direction::ASellBSell);
+        assert_eq!(opp.first, 0);
+        assert_eq!(opp.second, 1);
         assert!(opp.profit > U256::ZERO);
         assert_eq!(opp.amount_out, opp.loan_amount + opp.profit);
     }
 
     #[test]
     fn mirror_direction_is_found_when_pools_are_swapped() {
-        let a = pool(1_100_000, 900_000);
-        let b = pool(1_000_000, 1_000_000);
-        let opp = find_opportunity(U256::from(10_000u64), a, b, U256::ZERO)
+        let pools = vec![
+            pool(0, 1_100_000, 900_000),
+            pool(1, 1_000_000, 1_000_000),
+        ];
+        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO)
             .expect("swapped pools should still yield an opportunity");
-        assert_eq!(opp.direction, Direction::BSellASell);
+        assert_eq!(opp.first, 1);
+        assert_eq!(opp.second, 0);
+    }
+
+    #[test]
+    fn four_venues_route_through_the_dislocated_pool() {
+        // Four venues; venue 1 is the only dislocated pool, so any profitable
+        // cycle must route its return leg through venue 1.
+        let pools = vec![
+            pool(0, 1_000_000, 1_000_000),
+            pool(1, 1_100_000, 900_000),
+            pool(2, 1_000_000, 1_000_000),
+            pool(3, 1_000_000, 1_000_000),
+        ];
+        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO)
+            .expect("four venues should still find a pair");
+        assert!(opp.profit > U256::ZERO);
+        assert!(opp.first == 1 || opp.second == 1);
     }
 
     #[test]
     fn min_profit_threshold_filters_small_gains() {
-        let a = pool(1_000_000, 1_000_000);
-        let b = pool(1_001_000, 999_000);
-        let opp = find_opportunity(U256::from(10_000u64), a, b, U256::from(1_000_000u64));
+        let pools = vec![
+            pool(0, 1_000_000, 1_000_000),
+            pool(1, 1_001_000, 999_000),
+        ];
+        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::from(1_000_000u64));
         assert!(opp.is_none(), "tiny dislocation must fail a large min_profit");
     }
 
     #[test]
     fn best_of_multiple_sizes_can_be_selected() {
-        let a = pool(1_000_000, 1_000_000);
-        let b = pool(1_100_000, 900_000);
+        let pools = vec![
+            pool(0, 1_000_000, 1_000_000),
+            pool(1, 1_100_000, 900_000),
+        ];
         let sizes = [1_000u64, 10_000, 100_000];
         let best = sizes
             .iter()
-            .filter_map(|&s| find_opportunity(U256::from(s), a, b, U256::ZERO))
+            .filter_map(|&s| find_opportunity(U256::from(s), &pools, U256::ZERO))
             .max_by_key(|o| o.profit)
             .unwrap();
         assert!(best.profit > U256::ZERO);
