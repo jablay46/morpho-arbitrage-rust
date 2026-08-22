@@ -9,6 +9,7 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
     function approve(address spender, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
 }
 
 interface IUniswapV2Router {
@@ -38,6 +39,38 @@ interface IAerodromeRouter {
     ) external returns (uint256[] memory amounts);
 }
 
+interface IUniswapV3Router {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external
+        returns (uint256 amountOut);
+}
+
+interface IUniswapV4PoolManager {
+    struct PoolKey {
+        address currency0;
+        address currency1;
+        uint24 fee;
+        int24 tickSpacing;
+        address hooks;
+    }
+
+    function unlock(bytes calldata data) external returns (bytes memory);
+    function swap(PoolKey memory key, int128 amountSpecified, bool zeroForOne)
+        external
+        returns (int128 amount0, int128 amount1);
+}
+
 /**
  * @title FlashArbitrage
  * @notice Executes a two-DEX cycle funded by a Morpho Blue flash loan.
@@ -48,16 +81,20 @@ interface IAerodromeRouter {
 contract FlashArbitrage {
     uint8 internal constant KIND_UNISWAP_V2 = 0;
     uint8 internal constant KIND_AERODROME = 1;
+    uint8 internal constant KIND_UNISWAP_V3 = 2;
+    uint8 internal constant KIND_UNISWAP_V4 = 3;
 
     struct SwapLeg {
         address router;
-        uint8 kind;      // 0 = UniswapV2-style, 1 = Aerodrome-style
+        uint8 kind;      // 0=UniV2, 1=Aero, 2=UniV3, 3=UniV4
         address factory; // Aerodrome pool factory (kind 1 only; zero = default)
         bool stable;     // Aerodrome stable pool flag (kind 1 only)
         uint256 minOut;  // Minimum output; bounds slippage from price drift
                          // between simulation and inclusion (Base has a private
                          // sequencer mempool, so no sandwiching; the final
                          // profit check is the backstop).
+        uint24 feeTier;  // Uniswap V3 fee tier (kind 2 only)
+        bytes32 poolId;  // Uniswap V4 pool ID (kind 3 only)
     }
 
     struct ArbParams {
@@ -147,14 +184,39 @@ contract FlashArbitrage {
             );
             return amounts[amounts.length - 1];
         }
+        if (leg.kind == KIND_UNISWAP_V3) {
+            IUniswapV3Router.ExactInputSingleParams memory params = IUniswapV3Router.ExactInputSingleParams({
+                tokenIn: from,
+                tokenOut: to,
+                fee: leg.feeTier,
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountIn: amountIn,
+                amountOutMinimum: leg.minOut,
+                sqrtPriceLimitX96: 0
+            });
+            return IUniswapV3Router(leg.router).exactInputSingle(params);
+        }
+        if (leg.kind == KIND_UNISWAP_V4) {
+            // V4 uses an unlock/lock pattern that doesn't fit this flashloan
+            // arbitrage model; reserve for future implementation.
+            revert UnknownLegKind(leg.kind);
+        }
         revert UnknownLegKind(leg.kind);
     }
 
     function _approve(address token, address spender, uint256 amount) internal {
-        // Reset first for non-standard ERC20s (e.g. USDT-style) that reject
+        // Only reset if the current allowance is non-zero but insufficient;
+        // this avoids a wasted SSTORE for fresh/adequate allowances while
+        // still handling non-standard ERC20s (e.g. USDT-style) that reject
         // changing a non-zero allowance directly.
-        _safeApprove(token, spender, 0);
-        _safeApprove(token, spender, amount);
+        uint256 current = IERC20(token).allowance(address(this), spender);
+        if (current != 0 && current < amount) {
+            _safeApprove(token, spender, 0);
+        }
+        if (current < amount) {
+            _safeApprove(token, spender, amount);
+        }
     }
 
     function _safeApprove(address token, address spender, uint256 amount) private {

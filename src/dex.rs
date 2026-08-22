@@ -1,6 +1,7 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::sol;
+use alloy::sol_types::SolCall;
 use eyre::Result;
 
 sol! {
@@ -10,6 +11,23 @@ sol! {
         function token0() external view returns (address);
         function token1() external view returns (address);
     }
+
+    #[sol(rpc)]
+    interface IUniswapV3Pool {
+        function slot0() external view returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            uint8 feeProtocol,
+            bool unlocked
+        );
+        function liquidity() external view returns (uint128);
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+    }
+
 }
 
 /// Reserves of a V2-style pool, normalized so `reserve_in` always corresponds
@@ -74,3 +92,90 @@ pub async fn fetch_reserves<P: Provider>(
         reserve_out,
     })
 }
+
+/// Fetch reserves for multiple venues in a single JSON-RPC batch for
+/// block-aligned snapshots. Each venue contributes 3 calls
+/// (getReserves + token0 + token1) to one batch, so all pools are read
+/// against the same block at the node.
+pub async fn fetch_reserves_batched<P: Provider>(
+    provider: &P,
+    venues: &[(Address, Address)], // (pair, token_in) pairs
+) -> Result<Vec<PoolReserves>> {
+    use alloy::eips::BlockNumberOrTag;
+    use alloy::rpc::types::eth::TransactionRequest;
+
+    // Pin every call to "latest"; Chainstack requires the block argument, and
+    // an explicit tag keeps all reads in the batch against the same block.
+    let block = BlockNumberOrTag::Latest;
+    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
+    let mut waiters = Vec::with_capacity(venues.len() * 3);
+    for (pair, _) in venues {
+        for data in [
+            IUniswapV2Pair::getReservesCall {}.abi_encode(),
+            IUniswapV2Pair::token0Call {}.abi_encode(),
+            IUniswapV2Pair::token1Call {}.abi_encode(),
+        ] {
+            let tx = TransactionRequest::default().to(*pair).input(data.into());
+            waiters.push(
+                batch
+                    .add_call("eth_call", &(tx, block))
+                    .map_err(eyre::Error::from)?,
+            );
+        }
+    }
+    batch.send().await.map_err(eyre::Error::from)?;
+
+    let mut waiters = waiters.into_iter();
+    let mut out = Vec::with_capacity(venues.len());
+    for (i, (_, token_in)) in venues.iter().enumerate() {
+        let r_raw: Bytes = waiters.next().expect("3 waiters per venue").await.map_err(eyre::Error::from)?;
+        let t0_raw: Bytes = waiters.next().expect("3 waiters per venue").await.map_err(eyre::Error::from)?;
+        let t1_raw: Bytes = waiters.next().expect("3 waiters per venue").await.map_err(eyre::Error::from)?;
+        let reserves = IUniswapV2Pair::getReservesCall::abi_decode_returns(&r_raw)?;
+        let token0 = IUniswapV2Pair::token0Call::abi_decode_returns(&t0_raw)?;
+        let token1 = IUniswapV2Pair::token1Call::abi_decode_returns(&t1_raw)?;
+
+        let (r0, r1) = (
+            U256::from(reserves.reserve0),
+            U256::from(reserves.reserve1),
+        );
+        let (reserve_in, reserve_out) = if *token_in == token0 {
+            (r0, r1)
+        } else if *token_in == token1 {
+            (r1, r0)
+        } else {
+            return Err(eyre::eyre!(
+                "pair {} does not contain token {token_in} (token0={token0}, token1={token1})",
+                venues[i].0
+            ));
+        };
+        out.push(PoolReserves {
+            reserve_in,
+            reserve_out,
+        });
+    }
+    Ok(out)
+}
+
+/// Fetch V3 pool state (sqrtPriceX96, liquidity) for price calculation.
+pub async fn fetch_v3_pool_state<P: Provider>(
+    provider: &P,
+    pool: Address,
+    token_in: Address,
+) -> Result<(U256, U256)> {
+    let pool_contract = IUniswapV3Pool::new(pool, provider);
+    let slot0 = pool_contract.slot0().call().await?;
+    let liquidity = pool_contract.liquidity().call().await?;
+    let token0 = pool_contract.token0().call().await?;
+    let token1 = pool_contract.token1().call().await?;
+
+    if token_in != token0 && token_in != token1 {
+        return Err(eyre::eyre!(
+            "V3 pool {pool} does not contain token {token_in} (token0={token0}, token1={token1})"
+        ));
+    }
+
+    Ok((U256::from(slot0.sqrtPriceX96), U256::from(liquidity)))
+}
+
+

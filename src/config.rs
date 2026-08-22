@@ -11,6 +11,10 @@ pub enum VenueKind {
     UniswapV2 = 0,
     /// Aerodrome-style router taking `Route[]` structs.
     Aerodrome = 1,
+    /// Uniswap-V3-style router using `exactInputSingle` with `sqrtPriceLimitX96`.
+    UniswapV3 = 2,
+    /// Uniswap-V4-style PoolManager using `unlock` + `swap` with hooks.
+    UniswapV4 = 3,
 }
 
 /// One tradable venue: a pool plus its swap router and fee model.
@@ -20,15 +24,30 @@ pub struct Venue {
     pub kind: VenueKind,
     /// Pool fee in basis points charged on the input amount (30 = 0.3%).
     pub fee_bps: u64,
-    /// Aerodrome pool factory (Address::ZERO = router default). Unused for V2.
+    /// Aerodrome pool factory (Address::ZERO = router default). Unused for V2/V3/V4.
     pub factory: Address,
-    /// Aerodrome stable-pool flag. Unused for V2.
+    /// Aerodrome stable-pool flag. Unused for V2/V3/V4.
     pub stable: bool,
+    /// Uniswap V3 fee tier in hundredths of a bip (500 = 0.05%). Unused for V2/Aero.
+    pub fee_tier: u32,
+    /// Uniswap V4 pool ID (bytes32) for PoolManager. Unused for V2/V3.
+    pub pool_id: [u8; 32],
+}
+
+impl Venue {
+    /// For V2/Aero this is the pair address; for V3 it's the pool address;
+    /// for V4 it's unused (PoolManager handles routing via pool_id).
+    pub fn pool_address(&self) -> Address {
+        self.pair
+    }
 }
 
 /// Bot configuration loaded from environment variables / .env file.
 pub struct Config {
     pub rpc_url: String,
+    /// WebSocket URL for event-driven scanning (Chainstack, Alchemy, etc.).
+    /// If None, falls back to polling.
+    pub wss_url: Option<String>,
     pub private_key: String,
     pub morpho: Address,
     pub arb_contract: Address,
@@ -36,12 +55,17 @@ pub struct Config {
     pub loan_token: Address,
     /// Intermediate token used for the cross-DEX swap legs.
     pub quote_token: Address,
+    /// Wrapped native token (e.g. WETH on Base); used to convert gas cost
+    /// (paid in ETH) into loan-token units.
+    pub wrapped_native: Address,
     /// All DEX venues arbitraged against each other (at least two).
     pub venues: Vec<Venue>,
     /// Flash loan sizes to probe, in loan_token base units.
     pub loan_amounts: Vec<U256>,
     /// Minimum net profit (in loan_token base units) required to execute.
     pub min_profit: U256,
+    /// Gas price in wei for cost calculation. If None, fetched on-chain.
+    pub gas_price_wei: Option<U256>,
     /// Slippage tolerance per swap leg, in basis points (50 = 0.5%). The
     /// simulated leg output scaled by (1 - slippage) becomes the on-chain
     /// `minOut`, bounding price drift and raising the cost of sandwiching.
@@ -62,6 +86,7 @@ impl Config {
         };
 
         let rpc_url = env::var("RPC_URL").map_err(|_| eyre!("missing env var RPC_URL"))?;
+        let wss_url = env::var("WSS_URL").ok().filter(|s| !s.is_empty());
         let private_key =
             env::var("PRIVATE_KEY").map_err(|_| eyre!("missing env var PRIVATE_KEY"))?;
 
@@ -69,14 +94,31 @@ impl Config {
         let arb_contract = parse_addr("ARB_CONTRACT")?;
         let loan_token = parse_addr("LOAN_TOKEN")?;
         let quote_token = parse_addr("QUOTE_TOKEN")?;
+        // Used to price gas (paid in ETH) into loan-token units.
+        let wrapped_native = env::var("WRAPPED_NATIVE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                Address::from_str(&s).map_err(|e| eyre!("invalid WRAPPED_NATIVE: {e}"))
+            })
+            .transpose()?
+            .unwrap_or_else(|| {
+                // WETH on Base mainnet.
+                Address::from_str("0x4200000000000000000000000000000000000006")
+                    .expect("valid constant address")
+            });
         if loan_token == quote_token {
             return Err(eyre!("LOAN_TOKEN and QUOTE_TOKEN must differ"));
         }
 
         // DEX venues as comma-separated entries:
-        //   <pair>:<router>[:<kind>[:<fee_bps>[:<factory>[:<stable>]]]]
-        // kind: v2 (default) | aero; fee_bps default 30; factory defaults to
-        // the zero address (router default); stable default false.
+        //   <pair>:<router>[:<kind>[:<fee_bps>[:<factory>[:<stable>[:<fee_tier>[:<pool_id>]]]]]
+        // kind: v2 (default) | aero | v3 | v4
+        // fee_bps: default 30 (V2/Aero only; V3 uses fee_tier, V4 uses pool_id)
+        // factory: default zero (Aero only)
+        // stable: default false (Aero only)
+        // fee_tier: default 3000 (V3 only, in hundredths of a bip)
+        // pool_id: default zero (V4 only, bytes32 hex)
         let venues_raw =
             env::var("DEX_VENUES").map_err(|_| eyre!("missing env var DEX_VENUES"))?;
         let venues = venues_raw
@@ -93,6 +135,8 @@ impl Config {
                 let kind = match parts.next().map(str::trim).unwrap_or("v2") {
                     "v2" => VenueKind::UniswapV2,
                     "aero" => VenueKind::Aerodrome,
+                    "v3" => VenueKind::UniswapV3,
+                    "v4" => VenueKind::UniswapV4,
                     other => return Err(eyre!("invalid kind '{other}' in DEX_VENUES '{entry}'")),
                 };
                 let fee_bps = parts
@@ -119,6 +163,32 @@ impl Config {
                     .next()
                     .map(|s| matches!(s.trim(), "true" | "1" | "yes"))
                     .unwrap_or(false);
+                let fee_tier = parts
+                    .next()
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u32>()
+                            .map_err(|e| eyre!("invalid fee_tier in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(3000);
+                let pool_id = parts
+                    .next()
+                    .map(|s| {
+                        let s = s.trim().trim_start_matches("0x");
+                        let bytes = alloy::hex::decode(s)
+                            .map_err(|e| eyre!("invalid pool_id in DEX_VENUES '{entry}': {e}"))?;
+                        if bytes.len() != 32 {
+                            return Err(eyre!(
+                                "pool_id must be 32 bytes in DEX_VENUES '{entry}'"
+                            ));
+                        }
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        Ok::<_, eyre::Report>(arr)
+                    })
+                    .transpose()?
+                    .unwrap_or([0u8; 32]);
                 if parts.next().is_some() {
                     return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
                 }
@@ -131,6 +201,8 @@ impl Config {
                     fee_bps,
                     factory,
                     stable,
+                    fee_tier,
+                    pool_id,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -158,6 +230,12 @@ impl Config {
             .map_err(|e| eyre!("invalid MIN_PROFIT: {e}"))?
             .unwrap_or(U256::ZERO);
 
+        let gas_price_wei = env::var("GAS_PRICE_WEI")
+            .ok()
+            .map(|s| U256::from_str(&s))
+            .transpose()
+            .map_err(|e| eyre!("invalid GAS_PRICE_WEI: {e}"))?;
+
         let slippage_bps = env::var("SLIPPAGE_BPS")
             .ok()
             .map(|s| {
@@ -173,7 +251,7 @@ impl Config {
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5_000);
+            .unwrap_or(500);
 
         let dry_run = env::var("DRY_RUN")
             .map(|s| matches!(s.as_str(), "1" | "true" | "yes"))
@@ -181,14 +259,17 @@ impl Config {
 
         Ok(Self {
             rpc_url,
+            wss_url,
             private_key,
             morpho,
             arb_contract,
             loan_token,
             quote_token,
+            wrapped_native,
             venues,
             loan_amounts,
             min_profit,
+            gas_price_wei,
             slippage_bps,
             poll_interval_ms,
             dry_run,
