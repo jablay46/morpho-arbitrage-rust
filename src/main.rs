@@ -64,6 +64,7 @@ async fn run_once(cfg: &Config) -> Result<()> {
         pools.push(morpho_arbitrage_bot::arbitrage::PoolState {
             venue: idx,
             reserves,
+            fee_bps: venue.fee_bps,
         });
     }
 

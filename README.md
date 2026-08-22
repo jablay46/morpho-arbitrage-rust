@@ -18,13 +18,21 @@ contracts/
   FlashArbitrage.sol # receiver flashloan Morpho; mengeksekusi 2 swap on-chain
 ```
 
-Alur: bot membaca reserve semua pool V2 yang dikonfigurasi di `DEX_VENUES`
-(format `<pair>:<router>`, dipisah koma), mensimulasikan cycle
-`loan -> quote -> loan` untuk setiap pasangan venue terurut (i, j), i != j,
-dan beberapa ukuran pinjaman, memilih profit maksimum, menyimulasikannya
-lewat `eth_call`, lalu (jika tidak dry-run) memanggil
-`FlashArbitrage.execute(...)`. Profit divalidasi on-chain (`minProfit`) dan
-di-sweep ke owner. Contract tidak perlu diubah karena router diparameterkan.
+Alur: bot membaca reserve semua pool yang dikonfigurasi di `DEX_VENUES`
+(format `<pair>:<router>[:<kind>[:<fee_bps>[:<factory>[:<stable>]]]]`),
+mensimulasikan cycle `loan -> quote -> loan` untuk setiap pasangan venue
+terurut (i, j), i != j, dengan fee per-venue, dan beberapa ukuran pinjaman,
+memilih profit maksimum, menyimulasikannya lewat `eth_call` (dari alamat
+owner), lalu (jika tidak dry-run) memanggil `FlashArbitrage.execute(...)`.
+Profit divalidasi on-chain (`minProfit`) dan di-sweep ke owner.
+
+Contract mendukung dua keluarga router lewat `SwapLeg.kind`:
+- `0` = Uniswap-V2-style (`address[] path`) — Uniswap V2, Sushiswap V2,
+  Pancakeswap V2.
+- `1` = Aerodrome-style (`Route[]{from,to,stable,factory}`).
+
+Catatan: pool Aerodrome **stable** memakai kurva x^3y+y^3x, bukan constant
+product; simulasi off-chain bot ini hanya akurat untuk pool volatile (vAMM).
 
 ## Menjalankan
 

@@ -1,5 +1,5 @@
 use crate::arbitrage::Opportunity;
-use crate::config::Config;
+use crate::config::{Config, Venue};
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, TxHash};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -8,39 +8,62 @@ use alloy::sol;
 use eyre::Result;
 
 sol! {
+    struct SwapLeg {
+        address router;
+        uint8 kind;
+        address factory;
+        bool stable;
+    }
+
     struct ArbParams {
         address token;
+        address quote;
         uint256 amount;
-        address routerA;
-        address routerB;
-        address[] pathA;
-        address[] pathB;
+        SwapLeg legA;
+        SwapLeg legB;
         uint256 minProfit;
     }
 
     #[sol(rpc)]
     interface IFlashArbitrage {
         function execute(ArbParams params) external;
+        function owner() external view returns (address);
     }
 }
 
-/// Resolve the chosen venue pair to its routers and build the calldata.
+fn build_leg(venue: &Venue) -> SwapLeg {
+    SwapLeg {
+        router: venue.router,
+        kind: venue.kind as u8,
+        factory: venue.factory,
+        stable: venue.stable,
+    }
+}
+
+/// Resolve the chosen venue pair to its swap legs and build the calldata.
 pub fn build_params(cfg: &Config, opp: &Opportunity) -> ArbParams {
     ArbParams {
         token: cfg.loan_token,
+        quote: cfg.quote_token,
         amount: opp.loan_amount,
-        routerA: cfg.venues[opp.first].router,
-        routerB: cfg.venues[opp.second].router,
-        pathA: vec![cfg.loan_token, cfg.quote_token],
-        pathB: vec![cfg.quote_token, cfg.loan_token],
+        legA: build_leg(&cfg.venues[opp.first]),
+        legB: build_leg(&cfg.venues[opp.second]),
         minProfit: cfg.min_profit,
     }
 }
 
-/// Simulate `execute` via eth_call without broadcasting.
-pub async fn simulate<P: Provider>(provider: &P, contract: Address, params: ArbParams) -> Result<()> {
+/// Simulate `execute` via eth_call without broadcasting. The call must carry
+/// `from` = the contract owner, otherwise the contract's `onlyOwner` guard
+/// reverts the simulation. The owner is read on-chain so simulation works in
+/// dry-run mode without a valid private key.
+pub async fn simulate<P: Provider>(
+    provider: &P,
+    contract: Address,
+    params: ArbParams,
+) -> Result<()> {
     let arb = IFlashArbitrage::new(contract, provider);
-    arb.execute(params).call().await?;
+    let owner = arb.owner().call().await?;
+    arb.execute(params).from(owner).call().await?;
     Ok(())
 }
 

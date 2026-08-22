@@ -20,15 +20,25 @@ pub struct PoolReserves {
     pub reserve_out: U256,
 }
 
-/// Constant-product swap output with the standard 0.3% fee (997/1000).
-pub fn get_amount_out(amount_in: U256, reserve_in: U256, reserve_out: U256) -> Option<U256> {
+/// Constant-product swap output with a configurable fee in basis points
+/// (e.g. 30 = 0.3% for Uniswap V2, 5 = 0.05% for an Aerodrome pool).
+pub fn get_amount_out(
+    amount_in: U256,
+    reserve_in: U256,
+    reserve_out: U256,
+    fee_bps: u64,
+) -> Option<U256> {
+    if fee_bps >= 10_000 {
+        return None;
+    }
     if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
         return None;
     }
-    let amount_in_with_fee = amount_in.checked_mul(U256::from(997u64))?;
+    let scale = U256::from(10_000u64);
+    let amount_in_with_fee = amount_in.checked_mul(U256::from(10_000u64 - fee_bps))?;
     let numerator = amount_in_with_fee.checked_mul(reserve_out)?;
     let denominator = reserve_in
-        .checked_mul(U256::from(1000u64))?
+        .checked_mul(scale)?
         .checked_add(amount_in_with_fee)?;
     Some(numerator / denominator)
 }
