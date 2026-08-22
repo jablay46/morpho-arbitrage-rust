@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, U256};
 use clap::{Parser, Subcommand};
 use eyre::Result;
-use morpho_arbitrage_bot::arbitrage::{find_opportunity, PoolState, V3PoolState};
+use morpho_arbitrage_bot::arbitrage::{find_opportunity, v3_priceable, PoolState, V3PoolState};
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
     fetch_pair_tokens, fetch_scan_snapshot, fetch_v3_pair_tokens, orient_reserves, PairTokens,
@@ -228,16 +228,25 @@ where
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
         let (sqrt_price_x96, liquidity) = snapshot.v3_raw[j];
         let venue = &cfg.venues[idx];
+        let v3 = V3PoolState {
+            sqrt_price_x96,
+            liquidity,
+            loan_is_token0: cache.pair_tokens[idx].token0 == cfg.loan_token,
+        };
+        // Drop V3 venues whose virtual reserves can't be priced (extreme
+        // ticks make L*sqrt(P) overflow U256's representable range), rather
+        // than feeding the scanner zeros it would misread as free money.
+        if !v3_priceable(&v3) {
+            warn!(venue = idx, pool = %venue.pair, "V3 pool state unpriceable; skipping venue");
+            continue;
+        }
         pools.push(PoolState {
             venue: idx,
             reserves: PoolReserves {
                 reserve_in: U256::ZERO,
                 reserve_out: U256::ZERO,
             },
-            v3_state: Some(V3PoolState {
-                sqrt_price_x96,
-                liquidity,
-            }),
+            v3_state: Some(v3),
             fee_bps: venue.fee_bps,
             fee_tier: venue.fee_tier,
         });

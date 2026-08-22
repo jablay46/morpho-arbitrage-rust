@@ -154,8 +154,10 @@ impl Config {
                 if fee_bps >= 10_000 {
                     return Err(eyre!("fee_bps {fee_bps} too high in DEX_VENUES '{entry}'"));
                 }
+                // Optional fields: empty string = default.
                 let factory = parts
                     .next()
+                    .filter(|s| !s.trim().is_empty())
                     .map(|s| {
                         Address::from_str(s.trim())
                             .map_err(|e| eyre!("invalid factory in DEX_VENUES '{entry}': {e}"))
@@ -168,6 +170,7 @@ impl Config {
                     .unwrap_or(false);
                 let fee_tier = parts
                     .next()
+                    .filter(|s| !s.trim().is_empty())
                     .map(|s| {
                         s.trim()
                             .parse::<u32>()
@@ -177,6 +180,7 @@ impl Config {
                     .unwrap_or(3000);
                 let pool_id = parts
                     .next()
+                    .filter(|s| !s.trim().is_empty())
                     .map(|s| {
                         let s = s.trim().trim_start_matches("0x");
                         let bytes = alloy::hex::decode(s)

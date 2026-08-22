@@ -6,6 +6,10 @@ use alloy::primitives::U256;
 pub struct V3PoolState {
     pub sqrt_price_x96: U256,
     pub liquidity: U256,
+    /// True when the loan token is the pool's token0; sqrtPriceX96 encodes
+    /// token1/token0, so the virtual-reserve derivation flips depending on
+    /// which side the loan token sits.
+    pub loan_is_token0: bool,
 }
 
 /// Current reserves of one venue's pool, tagged with its index in the
@@ -57,31 +61,53 @@ fn mul_div(a: U256, b: U256, den: U256) -> Option<U256> {
     Some(U256::from_limbs_slice(&limbs[..4]))
 }
 
-/// Derive virtual constant-product reserves for a V3 pool from slot0 state.
-/// reserve_in = liquidity * sqrtPriceX96 / 2^96, reserve_out = liquidity * 2^96 / sqrtPriceX96.
-/// This is only a rough approximation (ignores tick boundaries and active-liquidity
-/// depletion); a quoter-based path should replace it for production V3 routing.
-fn v3_virtual_reserves(v3: V3PoolState) -> Option<(U256, U256)> {
-    if v3.sqrt_price_x96.is_zero() {
-        return None;
-    }
-    let q96 = U256::from(1u128) << 96;
-    let reserve_in = mul_div(v3.liquidity, v3.sqrt_price_x96, q96)?;
-    let reserve_out = mul_div(v3.liquidity, q96, v3.sqrt_price_x96)?;
-    Some((reserve_in, reserve_out))
+/// True when the pool's spot output can be computed without overflow.
+/// Kept for symmetry with the scanner's venue filtering; pools at extreme
+/// ticks are skipped rather than mispriced.
+pub fn v3_priceable(v3: &V3PoolState) -> bool {
+    v3_spot_amount_out(v3, 3000, U256::from(1u64)).is_some()
 }
 
-/// Same derivation with in/out orientation flipped (for the return leg).
-fn v3_virtual_reserves_flipped(v3: V3PoolState) -> Option<(U256, U256)> {
-    let (r_in, r_out) = v3_virtual_reserves(v3)?;
-    Some((r_out, r_in))
+/// Spot output of a V3 pool for `amount_in` of the loan token, derived from
+/// sqrtPriceX96 with U512 intermediates: P = (sqrtP/2^96)^2, so
+/// amount_out = amount_in * sqrtP^2 / 2^192 (or its inverse, depending on
+/// token orientation), less the pool fee. This is a spot-price estimate that
+/// ignores slippage within the pool (tick liquidity), so it slightly
+/// overestimates output for large trades; the on-chain minOut/profit checks
+/// remain the backstop.
+pub fn v3_spot_amount_out(v3: &V3PoolState, fee_tier: u32, amount_in: U256) -> Option<U256> {
+    use alloy::primitives::U512;
+    if v3.sqrt_price_x96.is_zero() || amount_in.is_zero() {
+        return None;
+    }
+    let sqrt512 = U512::from_limbs_slice(v3.sqrt_price_x96.as_limbs());
+    let p_sq = sqrt512 * sqrt512; // ~2^320 max, fits U512
+    let in512 = U512::from_limbs_slice(amount_in.as_limbs());
+    let q192 = U512::from(1u128) << 192;
+    let out512: U512 = if v3.loan_is_token0 {
+        // price = token1/token0 -> out = in * P
+        in512 * p_sq / q192
+    } else {
+        // out = in / P
+        if p_sq.is_zero() {
+            return None;
+        }
+        in512 * q192 / p_sq
+    };
+    let limbs = out512.as_limbs();
+    if limbs[4..].iter().any(|&l| l != 0) {
+        return None; // doesn't fit U256
+    }
+    let out = U256::from_limbs_slice(&limbs[..4]);
+    // Apply the pool fee (fee_tier is in hundredths of a bip: 500 = 0.05%).
+    Some(out * U256::from(1_000_000u64 - fee_tier as u64) / U256::from(1_000_000u64))
 }
 
 /// Simulate the cycle over every ordered venue pair (i, j) for one loan size,
 /// returning the most profitable one clearing `min_profit`, if any.
-/// For V3 venues, prices are approximated from slot0 via virtual
-/// constant-product reserves; for V2/Aero, the exact constant-product
-/// formula is used. Unpriceable pairs are skipped individually.
+/// For V3 venues, outputs are estimated from the slot0 spot price (see
+/// v3_spot_amount_out); for V2/Aero, the exact constant-product formula is
+/// used. Unpriceable pairs are skipped individually.
 pub fn find_opportunity(
     loan_amount: U256,
     pools: &[PoolState],
@@ -95,10 +121,7 @@ pub fn find_opportunity(
             }
             // Leg 1: loan token -> quote token on `first`.
             let quote_out = if let Some(v3) = first.v3_state {
-                let Some((reserve_in, reserve_out)) = v3_virtual_reserves(v3) else {
-                    continue;
-                };
-                let Some(out) = get_amount_out(loan_amount, reserve_in, reserve_out, first.fee_bps) else {
+                let Some(out) = v3_spot_amount_out(&v3, first.fee_tier, loan_amount) else {
                     continue;
                 };
                 out
@@ -115,10 +138,11 @@ pub fn find_opportunity(
             };
             // Leg 2: quote token -> loan token on `second` (reserves flipped).
             let amount_out = if let Some(v3) = second.v3_state {
-                let Some((reserve_in, reserve_out)) = v3_virtual_reserves_flipped(v3) else {
-                    continue;
+                let flipped = V3PoolState {
+                    loan_is_token0: !v3.loan_is_token0,
+                    ..v3
                 };
-                let Some(out) = get_amount_out(quote_out, reserve_in, reserve_out, second.fee_bps) else {
+                let Some(out) = v3_spot_amount_out(&flipped, second.fee_tier, quote_out) else {
                     continue;
                 };
                 out
