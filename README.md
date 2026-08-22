@@ -33,7 +33,8 @@ Contract mendukung dua keluarga router lewat `SwapLeg.kind`:
 
 Setiap leg membawa `minOut` (dihitung dari simulasi dikali
 `1 - SLIPPAGE_BPS`) untuk membatasi slippage akibat drift harga antara
-simulasi dan inklusi; cek `minProfit` di akhir tetap menjadi backstop.
+simulasi dan inklusi; toleransi leg B dikompound dua kali karena input-nya
+adalah output aktual leg A; cek `minProfit` di akhir tetap menjadi backstop.
 
 Catatan MEV di Base: sequencer terpusat dengan mempool privat, jadi tidak
 ada sandwich/frontrunning. Risiko nyata adalah kalah balapan dengan bot arb

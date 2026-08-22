@@ -49,18 +49,22 @@ fn with_slippage(expected: U256, slippage_bps: u64) -> U256 {
 
 /// Resolve the chosen venue pair to its swap legs and build the calldata.
 pub fn build_params(cfg: &Config, opp: &Opportunity) -> ArbParams {
+    // Leg 2's input is leg 1's *actual* output, which may legitimately land
+    // as low as legA.minOut (= quote_out * (1-s)). Leg 2's output then scales
+    // down proportionally to ~amount_out * (1-s), so a single-slippage bound
+    // would revert on any further drift even though the trade still clears
+    // minProfit. Apply the tolerance twice on leg B so it compounds.
+    let leg_a_min = with_slippage(opp.quote_out, cfg.slippage_bps);
+    let leg_b_min = with_slippage(
+        with_slippage(opp.amount_out, cfg.slippage_bps),
+        cfg.slippage_bps,
+    );
     ArbParams {
         token: cfg.loan_token,
         quote: cfg.quote_token,
         amount: opp.loan_amount,
-        legA: build_leg(
-            &cfg.venues[opp.first],
-            with_slippage(opp.quote_out, cfg.slippage_bps),
-        ),
-        legB: build_leg(
-            &cfg.venues[opp.second],
-            with_slippage(opp.amount_out, cfg.slippage_bps),
-        ),
+        legA: build_leg(&cfg.venues[opp.first], leg_a_min),
+        legB: build_leg(&cfg.venues[opp.second], leg_b_min),
         minProfit: cfg.min_profit,
     }
 }
@@ -156,6 +160,52 @@ mod tests {
             payload,
             "re-encoding must reproduce the exact Solidity bytes"
         );
+    }
+
+    #[test]
+    fn build_params_compounds_slippage_on_leg_b() {
+        use crate::arbitrage::Opportunity;
+        use crate::config::{Config, Venue, VenueKind};
+
+        let venue = |kind| Venue {
+            pair: Address::ZERO,
+            router: Address::ZERO,
+            kind,
+            fee_bps: 30,
+            factory: Address::ZERO,
+            stable: false,
+        };
+        let cfg = Config {
+            rpc_url: String::new(),
+            private_key: String::new(),
+            morpho: Address::ZERO,
+            arb_contract: Address::ZERO,
+            loan_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            venues: vec![venue(VenueKind::UniswapV2), venue(VenueKind::Aerodrome)],
+            loan_amounts: vec![],
+            min_profit: U256::ZERO,
+            slippage_bps: 50,
+            poll_interval_ms: 0,
+            dry_run: true,
+        };
+        let opp = Opportunity {
+            first: 0,
+            second: 1,
+            loan_amount: U256::from(10_000u64),
+            quote_out: U256::from(20_000u64),
+            amount_out: U256::from(10_100u64),
+            profit: U256::from(100u64),
+        };
+
+        let params = build_params(&cfg, &opp);
+        // Leg A tolerates one slippage interval: 20000 * 0.995 = 19900.
+        assert_eq!(params.legA.minOut, U256::from(19_900u64));
+        // Leg B tolerates two compounded intervals (its own input may have
+        // drifted down by the leg-A tolerance): floor(10100 * 0.995^2).
+        let expected_b = U256::from(10_100u64) * U256::from(9_950u64) / U256::from(10_000u64)
+            * U256::from(9_950u64) / U256::from(10_000u64);
+        assert_eq!(params.legB.minOut, expected_b);
     }
 }
 
