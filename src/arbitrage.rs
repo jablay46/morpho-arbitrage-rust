@@ -7,6 +7,8 @@ use alloy::primitives::U256;
 pub struct PoolState {
     pub venue: usize,
     pub reserves: PoolReserves,
+    /// Pool fee in basis points (30 = 0.3%).
+    pub fee_bps: u64,
 }
 
 /// A simulated arbitrage outcome for one loan size.
@@ -41,6 +43,7 @@ pub fn find_opportunity(
                 loan_amount,
                 first.reserves.reserve_in,
                 first.reserves.reserve_out,
+                first.fee_bps,
             ) else {
                 continue;
             };
@@ -49,6 +52,7 @@ pub fn find_opportunity(
                 quote_out,
                 second.reserves.reserve_out,
                 second.reserves.reserve_in,
+                second.fee_bps,
             ) else {
                 continue;
             };
@@ -78,12 +82,17 @@ mod tests {
     use super::*;
 
     fn pool(venue: usize, loan: u128, quote: u128) -> PoolState {
+        pool_with_fee(venue, loan, quote, 30)
+    }
+
+    fn pool_with_fee(venue: usize, loan: u128, quote: u128, fee_bps: u64) -> PoolState {
         PoolState {
             venue,
             reserves: PoolReserves {
                 reserve_in: U256::from(loan),
                 reserve_out: U256::from(quote),
             },
+            fee_bps,
         }
     }
 
@@ -94,6 +103,7 @@ mod tests {
             U256::from(1_000u64),
             U256::from(1_000_000u64),
             U256::from(1_000_000u64),
+            30,
         )
         .unwrap();
         // floor(997_000_000 / 1_000_997_000 * 1_000_000) = 996
@@ -101,10 +111,40 @@ mod tests {
     }
 
     #[test]
+    fn lower_fee_pool_yields_more_output() {
+        let high_fee = get_amount_out(
+            U256::from(1_000u64),
+            U256::from(1_000_000u64),
+            U256::from(1_000_000u64),
+            30,
+        )
+        .unwrap();
+        let low_fee = get_amount_out(
+            U256::from(1_000u64),
+            U256::from(1_000_000u64),
+            U256::from(1_000_000u64),
+            5,
+        )
+        .unwrap();
+        assert!(low_fee > high_fee, "a 0.05% pool must out-yield a 0.3% pool");
+    }
+
+    #[test]
+    fn invalid_fee_bps_rejected() {
+        assert!(get_amount_out(
+            U256::from(1_000u64),
+            U256::from(1_000_000u64),
+            U256::from(1_000_000u64),
+            10_000,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn zero_inputs_yield_none() {
-        assert!(get_amount_out(U256::ZERO, U256::from(1u64), U256::from(1u64)).is_none());
-        assert!(get_amount_out(U256::from(1u64), U256::ZERO, U256::from(1u64)).is_none());
-        assert!(get_amount_out(U256::from(1u64), U256::from(1u64), U256::ZERO).is_none());
+        assert!(get_amount_out(U256::ZERO, U256::from(1u64), U256::from(1u64), 30).is_none());
+        assert!(get_amount_out(U256::from(1u64), U256::ZERO, U256::from(1u64), 30).is_none());
+        assert!(get_amount_out(U256::from(1u64), U256::from(1u64), U256::ZERO, 30).is_none());
     }
 
     #[test]

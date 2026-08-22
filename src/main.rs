@@ -64,6 +64,7 @@ async fn run_once(cfg: &Config) -> Result<()> {
         pools.push(morpho_arbitrage_bot::arbitrage::PoolState {
             venue: idx,
             reserves,
+            fee_bps: venue.fee_bps,
         });
     }
 
@@ -88,7 +89,9 @@ async fn run_once(cfg: &Config) -> Result<()> {
 
     let params = executor::build_params(cfg, &opp);
 
-    executor::simulate(&provider, cfg.arb_contract, params.clone()).await?;
+    let signer: alloy::signers::local::PrivateKeySigner = cfg.private_key.parse()?;
+    let owner = signer.address();
+    executor::simulate(&provider, cfg.arb_contract, params.clone(), owner).await?;
 
     if cfg.dry_run {
         info!("dry-run enabled; skipping broadcast");

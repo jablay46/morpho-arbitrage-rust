@@ -3,10 +3,27 @@ use eyre::{eyre, Result};
 use std::env;
 use std::str::FromStr;
 
-/// One tradable venue: a Uniswap-V2-style pool plus its swap router.
+/// Router family of a venue; must match `KIND_*` constants in the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VenueKind {
+    /// Uniswap-V2-style router taking `address[] path` (also Sushiswap V2,
+    /// Pancakeswap V2).
+    UniswapV2 = 0,
+    /// Aerodrome-style router taking `Route[]` structs.
+    Aerodrome = 1,
+}
+
+/// One tradable venue: a pool plus its swap router and fee model.
 pub struct Venue {
     pub pair: Address,
     pub router: Address,
+    pub kind: VenueKind,
+    /// Pool fee in basis points charged on the input amount (30 = 0.3%).
+    pub fee_bps: u64,
+    /// Aerodrome pool factory (Address::ZERO = router default). Unused for V2.
+    pub factory: Address,
+    /// Aerodrome stable-pool flag. Unused for V2.
+    pub stable: bool,
 }
 
 /// Bot configuration loaded from environment variables / .env file.
@@ -49,22 +66,64 @@ impl Config {
         let loan_token = parse_addr("LOAN_TOKEN")?;
         let quote_token = parse_addr("QUOTE_TOKEN")?;
 
-        // DEX venues as comma-separated `pair:router` entries, e.g.
-        // DEX_VENUES=0xPair1:0xRouter1,0xPair2:0xRouter2,...
+        // DEX venues as comma-separated entries:
+        //   <pair>:<router>[:<kind>[:<fee_bps>[:<factory>[:<stable>]]]]
+        // kind: v2 (default) | aero; fee_bps default 30; factory defaults to
+        // the zero address (router default); stable default false.
         let venues_raw =
             env::var("DEX_VENUES").map_err(|_| eyre!("missing env var DEX_VENUES"))?;
         let venues = venues_raw
             .split(',')
             .map(|entry| {
                 let entry = entry.trim();
-                let (pair, router) = entry.split_once(':').ok_or_else(|| {
-                    eyre!("invalid DEX_VENUES entry '{entry}', expected <pair>:<router>")
+                let mut parts = entry.split(':');
+                let pair = parts.next().ok_or_else(|| {
+                    eyre!("invalid DEX_VENUES entry '{entry}', expected <pair>:<router>...")
                 })?;
+                let router = parts.next().ok_or_else(|| {
+                    eyre!("invalid DEX_VENUES entry '{entry}', missing router")
+                })?;
+                let kind = match parts.next().map(str::trim).unwrap_or("v2") {
+                    "v2" => VenueKind::UniswapV2,
+                    "aero" => VenueKind::Aerodrome,
+                    other => return Err(eyre!("invalid kind '{other}' in DEX_VENUES '{entry}'")),
+                };
+                let fee_bps = parts
+                    .next()
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u64>()
+                            .map_err(|e| eyre!("invalid fee_bps in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(30);
+                if fee_bps >= 10_000 {
+                    return Err(eyre!("fee_bps {fee_bps} too high in DEX_VENUES '{entry}'"));
+                }
+                let factory = parts
+                    .next()
+                    .map(|s| {
+                        Address::from_str(s.trim())
+                            .map_err(|e| eyre!("invalid factory in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(Address::ZERO);
+                let stable = parts
+                    .next()
+                    .map(|s| matches!(s.trim(), "true" | "1" | "yes"))
+                    .unwrap_or(false);
+                if parts.next().is_some() {
+                    return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
+                }
                 Ok::<_, eyre::Report>(Venue {
                     pair: Address::from_str(pair.trim())
                         .map_err(|e| eyre!("invalid pair in DEX_VENUES '{entry}': {e}"))?,
                     router: Address::from_str(router.trim())
                         .map_err(|e| eyre!("invalid router in DEX_VENUES '{entry}': {e}"))?,
+                    kind,
+                    fee_bps,
+                    factory,
+                    stable,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
