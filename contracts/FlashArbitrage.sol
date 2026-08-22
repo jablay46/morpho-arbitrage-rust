@@ -73,6 +73,7 @@ contract FlashArbitrage {
     error UnknownLegKind(uint8 kind);
     error Unprofitable(uint256 profit, uint256 minProfit);
     error ApproveFailed(address token, address spender);
+    error TransferFailed(address token, address to);
 
     constructor(address _morpho) {
         morpho = _morpho;
@@ -111,13 +112,13 @@ contract FlashArbitrage {
         // Sweep profit to owner. Balance left is balBefore >= assets, so the
         // subsequent Morpho pull still succeeds.
         if (profit > 0) {
-            IERC20(params.token).transfer(owner, profit);
+            _safeTransfer(params.token, owner, profit);
         }
     }
 
     /// Rescue any token stuck in this contract (dust, failed runs).
     function sweep(address token) external onlyOwner {
-        IERC20(token).transfer(owner, IERC20(token).balanceOf(address(this)));
+        _safeTransfer(token, owner, IERC20(token).balanceOf(address(this)));
     }
 
     function _swap(SwapLeg memory leg, address from, address to, uint256 amountIn)
@@ -157,6 +158,16 @@ contract FlashArbitrage {
             token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
         if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) {
             revert ApproveFailed(token, spender);
+        }
+    }
+
+    // Same non-standard-token handling as _safeApprove: tolerate tokens that
+    // return no data (USDT-style) and require `true` when data is returned.
+    function _safeTransfer(address token, address to, uint256 amount) private {
+        (bool ok, bytes memory ret) =
+            token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) {
+            revert TransferFailed(token, to);
         }
     }
 }
