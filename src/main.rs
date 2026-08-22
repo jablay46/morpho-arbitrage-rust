@@ -89,9 +89,7 @@ async fn run_once(cfg: &Config) -> Result<()> {
 
     let params = executor::build_params(cfg, &opp);
 
-    let signer: alloy::signers::local::PrivateKeySigner = cfg.private_key.parse()?;
-    let owner = signer.address();
-    executor::simulate(&provider, cfg.arb_contract, params.clone(), owner).await?;
+    executor::simulate(&provider, cfg.arb_contract, params.clone()).await?;
 
     if cfg.dry_run {
         info!("dry-run enabled; skipping broadcast");

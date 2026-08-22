@@ -27,6 +27,7 @@ sol! {
     #[sol(rpc)]
     interface IFlashArbitrage {
         function execute(ArbParams params) external;
+        function owner() external view returns (address);
     }
 }
 
@@ -53,15 +54,16 @@ pub fn build_params(cfg: &Config, opp: &Opportunity) -> ArbParams {
 
 /// Simulate `execute` via eth_call without broadcasting. The call must carry
 /// `from` = the contract owner, otherwise the contract's `onlyOwner` guard
-/// reverts the simulation.
+/// reverts the simulation. The owner is read on-chain so simulation works in
+/// dry-run mode without a valid private key.
 pub async fn simulate<P: Provider>(
     provider: &P,
     contract: Address,
     params: ArbParams,
-    from: Address,
 ) -> Result<()> {
     let arb = IFlashArbitrage::new(contract, provider);
-    arb.execute(params).from(from).call().await?;
+    let owner = arb.owner().call().await?;
+    arb.execute(params).from(owner).call().await?;
     Ok(())
 }
 
