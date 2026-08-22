@@ -148,7 +148,15 @@ contract FlashArbitrage {
     function _approve(address token, address spender, uint256 amount) internal {
         // Reset first for non-standard ERC20s (e.g. USDT-style) that reject
         // changing a non-zero allowance directly.
-        if (!IERC20(token).approve(spender, 0)) revert ApproveFailed(token, spender);
-        if (!IERC20(token).approve(spender, amount)) revert ApproveFailed(token, spender);
+        _safeApprove(token, spender, 0);
+        _safeApprove(token, spender, amount);
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) private {
+        (bool ok, bytes memory ret) =
+            token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) {
+            revert ApproveFailed(token, spender);
+        }
     }
 }
