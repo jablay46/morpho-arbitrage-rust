@@ -1,6 +1,7 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::sol;
+use alloy::sol_types::SolCall;
 use eyre::Result;
 
 sol! {
@@ -103,19 +104,67 @@ pub async fn fetch_reserves<P: Provider>(
 }
 
 /// Fetch reserves for multiple venues in a single JSON-RPC batch for
-/// block-aligned snapshots. Falls back to serial calls if batching fails.
+/// block-aligned snapshots. Each venue contributes 3 calls
+/// (getReserves + token0 + token1) to one batch, so all pools are read
+/// against the same block at the node.
 pub async fn fetch_reserves_batched<P: Provider>(
     provider: &P,
     venues: &[(Address, Address)], // (pair, token_in) pairs
 ) -> Result<Vec<PoolReserves>> {
-    // For now, use serial calls as a fallback; alloy's batch API requires
-    // custom transport. In production, use a multicall contract or
-    // alloy::providers::ProviderBuilder::with_batch for true batching.
-    let mut results = Vec::with_capacity(venues.len());
-    for (pair, token_in) in venues {
-        results.push(fetch_reserves(provider, *pair, *token_in).await?);
+    use alloy::eips::BlockNumberOrTag;
+    use alloy::rpc::types::eth::TransactionRequest;
+
+    // Pin every call to "latest"; Chainstack requires the block argument, and
+    // an explicit tag keeps all reads in the batch against the same block.
+    let block = BlockNumberOrTag::Latest;
+    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
+    let mut waiters = Vec::with_capacity(venues.len() * 3);
+    for (pair, _) in venues {
+        for data in [
+            IUniswapV2Pair::getReservesCall {}.abi_encode(),
+            IUniswapV2Pair::token0Call {}.abi_encode(),
+            IUniswapV2Pair::token1Call {}.abi_encode(),
+        ] {
+            let tx = TransactionRequest::default().to(*pair).input(data.into());
+            waiters.push(
+                batch
+                    .add_call("eth_call", &(tx, block))
+                    .map_err(eyre::Error::from)?,
+            );
+        }
     }
-    Ok(results)
+    batch.send().await.map_err(eyre::Error::from)?;
+
+    let mut waiters = waiters.into_iter();
+    let mut out = Vec::with_capacity(venues.len());
+    for (i, (_, token_in)) in venues.iter().enumerate() {
+        let r_raw: Bytes = waiters.next().expect("3 waiters per venue").await.map_err(eyre::Error::from)?;
+        let t0_raw: Bytes = waiters.next().expect("3 waiters per venue").await.map_err(eyre::Error::from)?;
+        let t1_raw: Bytes = waiters.next().expect("3 waiters per venue").await.map_err(eyre::Error::from)?;
+        let reserves = IUniswapV2Pair::getReservesCall::abi_decode_returns(&r_raw)?;
+        let token0 = IUniswapV2Pair::token0Call::abi_decode_returns(&t0_raw)?;
+        let token1 = IUniswapV2Pair::token1Call::abi_decode_returns(&t1_raw)?;
+
+        let (r0, r1) = (
+            U256::from(reserves.reserve0),
+            U256::from(reserves.reserve1),
+        );
+        let (reserve_in, reserve_out) = if *token_in == token0 {
+            (r0, r1)
+        } else if *token_in == token1 {
+            (r1, r0)
+        } else {
+            return Err(eyre::eyre!(
+                "pair {} does not contain token {token_in} (token0={token0}, token1={token1})",
+                venues[i].0
+            ));
+        };
+        out.push(PoolReserves {
+            reserve_in,
+            reserve_out,
+        });
+    }
+    Ok(out)
 }
 
 /// Fetch V3 pool state (sqrtPriceX96, liquidity) for price calculation.

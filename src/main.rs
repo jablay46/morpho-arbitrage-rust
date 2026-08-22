@@ -62,13 +62,26 @@ async fn main() -> Result<()> {
 }
 
 /// Event-driven scanning: subscribe to newHeads via WebSocket, scan per block.
-/// Note: alloy's WebSocket support requires the `ws` feature which is not
-/// available in alloy 1.x. This is a placeholder for when WebSocket support
-/// is added via a custom transport or a different crate.
-async fn run_event_driven(cfg: &Config, _wss_url: &str) -> Result<()> {
-    // TODO: Implement WebSocket subscription when alloy supports it or
-    // via a custom transport. For now, fall back to polling.
-    warn!("WebSocket event-driven scanning not yet implemented; falling back to polling");
+/// On subscription failure or stream end, falls back to polling so the bot
+/// keeps running (a dropped WSS connection must not kill the process).
+async fn run_event_driven(cfg: &Config, wss_url: &str) -> Result<()> {
+    use alloy::providers::Provider;
+    use futures::StreamExt;
+
+    let ws = alloy::rpc::client::WsConnect::new(wss_url);
+    let client = alloy::rpc::client::RpcClient::connect_pubsub(ws).await?;
+    let provider = alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
+
+    let sub = provider.subscribe_blocks().await?;
+    info!("subscribed to newHeads; scanning per block");
+    let mut stream = sub.into_stream();
+    while let Some(header) = stream.next().await {
+        info!(block = header.number, "new block; scanning");
+        if let Err(e) = run_once_with_provider(cfg, &provider).await {
+            warn!(error = %e, "event-driven scan failed");
+        }
+    }
+    warn!("block subscription ended; falling back to polling");
     loop {
         if let Err(e) = run_once(cfg).await {
             warn!(error = %e, "scan iteration failed");
@@ -89,9 +102,12 @@ async fn fetch_all_reserves<P: alloy::providers::Provider>(
 
     // Try batched fetch first; fall back to serial if it fails.
     let reserves = match fetch_reserves_batched(provider, &venues).await {
-        Ok(r) => r,
-        Err(_) => {
-            // Fallback to serial for providers that don't support batching.
+        Ok(r) => {
+            info!("reserves fetched via JSON-RPC batch");
+            r
+        }
+        Err(e) => {
+            warn!(error = %e, "batched fetch failed; falling back to serial");
             let mut results = Vec::with_capacity(cfg.venues.len());
             for venue in &cfg.venues {
                 results.push(fetch_reserves(provider, venue.pair, cfg.loan_token).await?);
