@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
         Command::Scan => {
             let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Some(wss_url) = &cfg.wss_url {
-                info!(wss = %wss_url, "starting event-driven scanning via WebSocket");
+                info!(wss = %redact_url(wss_url), "starting event-driven scanning via WebSocket");
                 run_event_driven(&cfg, &cache, wss_url, &broadcaster, &inflight).await?;
             } else {
                 info!(
@@ -164,6 +164,19 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Strip credentials from a URL for logging: keep scheme + host, drop the
+/// path/query where API keys typically live (e.g. Chainstack endpoints).
+fn redact_url(url: &str) -> String {
+    match url.find("://") {
+        Some(i) => {
+            let rest = &url[i + 3..];
+            let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+            format!("{}://{}", &url[..i], host)
+        }
+        None => url.split(['/', '?', '#']).next().unwrap_or(url).to_string(),
+    }
 }
 
 /// Build the wallet-enabled HTTP provider used to broadcast trades.
@@ -477,4 +490,25 @@ where
 {
     let provider = alloy::providers::ProviderBuilder::new().connect_http(cfg.rpc_url.parse()?);
     run_once_with_provider(cfg, cache, &provider, broadcaster, inflight).await
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_url;
+
+    #[test]
+    fn strips_path_and_query() {
+        assert_eq!(
+            redact_url("wss://node.example.com/SECRETAPIKEY"),
+            "wss://node.example.com"
+        );
+        assert_eq!(
+            redact_url("https://eth.example.com/v2/KEY?x=1"),
+            "https://eth.example.com"
+        );
+        assert_eq!(
+            redact_url("https://mainnet.base.org"),
+            "https://mainnet.base.org"
+        );
+    }
 }
