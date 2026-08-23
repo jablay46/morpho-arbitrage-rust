@@ -234,7 +234,7 @@ Variabel yang tersedia:
 Format `DEX_VENUES` (koma-separated):
 
 ```
-<POOL>:<ROUTER>[:<kind>[:<fee_bps>[:<factory>[:<stable>[:<fee_tier>[:<pool_id>]]]]]
+<POOL>:<ROUTER>[:<kind>[:<fee_bps>[:<factory>[:<stable>[:<fee_tier>[:<pool_id>[:<quoter>]]]]]]
 ```
 
 - `POOL` = alamat pool/pair, atau `auto` untuk resolve dari `factory` saat startup.
@@ -242,6 +242,9 @@ Format `DEX_VENUES` (koma-separated):
 - `fee_bps` = fee pool dalam basis point (default 30; untuk V2/Aero).
 - `fee_tier` = fee tier Uniswap V3 dalam hundredths of a bip (500/3000/10000).
 - `stable` = `true` untuk pool stable Aerodrome.
+- `quoter` = override QuoterV2 per-venue (V3, opsional). Kosongkan untuk
+  memakai `QUOTER_V2` global. Wajib diisi untuk V3 venue non-Uniswap
+  (mis. PancakeSwap V3) karena tiap factory punya quoter sendiri.
 
 Alamat terverifikasi di Base:
 
@@ -253,6 +256,9 @@ Aerodrome   router  0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874e43
 Uniswap V3  router  0x2626664c2603336E57B271c5C0b26F421741e481
             factory 0x33128a8fC17869897dcE68Ed026d694621f6FDfD
 QuoterV2            0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a
+Pancake V3  router  0x1b81D678ffb9C0263b24A97847620C99d213eB14
+            factory 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865
+QuoterV2            0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
 Morpho Blue         0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
 WETH                0x4200000000000000000000000000000000000006
 USDC                0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
@@ -263,6 +269,19 @@ Contoh WETH/USDC di 3 venue sekaligus (pool auto-resolve):
 ```bash
 DEX_VENUES=auto:0x4752ba5DBc23f44D87826276BF6Fd6b1c372aD24:v2:30:0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6,auto:0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874e43:aero:30:0x420DD381b31aEf6683db6B902084cB0FFECe40Da,auto:0x2626664c2603336E57B271c5C0b26F421741e481:v3:30:0x33128a8fC17869897dcE68Ed026d694621f6FDfD::3000
 ```
+
+Contoh menambah PancakeSwap V3 (fee tier 500 = 0.05%). Pool di-resolve
+otomatis dari factory, dan `quoter` diisi karena quoter Pancake berbeda
+dari Uniswap:
+
+```bash
+DEX_VENUES=...,auto:0x1b81D678ffb9C0263b24A97847620C99d213eB14:v3:30:0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865::500::0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
+```
+
+Catatan: `auto` untuk V3 me-resolve pool lewat `getPool(loan, quote,
+fee_tier)` di factory — jadi `fee_tier` menentukan pool mana yang dipakai,
+dan `quoter` menentukan kontrak yang meng-quote-nya. Keduanya harus milik
+DEX yang sama.
 
 ## 6. Menjalankan Bot
 

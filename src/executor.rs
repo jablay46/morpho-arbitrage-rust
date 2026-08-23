@@ -247,6 +247,7 @@ mod tests {
             stable: false,
             fee_tier: 3000,
             pool_id: [0u8; 32],
+            quoter: Address::ZERO,
         };
         let cfg = Config {
             rpc_url: String::new(),

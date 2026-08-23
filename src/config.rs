@@ -35,6 +35,11 @@ pub struct Venue {
     pub fee_tier: u32,
     /// Uniswap V4 pool ID (bytes32) for PoolManager. Unused for V2/V3.
     pub pool_id: [u8; 32],
+    /// Per-venue QuoterV2 override (V3 only). Address::ZERO = use the
+    /// global `Config::quoter_v2`. Needed for V3 venues whose quotes live
+    /// on a different deployment (e.g. PancakeSwap V3), since each factory
+    /// has its own quoter contract.
+    pub quoter: Address,
 }
 
 impl Venue {
@@ -213,6 +218,17 @@ impl Config {
                     })
                     .transpose()?
                     .unwrap_or([0u8; 32]);
+                // Optional per-venue QuoterV2 override (V3 only); empty or
+                // absent = fall back to the global QUOTER_V2.
+                let quoter = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        Address::from_str(s.trim())
+                            .map_err(|e| eyre!("invalid quoter in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(Address::ZERO);
                 if parts.next().is_some() {
                     return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
                 }
@@ -238,6 +254,7 @@ impl Config {
                     stable,
                     fee_tier,
                     pool_id,
+                    quoter,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
