@@ -130,15 +130,6 @@ async fn main() -> Result<()> {
         "bot configured"
     );
 
-    if cfg.loan_token != cfg.wrapped_native && cfg.gas_cost_loan.is_zero() && !cfg.dry_run {
-        warn!(
-            loan_token = %cfg.loan_token,
-            wrapped_native = %cfg.wrapped_native,
-            "loan token is not wrapped native and GAS_COST_LOAN is unset; \
-             net-profit filtering degrades to gross-profit (gas unaccounted)"
-        );
-    }
-
     match cli.command {
         Command::Once => run_once(&cfg, &cache, &broadcaster, None).await?,
         Command::Scan => {
@@ -377,10 +368,9 @@ where
         return Ok(());
     };
 
-    // Estimate gas cost and subtract from profit. Gas is paid in ETH
-    // (wrapped_native on L2); when the loan token differs there is no
-    // on-the-fly conversion, so the configured GAS_COST_LOAN fallback is
-    // used instead (warned about at startup when unset).
+    // Estimate gas cost and subtract from profit. Gas is paid in ETH;
+    // config enforces loan_token == wrapped_native, so the wei estimate
+    // is directly comparable to profit in loan-token units.
     //
     // Two-stage build: estimate gas with a provisional params (minProfit
     // barely affects calldata size/gas), then rebuild with the on-chain
@@ -393,12 +383,7 @@ where
         let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
         let gas_estimate =
             executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional).await?;
-        let gas_cost_wei = gas_estimate * gas_price;
-        if cfg.loan_token == cfg.wrapped_native {
-            gas_cost_wei
-        } else {
-            cfg.gas_cost_loan
-        }
+        gas_estimate * gas_price
     };
 
     let net_profit = opp.profit.saturating_sub(gas_cost_loan);
@@ -429,11 +414,6 @@ where
         info!("dry-run enabled; skipping broadcast");
         return Ok(());
     }
-
-    // eth_estimateGas fully executes the tx, so this call doubles as the
-    // pre-broadcast simulation gate on the FINAL params — a separate
-    // eth_call would only repeat the same execution and add latency.
-    executor::estimate_gas(provider, cfg.arb_contract, cache.owner, params.clone()).await?;
 
     // Claim the in-flight slot before broadcasting so subsequent scans
     // skip trading while this tx is pending inclusion. Without this the

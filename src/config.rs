@@ -81,12 +81,6 @@ pub struct Config {
     /// traversal via eth_call). Defaults to the Base deployment; QUOTER_V2
     /// must be set explicitly for any other chain.
     pub quoter_v2: Address,
-    /// Gas cost fallback in loan-token base units, used when the loan token
-    /// is not the wrapped native token (gas is paid in ETH and cannot be
-    /// converted on the fly without tracking an extra pool). Set this to a
-    /// conservative estimate, otherwise net-profit filtering silently
-    /// degrades to gross-profit filtering for non-native loans.
-    pub gas_cost_loan: U256,
 }
 
 impl Config {
@@ -120,6 +114,18 @@ impl Config {
             });
         if loan_token == quote_token {
             return Err(eyre!("LOAN_TOKEN and QUOTE_TOKEN must differ"));
+        }
+        // Gas is paid in ETH but profit accrues in the loan token. Only when
+        // the loan token IS the wrapped native token can the gas cost be
+        // subtracted exactly; for any other loan token there is no trusted
+        // on-the-fly conversion, and pretending otherwise turns net-profit
+        // filtering into gross-profit filtering. Restrict rather than
+        // mislead.
+        if loan_token != wrapped_native {
+            return Err(eyre!(
+                "LOAN_TOKEN must equal WRAPPED_NATIVE ({wrapped_native}); \
+                 non-native loans cannot account for gas correctly"
+            ));
         }
 
         // DEX venues as comma-separated entries:
@@ -308,13 +314,6 @@ impl Config {
                     .expect("valid constant address")
             });
 
-        let gas_cost_loan = env::var("GAS_COST_LOAN")
-            .ok()
-            .map(|s| U256::from_str(&s))
-            .transpose()
-            .map_err(|e| eyre!("invalid GAS_COST_LOAN: {e}"))?
-            .unwrap_or(U256::ZERO);
-
         Ok(Self {
             rpc_url,
             wss_url,
@@ -332,7 +331,6 @@ impl Config {
             poll_interval_ms,
             dry_run,
             quoter_v2,
-            gas_cost_loan,
         })
     }
 }

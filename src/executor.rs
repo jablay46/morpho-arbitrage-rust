@@ -265,7 +265,6 @@ mod tests {
             poll_interval_ms: 0,
             dry_run: true,
             quoter_v2: Address::ZERO,
-            gas_cost_loan: U256::ZERO,
         };
         let opp = Opportunity {
             first: 0,

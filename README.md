@@ -41,13 +41,13 @@ Alur satu iterasi scan:
    Venue V2 dihitung lokal dengan rumus constant-product yang eksak.
 3. **Pencarian peluang** — semua pasangan venue terurut (i, j), i != j, dan
    semua ukuran pinjaman; dipilih profit kotor maksimum.
-4. **Filter gas** — `eth_estimateGas` untuk `execute`, dikali gas price,
-   dikonversi ke unit loan token (langsung jika loan = wrapped native,
-   atau fallback `GAS_COST_LOAN`). Profit bersih harus >= `MIN_PROFIT`.
-5. **Gate simulasi** — `eth_estimateGas` kedua pada params final berfungsi
-   sekaligus sebagai simulasi penuh (estimateGas mengeksekusi tx); jika
-   akan revert, broadcast dibatalkan tanpa biaya.
-6. **Broadcast fire-and-forget** — tx dikirim dan bot langsung kembali
+4. **Filter gas** — `eth_estimateGas` untuk `execute`, dikali gas price.
+   Karena `LOAN_TOKEN` diwajibkan sama dengan wrapped native, estimasi wei
+   langsung sebanding dengan profit. Profit bersih harus >= `MIN_PROFIT`.
+   Call ini sekaligus berfungsi sebagai gate simulasi: estimateGas
+   mengeksekusi tx penuh, jadi opportunity yang akan revert ditolak di
+   sini tanpa biaya.
+5. **Broadcast fire-and-forget** — tx dikirim dan bot langsung kembali
    memindai; receipt dipantau di background task. Selama satu tx masih
    pending inklusi, bot menahan diri dari broadcast duplikat (flag
    in-flight yang dibersihkan oleh watcher receipt), sehingga satu
@@ -72,7 +72,8 @@ dikompound dua kali karena input-nya adalah output aktual leg A; cek
 Catatan MEV di Base: sequencer terpusat dengan mempool privat, jadi tidak
 ada sandwich/frontrunning. Risiko nyata adalah kalah balapan dengan bot arb
 lain — tx yang kalah revert dan rugi gas. Mitigasi: RPC latensi rendah,
-`WSS_URL` untuk scanning per-block, dan gate simulasi tepat sebelum kirim.
+`WSS_URL` untuk scanning per-block, dan estimateGas sebagai gate simulasi
+tepat sebelum kirim.
 
 Catatan: pool Aerodrome **stable** memakai kurva x^3y+y^3x, bukan constant
 product; simulasi off-chain bot ini hanya akurat untuk pool volatile (vAMM).
@@ -213,15 +214,14 @@ Variabel yang tersedia:
 | `PRIVATE_KEY` | Ya | Private key wallet bot (= owner kontrak). **Jangan pernah commit.** |
 | `MORPHO_ADDRESS` | Ya | Morpho Blue: `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb`. |
 | `ARB_CONTRACT` | Ya | Alamat kontrak hasil deploy langkah 4. |
-| `LOAN_TOKEN` | Ya | Token yang dipinjam + unit profit (mis. WETH `0x4200...0006`). |
+| `LOAN_TOKEN` | Ya | Token yang dipinjam + unit profit. **Harus sama dengan `WRAPPED_NATIVE`** (gas dibayar ETH; hanya loan native yang bisa memperhitungkan gas secara eksak). |
 | `QUOTE_TOKEN` | Ya | Token perantara cycle (mis. USDC `0x8335...2913`). |
-| `WRAPPED_NATIVE` | Tidak | Default WETH Base. Dipakai mengonversi gas (ETH) ke unit loan token. |
+| `WRAPPED_NATIVE` | Tidak | Default WETH Base. `LOAN_TOKEN` wajib menyamainya. |
 | `DEX_VENUES` | Ya | Daftar venue, format di bawah. |
 | `LOAN_AMOUNTS` | Tidak | Ukuran pinjaman yang diuji, koma-separated (base unit). Default `1000000000000000000` (1 token). |
 | `MIN_PROFIT` | Ya* | Profit bersih minimum (base unit loan token). **Harus > 0 jika `DRY_RUN=false`**. |
 | `SLIPPAGE_BPS` | Tidak | Toleransi slippage per leg dalam bps. Default `50` (0.5%). |
 | `GAS_PRICE_WEI` | Tidak | Override gas price; default diambil on-chain. |
-| `GAS_COST_LOAN` | Tidak | Estimasi biaya gas dalam unit loan token — dipakai hanya jika `LOAN_TOKEN` bukan wrapped native. |
 | `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (**khusus Base**; chain lain wajib diisi, mis. Ethereum mainnet `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`). |
 | `POLL_INTERVAL_MS` | Tidak | Interval polling untuk mode `scan` tanpa WSS. Default `500`. |
 | `DRY_RUN` | Tidak | Default `true` = hanya simulasi, tidak broadcast. Set `false` untuk live trading. |
@@ -352,6 +352,6 @@ Tips produksi:
 - Pakai wallet khusus bot dengan saldo minimal; profit tersimpan di kontrak
   dan hanya bisa di-`sweep` oleh owner.
 - `FlashArbitrage.sol` dibatasi `onlyOwner`; callback dibatasi ke Morpho.
-- Pertahanan berlapis: `minOut` per leg → `minProfit` on-chain → gas
-  estimate sebagai gate simulasi. Kegagalan terburuk adalah rugi gas,
+- Pertahanan berlapis: `minOut` per leg → `minProfit` on-chain →
+  `eth_estimateGas` sebagai gate simulasi. Kegagalan terburuk adalah rugi gas,
   bukan kehilangan principal (flash loan yang gagal otomatis revert).
