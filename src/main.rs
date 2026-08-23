@@ -166,6 +166,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Pick the quoter for a V3 venue: its per-venue override when set,
+/// otherwise the global QUOTER_V2.
+fn resolve_quoter(cfg: &Config, venue: &morpho_arbitrage_bot::config::Venue) -> Address {
+    if venue.quoter == Address::ZERO {
+        cfg.quoter_v2
+    } else {
+        venue.quoter
+    }
+}
+
 /// Strip credentials from a URL for logging: keep scheme + host, drop the
 /// path/query where API keys typically live (e.g. Chainstack endpoints).
 fn redact_url(url: &str) -> String {
@@ -271,17 +281,11 @@ where
                 token_out: cfg.quote_token,
                 fee_tier: cfg.venues[idx].fee_tier,
                 amount_in: size,
+                quoter: resolve_quoter(cfg, &cfg.venues[idx]),
             });
         }
     }
-    let snapshot = fetch_scan_snapshot(
-        provider,
-        cfg.quoter_v2,
-        &cache.v2_pairs,
-        &leg1_requests,
-        block,
-    )
-    .await?;
+    let snapshot = fetch_scan_snapshot(provider, &cache.v2_pairs, &leg1_requests, block).await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
 
     // Assemble leg-1 outputs per venue; V3 quotes come straight from the
@@ -366,6 +370,7 @@ where
                         token_out: cfg.loan_token,
                         fee_tier: cfg.venues[venue_idx].fee_tier,
                         amount_in: q,
+                        quoter: resolve_quoter(cfg, &cfg.venues[venue_idx]),
                     },
                 ));
             }
@@ -373,7 +378,7 @@ where
     }
     if !phase2.is_empty() {
         let requests: Vec<QuoteRequest> = phase2.iter().map(|(_, r)| *r).collect();
-        let results = fetch_quotes(provider, cfg.quoter_v2, &requests, block).await?;
+        let results = fetch_quotes(provider, &requests, block).await?;
         let mut grouped: Vec<Vec<(U256, Option<U256>)>> =
             (0..legs.len()).map(|_| Vec::new()).collect();
         for ((s, req), out) in phase2.iter().zip(results) {

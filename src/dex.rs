@@ -241,6 +241,11 @@ pub struct QuoteRequest {
     pub token_out: Address,
     pub fee_tier: u32,
     pub amount_in: U256,
+    /// QuoterV2 contract to call; per-request so a single batch can price
+    /// venues whose V3 quotes live on different quoter deployments (e.g.
+    /// Uniswap vs PancakeSwap), which have distinct factories and therefore
+    /// distinct quoter contracts.
+    pub quoter: Address,
 }
 
 /// Per-scan bundle of everything the bot needs from the chain, fetched in
@@ -258,8 +263,8 @@ pub struct ScanSnapshot {
     pub gas_price: U256,
 }
 
-/// Encode one quote request as an eth_call transaction against `quoter`.
-fn quote_tx(quoter: Address, req: &QuoteRequest) -> alloy::rpc::types::eth::TransactionRequest {
+/// Encode one quote request as an eth_call transaction against its quoter.
+fn quote_tx(req: &QuoteRequest) -> alloy::rpc::types::eth::TransactionRequest {
     use alloy::rpc::types::eth::TransactionRequest;
     let call = IQuoterV2::quoteExactInputSingleCall {
         params: QuoteExactInputSingleParams {
@@ -271,7 +276,7 @@ fn quote_tx(quoter: Address, req: &QuoteRequest) -> alloy::rpc::types::eth::Tran
         },
     };
     TransactionRequest::default()
-        .to(quoter)
+        .to(req.quoter)
         .input(call.abi_encode().into())
 }
 
@@ -293,7 +298,6 @@ fn decode_quote(raw: &Bytes) -> Option<U256> {
 /// quote batch are consistent with each other.
 pub async fn fetch_scan_snapshot<P: Provider>(
     provider: &P,
-    quoter: Address,
     v2_venues: &[Address], // pair addresses
     quotes: &[QuoteRequest],
     block: alloy::eips::BlockId,
@@ -317,7 +321,7 @@ pub async fn fetch_scan_snapshot<P: Provider>(
     for req in quotes {
         quote_waiters.push(
             batch
-                .add_call::<_, Bytes>("eth_call", &(quote_tx(quoter, req), block))
+                .add_call::<_, Bytes>("eth_call", &(quote_tx(req), block))
                 .map_err(eyre::Error::from)?,
         );
     }
@@ -382,7 +386,6 @@ pub async fn fetch_scan_snapshot<P: Provider>(
 /// Pinned to the same block as the phase-1 snapshot.
 pub async fn fetch_quotes<P: Provider>(
     provider: &P,
-    quoter: Address,
     requests: &[QuoteRequest],
     block: alloy::eips::BlockId,
 ) -> Result<Vec<Option<U256>>> {
@@ -391,7 +394,7 @@ pub async fn fetch_quotes<P: Provider>(
     for req in requests {
         waiters.push(
             batch
-                .add_call::<_, Bytes>("eth_call", &(quote_tx(quoter, req), block))
+                .add_call::<_, Bytes>("eth_call", &(quote_tx(req), block))
                 .map_err(eyre::Error::from)?,
         );
     }
