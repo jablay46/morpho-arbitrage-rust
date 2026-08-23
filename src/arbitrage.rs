@@ -1,31 +1,5 @@
-use crate::dex::{get_amount_out, PoolReserves};
+use crate::dex::get_amount_out;
 use alloy::primitives::U256;
-
-/// V3 pool state (sqrtPriceX96, liquidity) for price calculation.
-#[derive(Debug, Clone, Copy)]
-pub struct V3PoolState {
-    pub sqrt_price_x96: U256,
-    pub liquidity: U256,
-    /// True when the loan token is the pool's token0; sqrtPriceX96 encodes
-    /// token1/token0, so the virtual-reserve derivation flips depending on
-    /// which side the loan token sits.
-    pub loan_is_token0: bool,
-}
-
-/// Current reserves of one venue's pool, tagged with its index in the
-/// configured venue list. For V2/Aero, reserves are oriented loan-token
-/// first. For V3, `v3_state` is used instead of reserves.
-#[derive(Debug, Clone, Copy)]
-pub struct PoolState {
-    pub venue: usize,
-    pub reserves: PoolReserves,
-    /// V3 pool state (sqrtPriceX96, liquidity). None for V2/Aero.
-    pub v3_state: Option<V3PoolState>,
-    /// Pool fee in basis points (30 = 0.3%).
-    pub fee_bps: u64,
-    /// V3 fee tier (only used when v3_state is Some).
-    pub fee_tier: u32,
-}
 
 /// A simulated arbitrage outcome for one loan size.
 #[derive(Debug, Clone, Copy)]
@@ -43,143 +17,156 @@ pub struct Opportunity {
     pub profit: U256,
 }
 
-/// True when the pool's spot output can be computed without overflow.
-/// Kept for symmetry with the scanner's venue filtering; pools at extreme
-/// ticks are skipped rather than mispriced.
-pub fn v3_priceable(v3: &V3PoolState) -> bool {
-    v3_spot_amount_out(v3, 3000, U256::from(1u64)).is_some()
+/// Precomputed swap quotes for one venue over one scan. Both legs carry
+/// *real* executable outputs: exact constant-product math for V2/Aero
+/// venues, QuoterV2 results (tick/liquidity traversal done on-chain) for
+/// V3 venues. None means the venue could not quote that amount (reverted
+/// quoter call, empty reserves), and the pair is skipped rather than
+/// mispriced.
+pub struct VenueQuotes {
+    pub venue: usize,
+    /// Leg 1 (loan -> quote) output per configured loan size, aligned with
+    /// the `loan_amounts` slice passed to `find_opportunity`.
+    pub leg1: Vec<Option<U256>>,
+    /// Leg 2 (quote -> loan) outputs: `(quote_in, loan_out)` for every
+    /// distinct leg-1 output produced by the OTHER venues this scan.
+    pub leg2: Vec<(U256, Option<U256>)>,
 }
 
-/// Spot output of a V3 pool for `amount_in` of the loan token, derived from
-/// sqrtPriceX96 with U512 intermediates: P = (sqrtP/2^96)^2, so
-/// amount_out = amount_in * sqrtP^2 / 2^192 (or its inverse, depending on
-/// token orientation), less the pool fee. This is a spot-price estimate that
-/// ignores slippage within the pool (tick liquidity), so it slightly
-/// overestimates output for large trades; the on-chain minOut/profit checks
-/// remain the backstop.
-pub fn v3_spot_amount_out(v3: &V3PoolState, fee_tier: u32, amount_in: U256) -> Option<U256> {
-    use alloy::primitives::U512;
-    if v3.sqrt_price_x96.is_zero() || amount_in.is_zero() {
-        return None;
-    }
-    let sqrt512 = U512::from_limbs_slice(v3.sqrt_price_x96.as_limbs());
-    let p_sq = sqrt512 * sqrt512; // ~2^320 max, fits U512
-    let in512 = U512::from_limbs_slice(amount_in.as_limbs());
-    let q192 = U512::from(1u128) << 192;
-    let out512: U512 = if v3.loan_is_token0 {
-        // price = token1/token0 -> out = in * P
-        in512 * p_sq / q192
-    } else {
-        // out = in / P
-        if p_sq.is_zero() {
-            return None;
-        }
-        in512 * q192 / p_sq
-    };
-    let limbs = out512.as_limbs();
-    if limbs[4..].iter().any(|&l| l != 0) {
-        return None; // doesn't fit U256
-    }
-    let out = U256::from_limbs_slice(&limbs[..4]);
-    // Apply the pool fee (fee_tier is in hundredths of a bip: 500 = 0.05%).
-    Some(out * U256::from(1_000_000u64 - fee_tier as u64) / U256::from(1_000_000u64))
-}
-
-/// Simulate the cycle over every ordered venue pair (i, j) for one loan size,
-/// returning the most profitable one clearing `min_profit`, if any.
-/// For V3 venues, outputs are estimated from the slot0 spot price (see
-/// v3_spot_amount_out); for V2/Aero, the exact constant-product formula is
-/// used. Unpriceable pairs are skipped individually.
+/// Simulate the cycle over every ordered venue pair (i, j) and every loan
+/// size, returning the most profitable one clearing `min_profit`, if any.
 pub fn find_opportunity(
-    loan_amount: U256,
-    pools: &[PoolState],
+    loan_amounts: &[U256],
+    venues: &[VenueQuotes],
     min_profit: U256,
 ) -> Option<Opportunity> {
     let mut best: Option<Opportunity> = None;
-    for first in pools {
-        for second in pools {
-            if first.venue == second.venue {
+    for first in venues {
+        for (i, &loan_amount) in loan_amounts.iter().enumerate() {
+            let Some(quote_out) = first.leg1.get(i).copied().flatten() else {
                 continue;
-            }
-            // Leg 1: loan token -> quote token on `first`.
-            let quote_out = if let Some(v3) = first.v3_state {
-                let Some(out) = v3_spot_amount_out(&v3, first.fee_tier, loan_amount) else {
+            };
+            for second in venues {
+                if first.venue == second.venue {
                     continue;
                 };
-                out
-            } else {
-                let Some(out) = get_amount_out(
+                let Some(amount_out) = second
+                    .leg2
+                    .iter()
+                    .find(|(q, _)| *q == quote_out)
+                    .and_then(|(_, out)| *out)
+                else {
+                    continue;
+                };
+                let Some(profit) = amount_out.checked_sub(loan_amount) else {
+                    continue;
+                };
+                if profit.is_zero() || profit < min_profit {
+                    continue;
+                }
+                let opp = Opportunity {
+                    first: first.venue,
+                    second: second.venue,
                     loan_amount,
-                    first.reserves.reserve_in,
-                    first.reserves.reserve_out,
-                    first.fee_bps,
-                ) else {
-                    continue;
-                };
-                out
-            };
-            // Leg 2: quote token -> loan token on `second` (reserves flipped).
-            let amount_out = if let Some(v3) = second.v3_state {
-                let flipped = V3PoolState {
-                    loan_is_token0: !v3.loan_is_token0,
-                    ..v3
-                };
-                let Some(out) = v3_spot_amount_out(&flipped, second.fee_tier, quote_out) else {
-                    continue;
-                };
-                out
-            } else {
-                let Some(out) = get_amount_out(
                     quote_out,
-                    second.reserves.reserve_out,
-                    second.reserves.reserve_in,
-                    second.fee_bps,
-                ) else {
-                    continue;
+                    amount_out,
+                    profit,
                 };
-                out
-            };
-            let Some(profit) = amount_out.checked_sub(loan_amount) else {
-                continue;
-            };
-            if profit.is_zero() || profit < min_profit {
-                continue;
-            }
-            let opp = Opportunity {
-                first: first.venue,
-                second: second.venue,
-                loan_amount,
-                quote_out,
-                amount_out,
-                profit,
-            };
-            if best.is_none_or(|b| opp.profit > b.profit) {
-                best = Some(opp);
+                if best.is_none_or(|b| opp.profit > b.profit) {
+                    best = Some(opp);
+                }
             }
         }
     }
     best
 }
 
+/// Build the `VenueQuotes` for a V2/Aero venue: exact constant-product math
+/// for both legs, given the pool reserves oriented loan-token first and the
+/// distinct leg-1 outputs of the other venues.
+pub fn v2_quotes(
+    venue: usize,
+    reserves: crate::dex::PoolReserves,
+    fee_bps: u64,
+    loan_amounts: &[U256],
+    leg2_inputs: &[U256],
+) -> VenueQuotes {
+    let leg1 = loan_amounts
+        .iter()
+        .map(|&size| get_amount_out(size, reserves.reserve_in, reserves.reserve_out, fee_bps))
+        .collect();
+    let leg2 = leg2_inputs
+        .iter()
+        .map(|&q| {
+            (
+                q,
+                get_amount_out(q, reserves.reserve_out, reserves.reserve_in, fee_bps),
+            )
+        })
+        .collect();
+    VenueQuotes { venue, leg1, leg2 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dex::PoolReserves;
 
-    fn pool(venue: usize, loan: u128, quote: u128) -> PoolState {
-        pool_with_fee(venue, loan, quote, 30)
-    }
-
-    fn pool_with_fee(venue: usize, loan: u128, quote: u128, fee_bps: u64) -> PoolState {
-        PoolState {
+    /// Build a V2-style venue with 1:1-ish reserves, quoting against the
+    /// leg-1 outputs of `others` (test helper, indices are venue ids).
+    fn v2_venue(
+        venue: usize,
+        loan: u128,
+        quote: u128,
+        sizes: &[u128],
+        leg2_inputs: &[u128],
+        fee_bps: u64,
+    ) -> VenueQuotes {
+        v2_quotes(
             venue,
-            reserves: PoolReserves {
+            PoolReserves {
                 reserve_in: U256::from(loan),
                 reserve_out: U256::from(quote),
             },
-            v3_state: None,
             fee_bps,
-            fee_tier: 0,
-        }
+            &sizes.iter().map(|&s| U256::from(s)).collect::<Vec<_>>(),
+            &leg2_inputs
+                .iter()
+                .map(|&s| U256::from(s))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Build quotes for a set of constant-product venues, wiring each
+    /// venue's leg-2 inputs to the other venues' leg-1 outputs (mirrors
+    /// what the scanner does with RPC quotes).
+    fn pool_set(specs: &[(u128, u128)], sizes: &[u128]) -> Vec<VenueQuotes> {
+        let sizes_u: Vec<U256> = sizes.iter().map(|&s| U256::from(s)).collect();
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(loan, quote))| {
+                let reserves = PoolReserves {
+                    reserve_in: U256::from(loan),
+                    reserve_out: U256::from(quote),
+                };
+                let leg2_inputs: Vec<U256> = specs
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .flat_map(|(_, &(l2, q2))| {
+                        sizes_u.iter().filter_map(move |&s| {
+                            get_amount_out(s, U256::from(l2), U256::from(q2), 30)
+                        })
+                    })
+                    .collect();
+                v2_quotes(i, reserves, 30, &sizes_u, &leg2_inputs)
+            })
+            .collect()
+    }
+
+    fn sizes(s: &[u128]) -> Vec<U256> {
+        s.iter().map(|&x| U256::from(x)).collect()
     }
 
     #[test]
@@ -212,7 +199,10 @@ mod tests {
             5,
         )
         .unwrap();
-        assert!(low_fee > high_fee, "a 0.05% pool must out-yield a 0.3% pool");
+        assert!(
+            low_fee > high_fee,
+            "a 0.05% pool must out-yield a 0.3% pool"
+        );
     }
 
     #[test]
@@ -235,18 +225,15 @@ mod tests {
 
     #[test]
     fn balanced_pools_have_no_opportunity() {
-        let pools = vec![pool(0, 1_000_000, 1_000_000), pool(1, 1_000_000, 1_000_000)];
-        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO);
+        let venues = pool_set(&[(1_000_000, 1_000_000), (1_000_000, 1_000_000)], &[10_000]);
+        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO);
         assert!(opp.is_none(), "identical pools must not be profitable");
     }
 
     #[test]
     fn price_dislocation_yields_profit_in_one_direction() {
-        let pools = vec![
-            pool(0, 1_000_000, 1_000_000),
-            pool(1, 1_100_000, 900_000),
-        ];
-        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO)
+        let venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &[10_000]);
+        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO)
             .expect("dislocated pools should yield an opportunity");
         assert_eq!(opp.first, 0);
         assert_eq!(opp.second, 1);
@@ -256,11 +243,8 @@ mod tests {
 
     #[test]
     fn mirror_direction_is_found_when_pools_are_swapped() {
-        let pools = vec![
-            pool(0, 1_100_000, 900_000),
-            pool(1, 1_000_000, 1_000_000),
-        ];
-        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO)
+        let venues = pool_set(&[(1_100_000, 900_000), (1_000_000, 1_000_000)], &[10_000]);
+        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO)
             .expect("swapped pools should still yield an opportunity");
         assert_eq!(opp.first, 1);
         assert_eq!(opp.second, 0);
@@ -270,93 +254,76 @@ mod tests {
     fn four_venues_route_through_the_dislocated_pool() {
         // Four venues; venue 1 is the only dislocated pool, so any profitable
         // cycle must route its return leg through venue 1.
-        let pools = vec![
-            pool(0, 1_000_000, 1_000_000),
-            pool(1, 1_100_000, 900_000),
-            pool(2, 1_000_000, 1_000_000),
-            pool(3, 1_000_000, 1_000_000),
-        ];
-        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO)
+        let venues = pool_set(
+            &[
+                (1_000_000, 1_000_000),
+                (1_100_000, 900_000),
+                (1_000_000, 1_000_000),
+                (1_000_000, 1_000_000),
+            ],
+            &[10_000],
+        );
+        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO)
             .expect("four venues should still find a pair");
         assert!(opp.profit > U256::ZERO);
         assert!(opp.first == 1 || opp.second == 1);
     }
 
     #[test]
-    fn v3_spot_price_scales_linearly_and_applies_fee() {
-        // A pool priced at exactly 1:1 (sqrtP = 2^96) with 0.05% fee.
-        let v3 = V3PoolState {
-            sqrt_price_x96: U256::from(1u128) << 96,
-            liquidity: U256::ZERO,
-            loan_is_token0: true,
-        };
-        let out = v3_spot_amount_out(&v3, 500, U256::from(10_000u64)).unwrap();
-        assert_eq!(out, U256::from(9_995u64));
-        // Inverse direction at the same price is also 1:1.
-        let inv = V3PoolState {
-            loan_is_token0: false,
-            ..v3
-        };
-        let out_inv = v3_spot_amount_out(&inv, 500, U256::from(10_000u64)).unwrap();
-        assert_eq!(out_inv, U256::from(9_995u64));
-    }
-
-    #[test]
-    fn v3_spot_price_quadratic_in_sqrt_price() {
-        // sqrtP = 2 * 2^96 => price 4:1; buying token1 with token0 yields 4x.
-        let v3 = V3PoolState {
-            sqrt_price_x96: U256::from(2u128) << 96,
-            liquidity: U256::ZERO,
-            loan_is_token0: true,
-        };
-        let out = v3_spot_amount_out(&v3, 0, U256::from(1_000u64)).unwrap();
-        assert_eq!(out, U256::from(4_000u64));
-        // Selling token1 (flipped orientation) yields 1/4.
-        let inv = V3PoolState {
-            loan_is_token0: false,
-            ..v3
-        };
-        let out_inv = v3_spot_amount_out(&inv, 0, U256::from(4_000u64)).unwrap();
-        assert_eq!(out_inv, U256::from(1_000u64));
-    }
-
-    #[test]
-    fn unpriceable_pool_skips_only_that_pair() {
-        // Venue 1 has zero reserves (unpriceable); venues 0 and 2 are
-        // dislocated, so an opportunity must still be found between them.
-        let pools = vec![
-            pool(0, 1_000_000, 1_000_000),
-            pool(1, 0, 0),
-            pool(2, 1_100_000, 900_000),
-        ];
-        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::ZERO)
-            .expect("one dead pool must not abort the search");
+    fn unquotable_venue_skips_only_its_pairs() {
+        // Venue 1 cannot quote anything (e.g. QuoterV2 reverted); venues 0
+        // and 2 are dislocated, so an opportunity must still be found.
+        let mut venues = pool_set(
+            &[
+                (1_000_000, 1_000_000),
+                (1_100_000, 900_000),
+                (1_100_000, 900_000),
+            ],
+            &[10_000],
+        );
+        venues[1].leg1 = vec![None];
+        venues[1].leg2 = venues[1].leg2.iter().map(|&(q, _)| (q, None)).collect();
+        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO)
+            .expect("one dead venue must not abort the search");
         assert!(opp.profit > U256::ZERO);
         assert!(opp.first != 1 && opp.second != 1);
     }
 
     #[test]
     fn min_profit_threshold_filters_small_gains() {
-        let pools = vec![
-            pool(0, 1_000_000, 1_000_000),
-            pool(1, 1_001_000, 999_000),
-        ];
-        let opp = find_opportunity(U256::from(10_000u64), &pools, U256::from(1_000_000u64));
-        assert!(opp.is_none(), "tiny dislocation must fail a large min_profit");
+        let venues = pool_set(&[(1_000_000, 1_000_000), (1_001_000, 999_000)], &[10_000]);
+        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::from(1_000_000u64));
+        assert!(
+            opp.is_none(),
+            "tiny dislocation must fail a large min_profit"
+        );
     }
 
     #[test]
-    fn best_of_multiple_sizes_can_be_selected() {
-        let pools = vec![
-            pool(0, 1_000_000, 1_000_000),
-            pool(1, 1_100_000, 900_000),
-        ];
-        let sizes = [1_000u64, 10_000, 100_000];
-        let best = sizes
-            .iter()
-            .filter_map(|&s| find_opportunity(U256::from(s), &pools, U256::ZERO))
-            .max_by_key(|o| o.profit)
-            .unwrap();
+    fn best_of_multiple_sizes_is_selected() {
+        let sizes_in = [1_000u128, 10_000, 100_000];
+        let venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &sizes_in);
+        let best = find_opportunity(&sizes(&sizes_in), &venues, U256::ZERO)
+            .expect("some size should be profitable");
         assert!(best.profit > U256::ZERO);
+        // The optimum is not necessarily the largest size: price impact
+        // grows with size, so the search must consider all of them. Each
+        // single-size run needs quotes built for that size alone (leg
+        // outputs are aligned with the sizes they were quoted for).
+        for &s in &sizes_in {
+            let single = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &[s]);
+            let only = find_opportunity(&sizes(&[s]), &single, U256::ZERO).unwrap();
+            assert!(best.profit >= only.profit);
+        }
+    }
+
+    #[test]
+    fn v2_quotes_wire_both_legs() {
+        let q = v2_venue(0, 1_000_000, 1_000_000, &[1_000], &[500], 30);
+        assert_eq!(q.leg1.len(), 1);
+        assert!(q.leg1[0].is_some());
+        assert_eq!(q.leg2.len(), 1);
+        assert_eq!(q.leg2[0].0, U256::from(500u64));
+        assert!(q.leg2[0].1.is_some());
     }
 }

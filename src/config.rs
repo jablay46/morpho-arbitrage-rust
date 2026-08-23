@@ -77,6 +77,16 @@ pub struct Config {
     pub poll_interval_ms: u64,
     /// If true, never broadcast transactions; only log simulated results.
     pub dry_run: bool,
+    /// Uniswap QuoterV2 used to price V3 legs off-chain (real tick/liquidity
+    /// traversal via eth_call). Defaults to the canonical multi-chain
+    /// QuoterV2 deployment; override with QUOTER_V2 for other chains.
+    pub quoter_v2: Address,
+    /// Gas cost fallback in loan-token base units, used when the loan token
+    /// is not the wrapped native token (gas is paid in ETH and cannot be
+    /// converted on the fly without tracking an extra pool). Set this to a
+    /// conservative estimate, otherwise net-profit filtering silently
+    /// degrades to gross-profit filtering for non-native loans.
+    pub gas_cost_loan: U256,
 }
 
 impl Config {
@@ -101,9 +111,7 @@ impl Config {
         let wrapped_native = env::var("WRAPPED_NATIVE")
             .ok()
             .filter(|s| !s.is_empty())
-            .map(|s| {
-                Address::from_str(&s).map_err(|e| eyre!("invalid WRAPPED_NATIVE: {e}"))
-            })
+            .map(|s| Address::from_str(&s).map_err(|e| eyre!("invalid WRAPPED_NATIVE: {e}")))
             .transpose()?
             .unwrap_or_else(|| {
                 // WETH on Base mainnet.
@@ -122,8 +130,7 @@ impl Config {
         // stable: default false (Aero only)
         // fee_tier: default 3000 (V3 only, in hundredths of a bip)
         // pool_id: default zero (V4 only, bytes32 hex)
-        let venues_raw =
-            env::var("DEX_VENUES").map_err(|_| eyre!("missing env var DEX_VENUES"))?;
+        let venues_raw = env::var("DEX_VENUES").map_err(|_| eyre!("missing env var DEX_VENUES"))?;
         let venues = venues_raw
             .split(',')
             .map(|entry| {
@@ -132,9 +139,9 @@ impl Config {
                 let pair = parts.next().ok_or_else(|| {
                     eyre!("invalid DEX_VENUES entry '{entry}', expected <pair>:<router>...")
                 })?;
-                let router = parts.next().ok_or_else(|| {
-                    eyre!("invalid DEX_VENUES entry '{entry}', missing router")
-                })?;
+                let router = parts
+                    .next()
+                    .ok_or_else(|| eyre!("invalid DEX_VENUES entry '{entry}', missing router"))?;
                 let kind = match parts.next().map(str::trim).unwrap_or("v2") {
                     "v2" => VenueKind::UniswapV2,
                     "aero" => VenueKind::Aerodrome,
@@ -192,9 +199,7 @@ impl Config {
                         let bytes = alloy::hex::decode(s)
                             .map_err(|e| eyre!("invalid pool_id in DEX_VENUES '{entry}': {e}"))?;
                         if bytes.len() != 32 {
-                            return Err(eyre!(
-                                "pool_id must be 32 bytes in DEX_VENUES '{entry}'"
-                            ));
+                            return Err(eyre!("pool_id must be 32 bytes in DEX_VENUES '{entry}'"));
                         }
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(&bytes);
@@ -238,8 +243,7 @@ impl Config {
             .unwrap_or_else(|_| "1000000000000000000".to_string())
             .split(',')
             .map(|s| {
-                U256::from_str(s.trim())
-                    .map_err(|e| eyre!("invalid LOAN_AMOUNTS entry '{s}': {e}"))
+                U256::from_str(s.trim()).map_err(|e| eyre!("invalid LOAN_AMOUNTS entry '{s}': {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
         // Morpho Blue rejects zero-asset flash loans.
@@ -247,12 +251,24 @@ impl Config {
             return Err(eyre!("LOAN_AMOUNTS must not contain zero"));
         }
 
+        let dry_run = env::var("DRY_RUN")
+            .map(|s| matches!(s.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(true);
+
         let min_profit = env::var("MIN_PROFIT")
             .ok()
             .map(|s| U256::from_str(&s))
             .transpose()
             .map_err(|e| eyre!("invalid MIN_PROFIT: {e}"))?
             .unwrap_or(U256::ZERO);
+        // A zero floor allows economically meaningless trades (profit of a
+        // few wei) that only burn gas. Only tolerable while dry-running.
+        if min_profit.is_zero() && !dry_run {
+            return Err(eyre!(
+                "MIN_PROFIT must be greater than zero when DRY_RUN=false; \
+                 set a floor covering at least the expected gas cost"
+            ));
+        }
 
         let gas_price_wei = env::var("GAS_PRICE_WEI")
             .ok()
@@ -277,9 +293,24 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(500);
 
-        let dry_run = env::var("DRY_RUN")
-            .map(|s| matches!(s.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true);
+        // Canonical Uniswap QuoterV2 deployment (same address on Base,
+        // Ethereum, Arbitrum, Optimism, Polygon, ...).
+        let quoter_v2 = env::var("QUOTER_V2")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| Address::from_str(&s).map_err(|e| eyre!("invalid QUOTER_V2: {e}")))
+            .transpose()?
+            .unwrap_or_else(|| {
+                Address::from_str("0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a")
+                    .expect("valid constant address")
+            });
+
+        let gas_cost_loan = env::var("GAS_COST_LOAN")
+            .ok()
+            .map(|s| U256::from_str(&s))
+            .transpose()
+            .map_err(|e| eyre!("invalid GAS_COST_LOAN: {e}"))?
+            .unwrap_or(U256::ZERO);
 
         Ok(Self {
             rpc_url,
@@ -297,6 +328,8 @@ impl Config {
             slippage_bps,
             poll_interval_ms,
             dry_run,
+            quoter_v2,
+            gas_cost_loan,
         })
     }
 }

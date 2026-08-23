@@ -14,18 +14,30 @@ sol! {
 
     #[sol(rpc)]
     interface IUniswapV3Pool {
-        function slot0() external view returns (
-            uint160 sqrtPriceX96,
-            int24 tick,
-            uint16 observationIndex,
-            uint16 observationCardinality,
-            uint16 observationCardinalityNext,
-            uint8 feeProtocol,
-            bool unlocked
-        );
-        function liquidity() external view returns (uint128);
         function token0() external view returns (address);
         function token1() external view returns (address);
+    }
+
+    struct QuoteExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint24 fee;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    // Uniswap QuoterV2: not view (it simulates the swap), so always called
+    // via eth_call; it returns real values rather than packed revert data.
+    #[sol(rpc)]
+    interface IQuoterV2 {
+        function quoteExactInputSingle(QuoteExactInputSingleParams memory params)
+            external
+            returns (
+                uint256 amountOut,
+                uint160[] memory sqrtPriceX96AfterList,
+                uint32[] memory initializedTicksCrossedList,
+                uint256 gasEstimate
+            );
     }
 
     #[sol(rpc)]
@@ -203,10 +215,7 @@ pub async fn fetch_reserves<P: Provider>(
     let token0 = pool.token0().call().await?;
     let token1 = pool.token1().call().await?;
 
-    let (r0, r1) = (
-        U256::from(reserves.reserve0),
-        U256::from(reserves.reserve1),
-    );
+    let (r0, r1) = (U256::from(reserves.reserve0), U256::from(reserves.reserve1));
     let (reserve_in, reserve_out) = if token_in == token0 {
         (r0, r1)
     } else if token_in == token1 {
@@ -222,17 +231,53 @@ pub async fn fetch_reserves<P: Provider>(
     })
 }
 
+/// One QuoterV2 `quoteExactInputSingle` request. The fee tier must be the
+/// venue's actual pool fee — quoting with a different tier prices a
+/// different pool.
+#[derive(Debug, Clone, Copy)]
+pub struct QuoteRequest {
+    pub token_in: Address,
+    pub token_out: Address,
+    pub fee_tier: u32,
+    pub amount_in: U256,
+}
+
 /// Per-scan bundle of everything the bot needs from the chain, fetched in
-/// ONE JSON-RPC batch: getReserves per V2/Aero venue, slot0+liquidity per
-/// V3 venue, and the current gas price.
+/// ONE JSON-RPC batch: getReserves per V2/Aero venue, one QuoterV2 call per
+/// requested V3 quote, and the current gas price.
 pub struct ScanSnapshot {
     /// Raw (reserve0, reserve1) per V2/Aero venue, aligned with the
     /// `v2_venues` slice passed to `fetch_scan_snapshot`. None when that
     /// venue's eth_call reverted (caller skips it instead of aborting).
     pub v2_raw: Vec<Option<(U256, U256)>>,
-    /// (sqrtPriceX96, liquidity) per V3 venue; None on per-venue failure.
-    pub v3_raw: Vec<Option<(U256, U256)>>,
+    /// QuoterV2 amountOut per entry of the `quotes` slice passed to
+    /// `fetch_scan_snapshot`; None when that quote reverted (e.g. the trade
+    /// exceeds the pool's liquidity).
+    pub v3_quotes: Vec<Option<U256>>,
     pub gas_price: U256,
+}
+
+/// Encode one quote request as an eth_call transaction against `quoter`.
+fn quote_tx(quoter: Address, req: &QuoteRequest) -> alloy::rpc::types::eth::TransactionRequest {
+    use alloy::rpc::types::eth::TransactionRequest;
+    let call = IQuoterV2::quoteExactInputSingleCall {
+        params: QuoteExactInputSingleParams {
+            tokenIn: req.token_in,
+            tokenOut: req.token_out,
+            amountIn: req.amount_in,
+            fee: alloy::primitives::Uint::<24, 1>::from(req.fee_tier),
+            sqrtPriceLimitX96: Default::default(),
+        },
+    };
+    TransactionRequest::default()
+        .to(quoter)
+        .input(call.abi_encode().into())
+}
+
+fn decode_quote(raw: &Bytes) -> Option<U256> {
+    IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw)
+        .ok()
+        .map(|r| r.amountOut)
 }
 
 /// Fetch a full scan snapshot in a single JSON-RPC batch. Requires
@@ -240,15 +285,16 @@ pub struct ScanSnapshot {
 /// batch calls without it — and keeps all reads block-aligned.
 pub async fn fetch_scan_snapshot<P: Provider>(
     provider: &P,
+    quoter: Address,
     v2_venues: &[Address], // pair addresses
-    v3_venues: &[Address], // pool addresses
+    quotes: &[QuoteRequest],
 ) -> Result<ScanSnapshot> {
     use alloy::eips::BlockNumberOrTag;
     use alloy::rpc::types::eth::TransactionRequest;
 
     let block = BlockNumberOrTag::Latest;
     let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
-    let mut waiters = Vec::with_capacity(v2_venues.len() + v3_venues.len() * 2 + 1);
+    let mut waiters = Vec::with_capacity(v2_venues.len() + quotes.len() + 1);
 
     for pair in v2_venues {
         let tx = TransactionRequest::default()
@@ -260,18 +306,13 @@ pub async fn fetch_scan_snapshot<P: Provider>(
                 .map_err(eyre::Error::from)?,
         );
     }
-    for pool in v3_venues {
-        for data in [
-            IUniswapV3Pool::slot0Call {}.abi_encode(),
-            IUniswapV3Pool::liquidityCall {}.abi_encode(),
-        ] {
-            let tx = TransactionRequest::default().to(*pool).input(data.into());
-            waiters.push(
-                batch
-                    .add_call::<_, Bytes>("eth_call", &(tx, block))
-                    .map_err(eyre::Error::from)?,
-            );
-        }
+    let mut quote_waiters = Vec::with_capacity(quotes.len());
+    for req in quotes {
+        quote_waiters.push(
+            batch
+                .add_call::<_, Bytes>("eth_call", &(quote_tx(quoter, req), block))
+                .map_err(eyre::Error::from)?,
+        );
     }
     let gas_price_waiter = batch
         .add_call::<_, U256>("eth_gasPrice", &())
@@ -281,67 +322,69 @@ pub async fn fetch_scan_snapshot<P: Provider>(
 
     // Per-venue error handling: a single reverted call (dead/misconfigured
     // pool) yields None for that venue instead of failing the whole scan.
-    let mut waiters = waiters.into_iter();
     let mut v2_raw = Vec::with_capacity(v2_venues.len());
-    for _ in v2_venues {
-        let entry: Option<(U256, U256)> =
-            match waiters.next().expect("one waiter per V2 venue").await {
-                Ok(raw) => IUniswapV2Pair::getReservesCall::abi_decode_returns(&raw)
-                    .ok()
-                    .map(|r| (U256::from(r.reserve0), U256::from(r.reserve1))),
-                Err(_) => None,
-            };
+    for waiter in waiters {
+        let entry = match waiter.await {
+            Ok(raw) => IUniswapV2Pair::getReservesCall::abi_decode_returns(&raw)
+                .ok()
+                .map(|r| (U256::from(r.reserve0), U256::from(r.reserve1))),
+            Err(_) => None,
+        };
         v2_raw.push(entry);
     }
-    let mut v3_raw = Vec::with_capacity(v3_venues.len());
-    for _ in v3_venues {
-        let entry: Option<(U256, U256)> = match (
-            waiters.next().expect("two waiters per V3 venue").await,
-            waiters.next().expect("two waiters per V3 venue").await,
-        ) {
-            (Ok(s_raw), Ok(l_raw)) => {
-                match (
-                    IUniswapV3Pool::slot0Call::abi_decode_returns(&s_raw),
-                    IUniswapV3Pool::liquidityCall::abi_decode_returns(&l_raw),
-                ) {
-                    (Ok(slot0), Ok(liquidity)) => {
-                        Some((U256::from(slot0.sqrtPriceX96), U256::from(liquidity)))
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        v3_raw.push(entry);
+    let mut v3_quotes = Vec::with_capacity(quotes.len());
+    for waiter in quote_waiters {
+        v3_quotes.push(match waiter.await {
+            Ok(raw) => decode_quote(&raw),
+            Err(_) => None,
+        });
     }
     let gas_price = gas_price_waiter.await.map_err(eyre::Error::from)?;
 
     Ok(ScanSnapshot {
         v2_raw,
-        v3_raw,
+        v3_quotes,
         gas_price,
     })
 }
 
-/// Fetch V3 pool state (sqrtPriceX96, liquidity) for price calculation.
-/// Serial fallback used when the batched snapshot fails.
-pub async fn fetch_v3_pool_state<P: Provider>(
+/// Run a standalone batch of QuoterV2 quotes (used for leg 2, whose inputs
+/// are only known after leg 1 has been priced). None per reverted quote.
+pub async fn fetch_quotes<P: Provider>(
     provider: &P,
-    pool: Address,
-) -> Result<(U256, U256)> {
-    let pool_contract = IUniswapV3Pool::new(pool, provider);
-    let slot0 = pool_contract.slot0().call().await?;
-    let liquidity = pool_contract.liquidity().call().await?;
-    Ok((U256::from(slot0.sqrtPriceX96), U256::from(liquidity)))
+    quoter: Address,
+    requests: &[QuoteRequest],
+) -> Result<Vec<Option<U256>>> {
+    use alloy::eips::BlockNumberOrTag;
+
+    let block = BlockNumberOrTag::Latest;
+    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
+    let mut waiters = Vec::with_capacity(requests.len());
+    for req in requests {
+        waiters.push(
+            batch
+                .add_call::<_, Bytes>("eth_call", &(quote_tx(quoter, req), block))
+                .map_err(eyre::Error::from)?,
+        );
+    }
+    batch.send().await.map_err(eyre::Error::from)?;
+
+    let mut out = Vec::with_capacity(requests.len());
+    for waiter in waiters {
+        out.push(match waiter.await {
+            Ok(raw) => decode_quote(&raw),
+            Err(_) => None,
+        });
+    }
+    Ok(out)
 }
 
 /// Validate at startup that a V3 pool actually contains the two configured
-/// tokens (cached pair tokens are used for orientation thereafter).
+/// tokens (pricing thereafter goes through QuoterV2, which takes the token
+/// direction explicitly, so no orientation state is kept).
 pub async fn fetch_v3_pair_tokens<P: Provider>(provider: &P, pool: Address) -> Result<PairTokens> {
     let pool_contract = IUniswapV3Pool::new(pool, provider);
     let token0 = pool_contract.token0().call().await?;
     let token1 = pool_contract.token1().call().await?;
     Ok(PairTokens { token0, token1 })
 }
-
-

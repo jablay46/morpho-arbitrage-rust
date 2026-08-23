@@ -110,19 +110,38 @@ pub async fn estimate_gas<P: Provider>(
     Ok(U256::from(gas))
 }
 
-/// Broadcast `execute` and wait for the receipt. Reuses the caller's
-/// wallet-enabled provider instead of opening a fresh connection per
-/// trade (a dropped/misconfigured RPC_URL must not break broadcasting
-/// when the scan provider is healthy, and vice versa).
-pub async fn execute<P: Provider>(
-    provider: &P,
-    contract: Address,
-    params: ArbParams,
-) -> Result<TxHash> {
+/// Broadcast `execute` and return as soon as the node accepts the tx,
+/// without waiting for inclusion. Waiting for the receipt would block the
+/// scan loop for at least one block per trade, blinding the bot to the
+/// next opportunity; the receipt is awaited on a background task instead,
+/// which only logs the outcome (confirmed / reverted) since a revert is
+/// protected by the on-chain minProfit backstop and costs only gas.
+/// Reuses the caller's wallet-enabled provider instead of opening a fresh
+/// connection per trade.
+pub async fn execute<P>(provider: P, contract: Address, params: ArbParams) -> Result<TxHash>
+where
+    P: Provider + 'static,
+{
     let arb = IFlashArbitrage::new(contract, provider);
     let pending = arb.execute(params).send().await?;
-    let receipt = pending.get_receipt().await?;
-    Ok(receipt.transaction_hash)
+    let tx_hash = *pending.tx_hash();
+    tokio::spawn(async move {
+        match pending.get_receipt().await {
+            Ok(receipt) if receipt.status() => {
+                tracing::info!(tx = %receipt.transaction_hash, "arbitrage transaction confirmed");
+            }
+            Ok(receipt) => {
+                tracing::warn!(
+                    tx = %receipt.transaction_hash,
+                    "arbitrage transaction reverted on-chain (gas lost; minProfit backstop held)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(tx = %tx_hash, error = %e, "failed to fetch transaction receipt");
+            }
+        }
+    });
+    Ok(tx_hash)
 }
 
 #[cfg(test)]
@@ -167,17 +186,32 @@ mod tests {
         );
 
         let params = ArbParams::abi_decode(payload).expect("solidity payload decodes");
-        assert_eq!(params.token, address!("1111111111111111111111111111111111111111"));
-        assert_eq!(params.quote, address!("2222222222222222222222222222222222222222"));
+        assert_eq!(
+            params.token,
+            address!("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            params.quote,
+            address!("2222222222222222222222222222222222222222")
+        );
         assert_eq!(params.amount, U256::from(1_000_000_000_000_000_000u128));
-        assert_eq!(params.legA.router, address!("3333333333333333333333333333333333333333"));
+        assert_eq!(
+            params.legA.router,
+            address!("3333333333333333333333333333333333333333")
+        );
         assert_eq!(params.legA.kind, 0);
         assert_eq!(params.legA.factory, Address::ZERO);
         assert!(!params.legA.stable);
         assert_eq!(params.legA.minOut, U256::from(900u64));
-        assert_eq!(params.legB.router, address!("4444444444444444444444444444444444444444"));
+        assert_eq!(
+            params.legB.router,
+            address!("4444444444444444444444444444444444444444")
+        );
         assert_eq!(params.legB.kind, 1);
-        assert_eq!(params.legB.factory, address!("5555555555555555555555555555555555555555"));
+        assert_eq!(
+            params.legB.factory,
+            address!("5555555555555555555555555555555555555555")
+        );
         assert!(params.legB.stable);
         assert_eq!(params.legB.minOut, U256::from(1_001u64));
         assert_eq!(params.minProfit, U256::from(12_345u64));
@@ -220,6 +254,8 @@ mod tests {
             slippage_bps: 50,
             poll_interval_ms: 0,
             dry_run: true,
+            quoter_v2: Address::ZERO,
+            gas_cost_loan: U256::ZERO,
         };
         let opp = Opportunity {
             first: 0,
@@ -237,8 +273,8 @@ mod tests {
         // Leg B tolerates two compounded intervals (its own input may have
         // drifted down by the leg-A tolerance): floor(10100 * 0.995^2).
         let expected_b = U256::from(10_100u64) * U256::from(9_950u64) / U256::from(10_000u64)
-            * U256::from(9_950u64) / U256::from(10_000u64);
+            * U256::from(9_950u64)
+            / U256::from(10_000u64);
         assert_eq!(params.legB.minOut, expected_b);
     }
 }
-
