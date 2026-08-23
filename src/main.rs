@@ -138,7 +138,8 @@ async fn main() -> Result<()> {
     for (i, v) in cfg.venues.iter().enumerate() {
         info!(
             venue = i,
-            pair = %v.pair,
+            pool = %cache.pool_addrs[i],
+            configured = %v.pair,
             kind = ?v.kind,
             fee_bps = v.fee_bps,
             fee_tier = v.fee_tier,
