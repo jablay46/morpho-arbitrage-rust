@@ -41,6 +41,8 @@ struct VenueCache {
     v2_pairs: Vec<Address>,
     /// V3 venue indices (priced via QuoterV2, no per-scan pool reads).
     v3_idx: Vec<usize>,
+    /// All resolved pool addresses (V2 + V3), for the event filter.
+    pool_addrs: Vec<Address>,
     /// Contract owner, used as `from` in simulations/gas estimates.
     owner: Address,
 }
@@ -51,6 +53,7 @@ impl VenueCache {
         let mut v2_idx = Vec::new();
         let mut v2_pairs = Vec::new();
         let mut v3_idx = Vec::new();
+        let mut pool_addrs = Vec::with_capacity(cfg.venues.len());
         for (idx, venue) in cfg.venues.iter().enumerate() {
             // Auto-resolve the pool from the venue's factory when the
             // config says "auto" (pair = Address::ZERO).
@@ -89,6 +92,7 @@ impl VenueCache {
                 }
             }
             pair_tokens.push(tokens);
+            pool_addrs.push(pool);
         }
         let owner = executor::fetch_owner(provider, cfg.arb_contract).await?;
         Ok(Self {
@@ -96,6 +100,7 @@ impl VenueCache {
             v2_idx,
             v2_pairs,
             v3_idx,
+            pool_addrs,
             owner,
         })
     }
@@ -201,9 +206,40 @@ fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider + C
         .connect_http(cfg.rpc_url.parse()?))
 }
 
-/// Event-driven scanning: subscribe to newHeads via WebSocket, scan per block.
-/// On subscription failure or stream end, falls back to polling so the bot
-/// keeps running (a dropped WSS connection must not kill the process).
+/// Topic-0 signatures of pool events that can move the price of a watched
+/// pool: V2 Sync/Swap/Mint/Burn, V3 Swap/Mint/Burn, plus the Aerodrome
+/// (Velodrome fork) variants, whose Sync/Swap/Burn declarations differ
+/// from Uniswap V2 and therefore hash to different topic0 values.
+fn pool_event_signatures() -> Vec<alloy::primitives::B256> {
+    [
+        // Uniswap V2 (also Sushiswap/Pancakeswap V2).
+        "Sync(uint112,uint112)",
+        "Swap(address,uint256,uint256,uint256,uint256,address)",
+        "Mint(address,uint256,uint256)",
+        "Burn(address,uint256,uint256,address)",
+        // Aerodrome: Sync/Swap use uint256 and Burn orders `to` before the
+        // amounts, so all three hash differently from the V2 originals.
+        "Sync(uint256,uint256)",
+        "Swap(address,address,uint256,uint256,uint256,uint256)",
+        "Burn(address,address,uint256,uint256)",
+        // Uniswap V3. Aerodrome's Mint is identical to V2's, already above.
+        "Swap(address,address,int256,int256,uint160,uint128,int24)",
+        "Mint(address,address,int24,int24,uint128,uint256,uint256)",
+        "Burn(address,int24,int24,uint128,uint256,uint256)",
+    ]
+    .into_iter()
+    .map(alloy::primitives::keccak256)
+    .collect()
+}
+
+/// Event-driven scanning: a scan is triggered by a price-moving event on any
+/// watched pool (eth_logs subscription), with a full sweep forced every
+/// `cfg.sweep_interval_blocks` blocks as a safety net against missed events.
+/// newHeads drives the sweep clock; several pool events in one block still
+/// cause only one scan, since chain reads are pinned to the sealed latest
+/// block anyway. On subscription failure or stream end, falls back to
+/// polling so the bot keeps running (a dropped WSS connection must not kill
+/// the process).
 async fn run_event_driven<B>(
     cfg: &Config,
     cache: &VenueCache,
@@ -221,15 +257,75 @@ where
     let client = alloy::rpc::client::RpcClient::connect_pubsub(ws).await?;
     let provider = alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
 
-    let sub = provider.subscribe_blocks().await?;
-    info!("subscribed to newHeads; scanning per block");
-    let mut stream = sub.into_stream();
-    while let Some(header) = stream.next().await {
-        info!(block = header.number, "new block; scanning");
-        if let Err(e) =
-            run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await
-        {
-            warn!(error = %e, "event-driven scan failed");
+    let heads_sub = provider.subscribe_blocks().await?;
+    let mut heads = heads_sub.into_stream();
+
+    // Without the log subscription (provider rejects the filter, etc.) the
+    // sweep interval becomes 1 block, reproducing scan-per-block behavior.
+    let filter = alloy::rpc::types::Filter::new()
+        .address(cache.pool_addrs.clone())
+        .event_signature(pool_event_signatures());
+    let mut sweep_every = cfg.sweep_interval_blocks;
+    let mut logs = match provider.subscribe_logs(&filter).await {
+        Ok(sub) => {
+            info!(
+                pools = cache.pool_addrs.len(),
+                sweep_every, "subscribed to newHeads + pool logs; scanning on pool events"
+            );
+            sub.into_stream().boxed()
+        }
+        Err(e) => {
+            warn!(error = %e, "log subscription failed; scanning every block");
+            sweep_every = 1;
+            futures::stream::pending().boxed()
+        }
+    };
+
+    // Block number of the last scan; any scan (event- or sweep-triggered)
+    // resets the sweep clock because both run the same full scan.
+    let mut last_scanned = 0u64;
+    loop {
+        let trigger = tokio::select! {
+            header = heads.next() => {
+                let Some(header) = header else { break };
+                let block = header.number;
+                if block >= last_scanned + sweep_every {
+                    Some(("sweep", block))
+                } else {
+                    None
+                }
+            }
+            log = logs.next() => {
+                match log {
+                    // Degraded mode: fall back to scanning every block.
+                    None => {
+                        warn!("log subscription ended; scanning every block");
+                        sweep_every = 1;
+                        logs = futures::stream::pending().boxed();
+                        None
+                    }
+                    // Reorged-away events must not trigger a scan.
+                    Some(log) if log.removed => None,
+                    Some(log) => match log.block_number {
+                        // Multiple pool events within one block coalesce into
+                        // a single scan: reads are pinned to the sealed
+                        // latest block, so later events add nothing.
+                        Some(block) if block > last_scanned => Some(("pool event", block)),
+                        _ => None,
+                    },
+                }
+            }
+        };
+        let Some((reason, block)) = trigger else {
+            continue;
+        };
+        info!(block, reason, "scanning");
+        match run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await {
+            // Advance by the block the scan actually read (latest at scan
+            // time), not the trigger block, so buffered events for blocks
+            // already covered by that read don't fire redundant scans.
+            Ok(scanned) => last_scanned = last_scanned.max(scanned),
+            Err(e) => warn!(error = %e, "event-driven scan failed"),
         }
     }
     warn!("block subscription ended; falling back to polling");
@@ -253,14 +349,16 @@ type InflightFlag = Arc<std::sync::atomic::AtomicBool>;
 /// reserves, V3 leg-1 quotes (one QuoterV2 call per venue x loan size) and
 /// the gas price; phase 2 quotes V3 leg 2, whose inputs are only known once
 /// leg 1 has been priced. Pinning both phases to one block keeps the two
-/// legs of a cycle priced against a consistent chain state.
+/// legs of a cycle priced against a consistent chain state. Returns the
+/// block number the reads were pinned to, so the event loop can track
+/// which chain state has actually been covered.
 async fn run_once_with_provider<P, B>(
     cfg: &Config,
     cache: &VenueCache,
     provider: &P,
     broadcaster: &B,
     inflight: Option<&InflightFlag>,
-) -> Result<()>
+) -> Result<u64>
 where
     P: alloy::providers::Provider,
     B: alloy::providers::Provider + Clone + 'static,
@@ -270,7 +368,8 @@ where
     // Pin both phases to one block so the legs of a cycle are priced
     // against the same chain state ("latest" could advance between the
     // two batches).
-    let block = alloy::eips::BlockId::number(provider.get_block_number().await?);
+    let block_number = provider.get_block_number().await?;
+    let block = alloy::eips::BlockId::number(block_number);
 
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
@@ -394,7 +493,7 @@ where
     let quotes: Vec<VenueQuotes> = legs.into_iter().map(|l| l.quotes).collect();
     let Some(opp) = find_opportunity(sizes, &quotes, cfg.min_profit) else {
         info!("no profitable opportunity");
-        return Ok(());
+        return Ok(block_number);
     };
 
     // Estimate gas cost and subtract from profit. Gas is paid in ETH;
@@ -425,7 +524,7 @@ where
             net = %net_profit,
             "opportunity filtered out by gas cost"
         );
-        return Ok(());
+        return Ok(block_number);
     }
 
     info!(
@@ -441,7 +540,7 @@ where
     if cfg.dry_run {
         executor::simulate(provider, cfg.arb_contract, cache.owner, params).await?;
         info!("dry-run enabled; skipping broadcast");
-        return Ok(());
+        return Ok(block_number);
     }
 
     // Claim the in-flight slot before broadcasting so subsequent scans
@@ -459,7 +558,7 @@ where
             .is_err()
         {
             info!("trade already in flight; skipping duplicate broadcast");
-            return Ok(());
+            return Ok(block_number);
         }
     }
     // Fire-and-forget: returns once the node accepts the tx; the receipt
@@ -480,7 +579,7 @@ where
             return Err(e);
         }
     }
-    Ok(())
+    Ok(block_number)
 }
 
 /// Run one scan iteration (convenience wrapper for polling mode).
@@ -494,7 +593,31 @@ where
     B: alloy::providers::Provider + Clone + 'static,
 {
     let provider = alloy::providers::ProviderBuilder::new().connect_http(cfg.rpc_url.parse()?);
-    run_once_with_provider(cfg, cache, &provider, broadcaster, inflight).await
+    run_once_with_provider(cfg, cache, &provider, broadcaster, inflight)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(test)]
+mod pool_event_tests {
+    use super::pool_event_signatures;
+    use alloy::primitives::{b256, B256};
+
+    #[test]
+    fn signatures_match_canonical_topic0() {
+        let sigs = pool_event_signatures();
+        // Well-known topic0 values, cross-checked against Uniswap V2/V3
+        // deployments; a typo in the signature strings would silently
+        // disable event triggers.
+        let v2_sync = b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+        let v3_swap = b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+        assert!(sigs.contains(&v2_sync));
+        assert!(sigs.contains(&v3_swap));
+        assert_eq!(sigs.len(), 10);
+        // All distinct: a duplicate would only bloat the filter.
+        let unique: std::collections::HashSet<B256> = sigs.iter().copied().collect();
+        assert_eq!(unique.len(), sigs.len());
+    }
 }
 
 #[cfg(test)]
