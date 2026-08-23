@@ -114,11 +114,18 @@ pub async fn estimate_gas<P: Provider>(
 /// without waiting for inclusion. Waiting for the receipt would block the
 /// scan loop for at least one block per trade, blinding the bot to the
 /// next opportunity; the receipt is awaited on a background task instead,
-/// which only logs the outcome (confirmed / reverted) since a revert is
-/// protected by the on-chain minProfit backstop and costs only gas.
+/// which logs the outcome (confirmed / reverted) since a revert is
+/// protected by the on-chain minProfit backstop and costs only gas. If
+/// `inflight` is given, the background watcher clears it on ALL receipt
+/// outcomes so the scanner resumes trading once the tx is included.
 /// Reuses the caller's wallet-enabled provider instead of opening a fresh
 /// connection per trade.
-pub async fn execute<P>(provider: P, contract: Address, params: ArbParams) -> Result<TxHash>
+pub async fn execute<P>(
+    provider: P,
+    contract: Address,
+    params: ArbParams,
+    inflight: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<TxHash>
 where
     P: Provider + 'static,
 {
@@ -139,6 +146,9 @@ where
             Err(e) => {
                 tracing::warn!(tx = %tx_hash, error = %e, "failed to fetch transaction receipt");
             }
+        }
+        if let Some(flag) = inflight {
+            flag.store(false, std::sync::atomic::Ordering::Release);
         }
     });
     Ok(tx_hash)

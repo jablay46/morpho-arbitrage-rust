@@ -8,6 +8,7 @@ use morpho_arbitrage_bot::dex::{
     PairTokens, QuoteRequest,
 };
 use morpho_arbitrage_bot::executor;
+use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -139,18 +140,19 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Command::Once => run_once(&cfg, &cache, &broadcaster).await?,
+        Command::Once => run_once(&cfg, &cache, &broadcaster, None).await?,
         Command::Scan => {
+            let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Some(wss_url) = &cfg.wss_url {
                 info!(wss = %wss_url, "starting event-driven scanning via WebSocket");
-                run_event_driven(&cfg, &cache, wss_url, &broadcaster).await?;
+                run_event_driven(&cfg, &cache, wss_url, &broadcaster, &inflight).await?;
             } else {
                 info!(
                     poll_ms = cfg.poll_interval_ms,
                     "starting polling-based scanning"
                 );
                 loop {
-                    if let Err(e) = run_once(&cfg, &cache, &broadcaster).await {
+                    if let Err(e) = run_once(&cfg, &cache, &broadcaster, Some(&inflight)).await {
                         warn!(error = %e, "scan iteration failed");
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms))
@@ -182,6 +184,7 @@ async fn run_event_driven<B>(
     cache: &VenueCache,
     wss_url: &str,
     broadcaster: &B,
+    inflight: &InflightFlag,
 ) -> Result<()>
 where
     B: alloy::providers::Provider + Clone + 'static,
@@ -198,34 +201,51 @@ where
     let mut stream = sub.into_stream();
     while let Some(header) = stream.next().await {
         info!(block = header.number, "new block; scanning");
-        if let Err(e) = run_once_with_provider(cfg, cache, &provider, broadcaster).await {
+        if let Err(e) =
+            run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await
+        {
             warn!(error = %e, "event-driven scan failed");
         }
     }
     warn!("block subscription ended; falling back to polling");
     loop {
-        if let Err(e) = run_once(cfg, cache, broadcaster).await {
+        if let Err(e) = run_once(cfg, cache, broadcaster, Some(inflight)).await {
             warn!(error = %e, "scan iteration failed");
         }
         tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms)).await;
     }
 }
 
+/// Shared "a trade is in flight" flag. Because broadcasting is
+/// fire-and-forget, the next scan would re-detect the same opportunity
+/// (prices are unchanged until the pending tx is included) and broadcast a
+/// competing duplicate that burns gas on revert. The flag is cleared by the
+/// background receipt watcher once the tx is included.
+type InflightFlag = Arc<std::sync::atomic::AtomicBool>;
+
 /// Run one scan iteration with a given provider. Chain reads happen in two
-/// JSON-RPC batches: phase 1 fetches V2 reserves, V3 leg-1 quotes (one
-/// QuoterV2 call per venue x loan size) and the gas price; phase 2 quotes
-/// V3 leg 2, whose inputs are only known once leg 1 has been priced.
+/// JSON-RPC batches, both pinned to the same block: phase 1 fetches V2
+/// reserves, V3 leg-1 quotes (one QuoterV2 call per venue x loan size) and
+/// the gas price; phase 2 quotes V3 leg 2, whose inputs are only known once
+/// leg 1 has been priced. Pinning both phases to one block keeps the two
+/// legs of a cycle priced against a consistent chain state.
 async fn run_once_with_provider<P, B>(
     cfg: &Config,
     cache: &VenueCache,
     provider: &P,
     broadcaster: &B,
+    inflight: Option<&InflightFlag>,
 ) -> Result<()>
 where
     P: alloy::providers::Provider,
     B: alloy::providers::Provider + Clone + 'static,
 {
     let sizes = &cfg.loan_amounts;
+
+    // Pin both phases to one block so the legs of a cycle are priced
+    // against the same chain state ("latest" could advance between the
+    // two batches).
+    let block = alloy::eips::BlockId::number(provider.get_block_number().await?);
 
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
@@ -239,8 +259,14 @@ where
             });
         }
     }
-    let snapshot =
-        fetch_scan_snapshot(provider, cfg.quoter_v2, &cache.v2_pairs, &leg1_requests).await?;
+    let snapshot = fetch_scan_snapshot(
+        provider,
+        cfg.quoter_v2,
+        &cache.v2_pairs,
+        &leg1_requests,
+        block,
+    )
+    .await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
 
     // Assemble leg-1 outputs per venue; V3 quotes come straight from the
@@ -332,7 +358,7 @@ where
     }
     if !phase2.is_empty() {
         let requests: Vec<QuoteRequest> = phase2.iter().map(|(_, r)| *r).collect();
-        let results = fetch_quotes(provider, cfg.quoter_v2, &requests).await?;
+        let results = fetch_quotes(provider, cfg.quoter_v2, &requests, block).await?;
         let mut grouped: Vec<Vec<(U256, Option<U256>)>> =
             (0..legs.len()).map(|_| Vec::new()).collect();
         for ((s, req), out) in phase2.iter().zip(results) {
@@ -409,18 +435,55 @@ where
     // eth_call would only repeat the same execution and add latency.
     executor::estimate_gas(provider, cfg.arb_contract, cache.owner, params.clone()).await?;
 
-    // Fire-and-forget: returns once the node accepts the tx; the receipt is
-    // awaited on a background task so the scan loop is never blocked.
-    let tx = executor::execute(broadcaster.clone(), cfg.arb_contract, params).await?;
-    info!(tx = %tx, "arbitrage transaction broadcast");
+    // Claim the in-flight slot before broadcasting so subsequent scans
+    // skip trading while this tx is pending inclusion. Without this the
+    // very next scan would re-detect the same opportunity and broadcast a
+    // competing duplicate (distinct nonce) that only burns gas on revert.
+    if let Some(flag) = inflight {
+        if flag
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            info!("trade already in flight; skipping duplicate broadcast");
+            return Ok(());
+        }
+    }
+    // Fire-and-forget: returns once the node accepts the tx; the receipt
+    // watcher clears the in-flight flag on inclusion.
+    match executor::execute(
+        broadcaster.clone(),
+        cfg.arb_contract,
+        params,
+        inflight.cloned(),
+    )
+    .await
+    {
+        Ok(tx) => info!(tx = %tx, "arbitrage transaction broadcast"),
+        Err(e) => {
+            if let Some(flag) = inflight {
+                flag.store(false, std::sync::atomic::Ordering::Release);
+            }
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
 /// Run one scan iteration (convenience wrapper for polling mode).
-async fn run_once<B>(cfg: &Config, cache: &VenueCache, broadcaster: &B) -> Result<()>
+async fn run_once<B>(
+    cfg: &Config,
+    cache: &VenueCache,
+    broadcaster: &B,
+    inflight: Option<&InflightFlag>,
+) -> Result<()>
 where
     B: alloy::providers::Provider + Clone + 'static,
 {
     let provider = alloy::providers::ProviderBuilder::new().connect_http(cfg.rpc_url.parse()?);
-    run_once_with_provider(cfg, cache, &provider, broadcaster).await
+    run_once_with_provider(cfg, cache, &provider, broadcaster, inflight).await
 }

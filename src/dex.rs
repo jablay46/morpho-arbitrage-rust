@@ -280,19 +280,19 @@ fn decode_quote(raw: &Bytes) -> Option<U256> {
         .map(|r| r.amountOut)
 }
 
-/// Fetch a full scan snapshot in a single JSON-RPC batch. Requires
-/// `eth_call` with an explicit block tag ("latest") — Chainstack rejects
-/// batch calls without it — and keeps all reads block-aligned.
+/// Fetch a full scan snapshot in a single JSON-RPC batch. Every eth_call
+/// carries an explicit block id (Chainstack rejects batch calls without
+/// one); the caller pins the block so this snapshot and any follow-up
+/// quote batch are consistent with each other.
 pub async fn fetch_scan_snapshot<P: Provider>(
     provider: &P,
     quoter: Address,
     v2_venues: &[Address], // pair addresses
     quotes: &[QuoteRequest],
+    block: alloy::eips::BlockId,
 ) -> Result<ScanSnapshot> {
-    use alloy::eips::BlockNumberOrTag;
     use alloy::rpc::types::eth::TransactionRequest;
 
-    let block = BlockNumberOrTag::Latest;
     let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
     let mut waiters = Vec::with_capacity(v2_venues.len() + quotes.len() + 1);
 
@@ -350,14 +350,13 @@ pub async fn fetch_scan_snapshot<P: Provider>(
 
 /// Run a standalone batch of QuoterV2 quotes (used for leg 2, whose inputs
 /// are only known after leg 1 has been priced). None per reverted quote.
+/// Pinned to the same block as the phase-1 snapshot.
 pub async fn fetch_quotes<P: Provider>(
     provider: &P,
     quoter: Address,
     requests: &[QuoteRequest],
+    block: alloy::eips::BlockId,
 ) -> Result<Vec<Option<U256>>> {
-    use alloy::eips::BlockNumberOrTag;
-
-    let block = BlockNumberOrTag::Latest;
     let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
     let mut waiters = Vec::with_capacity(requests.len());
     for req in requests {

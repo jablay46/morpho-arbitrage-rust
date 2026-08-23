@@ -78,8 +78,8 @@ pub struct Config {
     /// If true, never broadcast transactions; only log simulated results.
     pub dry_run: bool,
     /// Uniswap QuoterV2 used to price V3 legs off-chain (real tick/liquidity
-    /// traversal via eth_call). Defaults to the canonical multi-chain
-    /// QuoterV2 deployment; override with QUOTER_V2 for other chains.
+    /// traversal via eth_call). Defaults to the Base deployment; QUOTER_V2
+    /// must be set explicitly for any other chain.
     pub quoter_v2: Address,
     /// Gas cost fallback in loan-token base units, used when the loan token
     /// is not the wrapped native token (gas is paid in ETH and cannot be
@@ -293,8 +293,11 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(500);
 
-        // Canonical Uniswap QuoterV2 deployment (same address on Base,
-        // Ethereum, Arbitrum, Optimism, Polygon, ...).
+        // Uniswap QuoterV2 on Base. This address is Base-specific; other
+        // chains deploy QuoterV2 elsewhere (e.g. Ethereum mainnet uses
+        // 0x61fFE014bA17989E743c5F6cB21bF9697530B21e), so QUOTER_V2 must be
+        // set explicitly when targeting a non-Base chain — with a wrong
+        // address every V3 quote reverts and V3 venues are silently skipped.
         let quoter_v2 = env::var("QUOTER_V2")
             .ok()
             .filter(|s| !s.is_empty())

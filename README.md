@@ -34,10 +34,11 @@ Alur satu iterasi scan:
 1. **Batch RPC fase 1** — `getReserves` untuk setiap venue V2/Aero, satu call
    **QuoterV2** (`quoteExactInputSingle`) untuk setiap venue V3 x setiap
    ukuran pinjaman (leg 1: loan → quote), plus `eth_gasPrice`. Semua dalam
-   SATU batch JSON-RPC.
+   SATU batch JSON-RPC, dipin ke nomor block eksplisit.
 2. **Batch RPC fase 2** — leg 2 (quote → loan) untuk venue V3, karena
-   inputnya baru diketahui setelah leg 1 dihargai. Venue V2 dihitung lokal
-   dengan rumus constant-product yang eksak.
+   inputnya baru diketahui setelah leg 1 dihargai. Dipin ke block yang sama
+   dengan fase 1 agar kedua leg dihargai pada state chain yang konsisten.
+   Venue V2 dihitung lokal dengan rumus constant-product yang eksak.
 3. **Pencarian peluang** — semua pasangan venue terurut (i, j), i != j, dan
    semua ukuran pinjaman; dipilih profit kotor maksimum.
 4. **Filter gas** — `eth_estimateGas` untuk `execute`, dikali gas price,
@@ -47,7 +48,10 @@ Alur satu iterasi scan:
    sekaligus sebagai simulasi penuh (estimateGas mengeksekusi tx); jika
    akan revert, broadcast dibatalkan tanpa biaya.
 6. **Broadcast fire-and-forget** — tx dikirim dan bot langsung kembali
-   memindai; receipt dipantau di background task.
+   memindai; receipt dipantau di background task. Selama satu tx masih
+   pending inklusi, bot menahan diri dari broadcast duplikat (flag
+   in-flight yang dibersihkan oleh watcher receipt), sehingga satu
+   peluang tidak dikejar dengan banyak tx yang saling bersaing.
 
 Pricing V3 memakai **QuoterV2**, yaitu traversal tick/liquidity riil yang
 dilakukan on-chain via `eth_call` — bukan estimasi spot price — sehingga
@@ -218,7 +222,7 @@ Variabel yang tersedia:
 | `SLIPPAGE_BPS` | Tidak | Toleransi slippage per leg dalam bps. Default `50` (0.5%). |
 | `GAS_PRICE_WEI` | Tidak | Override gas price; default diambil on-chain. |
 | `GAS_COST_LOAN` | Tidak | Estimasi biaya gas dalam unit loan token — dipakai hanya jika `LOAN_TOKEN` bukan wrapped native. |
-| `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (kanonik multi-chain). |
+| `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (**khusus Base**; chain lain wajib diisi, mis. Ethereum mainnet `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`). |
 | `POLL_INTERVAL_MS` | Tidak | Interval polling untuk mode `scan` tanpa WSS. Default `500`. |
 | `DRY_RUN` | Tidak | Default `true` = hanya simulasi, tidak broadcast. Set `false` untuk live trading. |
 
