@@ -207,13 +207,22 @@ fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider + C
 }
 
 /// Topic-0 signatures of pool events that can move the price of a watched
-/// pool: V2 Sync/Swap/Mint/Burn and V3 Swap/Mint/Burn.
+/// pool: V2 Sync/Swap/Mint/Burn, V3 Swap/Mint/Burn, plus the Aerodrome
+/// (Velodrome fork) variants, whose Sync/Swap/Burn declarations differ
+/// from Uniswap V2 and therefore hash to different topic0 values.
 fn pool_event_signatures() -> Vec<alloy::primitives::B256> {
     [
+        // Uniswap V2 (also Sushiswap/Pancakeswap V2).
         "Sync(uint112,uint112)",
         "Swap(address,uint256,uint256,uint256,uint256,address)",
         "Mint(address,uint256,uint256)",
         "Burn(address,uint256,uint256,address)",
+        // Aerodrome: Sync/Swap use uint256 and Burn orders `to` before the
+        // amounts, so all three hash differently from the V2 originals.
+        "Sync(uint256,uint256)",
+        "Swap(address,address,uint256,uint256,uint256,uint256)",
+        "Burn(address,address,uint256,uint256)",
+        // Uniswap V3. Aerodrome's Mint is identical to V2's, already above.
         "Swap(address,address,int256,int256,uint160,uint128,int24)",
         "Mint(address,address,int24,int24,uint128,uint256,uint256)",
         "Burn(address,int24,int24,uint128,uint256,uint256)",
@@ -312,7 +321,10 @@ where
         };
         info!(block, reason, "scanning");
         match run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await {
-            Ok(()) => last_scanned = last_scanned.max(block),
+            // Advance by the block the scan actually read (latest at scan
+            // time), not the trigger block, so buffered events for blocks
+            // already covered by that read don't fire redundant scans.
+            Ok(scanned) => last_scanned = last_scanned.max(scanned),
             Err(e) => warn!(error = %e, "event-driven scan failed"),
         }
     }
@@ -337,14 +349,16 @@ type InflightFlag = Arc<std::sync::atomic::AtomicBool>;
 /// reserves, V3 leg-1 quotes (one QuoterV2 call per venue x loan size) and
 /// the gas price; phase 2 quotes V3 leg 2, whose inputs are only known once
 /// leg 1 has been priced. Pinning both phases to one block keeps the two
-/// legs of a cycle priced against a consistent chain state.
+/// legs of a cycle priced against a consistent chain state. Returns the
+/// block number the reads were pinned to, so the event loop can track
+/// which chain state has actually been covered.
 async fn run_once_with_provider<P, B>(
     cfg: &Config,
     cache: &VenueCache,
     provider: &P,
     broadcaster: &B,
     inflight: Option<&InflightFlag>,
-) -> Result<()>
+) -> Result<u64>
 where
     P: alloy::providers::Provider,
     B: alloy::providers::Provider + Clone + 'static,
@@ -354,7 +368,8 @@ where
     // Pin both phases to one block so the legs of a cycle are priced
     // against the same chain state ("latest" could advance between the
     // two batches).
-    let block = alloy::eips::BlockId::number(provider.get_block_number().await?);
+    let block_number = provider.get_block_number().await?;
+    let block = alloy::eips::BlockId::number(block_number);
 
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
@@ -478,7 +493,7 @@ where
     let quotes: Vec<VenueQuotes> = legs.into_iter().map(|l| l.quotes).collect();
     let Some(opp) = find_opportunity(sizes, &quotes, cfg.min_profit) else {
         info!("no profitable opportunity");
-        return Ok(());
+        return Ok(block_number);
     };
 
     // Estimate gas cost and subtract from profit. Gas is paid in ETH;
@@ -509,7 +524,7 @@ where
             net = %net_profit,
             "opportunity filtered out by gas cost"
         );
-        return Ok(());
+        return Ok(block_number);
     }
 
     info!(
@@ -525,7 +540,7 @@ where
     if cfg.dry_run {
         executor::simulate(provider, cfg.arb_contract, cache.owner, params).await?;
         info!("dry-run enabled; skipping broadcast");
-        return Ok(());
+        return Ok(block_number);
     }
 
     // Claim the in-flight slot before broadcasting so subsequent scans
@@ -543,7 +558,7 @@ where
             .is_err()
         {
             info!("trade already in flight; skipping duplicate broadcast");
-            return Ok(());
+            return Ok(block_number);
         }
     }
     // Fire-and-forget: returns once the node accepts the tx; the receipt
@@ -564,7 +579,7 @@ where
             return Err(e);
         }
     }
-    Ok(())
+    Ok(block_number)
 }
 
 /// Run one scan iteration (convenience wrapper for polling mode).
@@ -578,7 +593,9 @@ where
     B: alloy::providers::Provider + Clone + 'static,
 {
     let provider = alloy::providers::ProviderBuilder::new().connect_http(cfg.rpc_url.parse()?);
-    run_once_with_provider(cfg, cache, &provider, broadcaster, inflight).await
+    run_once_with_provider(cfg, cache, &provider, broadcaster, inflight)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -596,7 +613,7 @@ mod pool_event_tests {
         let v3_swap = b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
         assert!(sigs.contains(&v2_sync));
         assert!(sigs.contains(&v3_swap));
-        assert_eq!(sigs.len(), 7);
+        assert_eq!(sigs.len(), 10);
         // All distinct: a duplicate would only bloat the filter.
         let unique: std::collections::HashSet<B256> = sigs.iter().copied().collect();
         assert_eq!(unique.len(), sigs.len());
