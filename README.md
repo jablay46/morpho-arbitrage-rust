@@ -177,25 +177,25 @@ mengeksekusi kedua swap on-chain. Deploy dengan Foundry:
 
 ```bash
 # dari root repo
-forge create contracts/FlashArbitrage.sol:FlashArbitrage \
-  --rpc-url https://base-mainnet.g.alchemy.com/v2/KEY_ANDA \
-  --private-key 0xPRIVATE_KEY_BOT \
-  --constructor-args 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
+forge create contracts/FlashArbitrage.sol:FlashArbitrage --rpc-url https://base-mainnet.g.alchemy.com/v2/KEY_ANDA --private-key 0xPRIVATE_KEY_BOT --broadcast --constructor-args 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
 ```
 
 - `0xBBBB...FFCb` adalah alamat **Morpho Blue** (sama di Base & Ethereum
   mainnet).
+- **`--constructor-args` harus paling akhir** — pada beberapa versi forge
+  flag ini menelan semua argumen setelahnya, sehingga flag lain yang
+  diletakkan sesudahnya salah dibaca sebagai argumen konstruktor (error
+  "Constructor argument count mismatch").
 - Output akan menampilkan `Deployed to: 0x...` — simpan alamat ini sebagai
   `ARB_CONTRACT` di `.env`.
 - Deployer otomatis menjadi `owner` kontrak; hanya owner yang bisa
   `execute` dan `sweep` profit.
 
-Alternatif tanpa `--private-key` di command line (lebih aman, interaktif):
+Alternatif tanpa `--private-key` di command line (lebih aman, interaktif),
+dengan verifikasi source via Sourcify (tanpa API key):
 
 ```bash
-forge create contracts/FlashArbitrage.sol:FlashArbitrage \
-  --rpc-url $RPC_URL --interactive \
-  --constructor-args 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
+forge create contracts/FlashArbitrage.sol:FlashArbitrage --rpc-url $RPC_URL --interactive --broadcast --verify --verifier sourcify --chain 8453 --constructor-args 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
 ```
 
 ## 5. Konfigurasi (.env)
