@@ -1,18 +1,22 @@
 use alloy::primitives::{Address, U256};
 use clap::{Parser, Subcommand};
 use eyre::Result;
-use morpho_arbitrage_bot::arbitrage::{find_opportunity, v3_priceable, PoolState, V3PoolState};
+use morpho_arbitrage_bot::arbitrage::{find_opportunity, v2_quotes, VenueQuotes};
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
-    fetch_pair_tokens, fetch_scan_snapshot, fetch_v3_pair_tokens, orient_reserves, PairTokens,
-    PoolReserves,
+    fetch_pair_tokens, fetch_quotes, fetch_scan_snapshot, fetch_v3_pair_tokens, orient_reserves,
+    PairTokens, QuoteRequest,
 };
 use morpho_arbitrage_bot::executor;
+use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "morpho-arbitrage-bot", about = "Morpho flashloan arbitrage bot")]
+#[command(
+    name = "morpho-arbitrage-bot",
+    about = "Morpho flashloan arbitrage bot"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -27,17 +31,16 @@ enum Command {
 }
 
 /// Immutable per-venue metadata resolved once at startup, so per-scan RPC
-/// traffic is only getReserves / slot0+liquidity / gasPrice (token0/token1
-/// and the contract owner never change).
+/// traffic is only getReserves / QuoterV2 / gasPrice (token0/token1 and the
+/// contract owner never change).
 struct VenueCache {
     /// (token0, token1) per venue, aligned with cfg.venues.
     pair_tokens: Vec<PairTokens>,
     /// V2/Aero venue indices and their pair addresses, for the snapshot batch.
     v2_idx: Vec<usize>,
     v2_pairs: Vec<Address>,
-    /// V3 venue indices and their pool addresses.
+    /// V3 venue indices (priced via QuoterV2, no per-scan pool reads).
     v3_idx: Vec<usize>,
-    v3_pools: Vec<Address>,
     /// Contract owner, used as `from` in simulations/gas estimates.
     owner: Address,
 }
@@ -48,7 +51,6 @@ impl VenueCache {
         let mut v2_idx = Vec::new();
         let mut v2_pairs = Vec::new();
         let mut v3_idx = Vec::new();
-        let mut v3_pools = Vec::new();
         for (idx, venue) in cfg.venues.iter().enumerate() {
             // Auto-resolve the pool from the venue's factory when the
             // config says "auto" (pair = Address::ZERO).
@@ -73,20 +75,18 @@ impl VenueCache {
             };
             let tokens = if venue.kind == VenueKind::UniswapV3 {
                 v3_idx.push(idx);
-                v3_pools.push(pool);
                 fetch_v3_pair_tokens(provider, pool).await?
             } else {
                 v2_idx.push(idx);
                 v2_pairs.push(pool);
                 fetch_pair_tokens(provider, pool).await?
             };
-            // Fail fast on misconfigured venues: the loan token must be in
-            // the pair, otherwise orientation would error on every scan.
-            if cfg.loan_token != tokens.token0 && cfg.loan_token != tokens.token1 {
-                eyre::bail!(
-                    "venue {idx} pool {pool} does not contain loan token {}",
-                    cfg.loan_token
-                );
+            // Fail fast on misconfigured venues: both cycle tokens must be
+            // in the pair, otherwise every scan would silently skip it.
+            for (label, token) in [("loan", cfg.loan_token), ("quote", cfg.quote_token)] {
+                if token != tokens.token0 && token != tokens.token1 {
+                    eyre::bail!("venue {idx} pool {pool} does not contain {label} token {token}");
+                }
             }
             pair_tokens.push(tokens);
         }
@@ -96,7 +96,6 @@ impl VenueCache {
             v2_idx,
             v2_pairs,
             v3_idx,
-            v3_pools,
             owner,
         })
     }
@@ -131,19 +130,33 @@ async fn main() -> Result<()> {
         "bot configured"
     );
 
+    if cfg.loan_token != cfg.wrapped_native && cfg.gas_cost_loan.is_zero() && !cfg.dry_run {
+        warn!(
+            loan_token = %cfg.loan_token,
+            wrapped_native = %cfg.wrapped_native,
+            "loan token is not wrapped native and GAS_COST_LOAN is unset; \
+             net-profit filtering degrades to gross-profit (gas unaccounted)"
+        );
+    }
+
     match cli.command {
-        Command::Once => run_once(&cfg, &cache, &broadcaster).await?,
+        Command::Once => run_once(&cfg, &cache, &broadcaster, None).await?,
         Command::Scan => {
+            let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Some(wss_url) = &cfg.wss_url {
                 info!(wss = %wss_url, "starting event-driven scanning via WebSocket");
-                run_event_driven(&cfg, &cache, wss_url, &broadcaster).await?;
+                run_event_driven(&cfg, &cache, wss_url, &broadcaster, &inflight).await?;
             } else {
-                info!(poll_ms = cfg.poll_interval_ms, "starting polling-based scanning");
+                info!(
+                    poll_ms = cfg.poll_interval_ms,
+                    "starting polling-based scanning"
+                );
                 loop {
-                    if let Err(e) = run_once(&cfg, &cache, &broadcaster).await {
+                    if let Err(e) = run_once(&cfg, &cache, &broadcaster, Some(&inflight)).await {
                         warn!(error = %e, "scan iteration failed");
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms))
+                        .await;
                 }
             }
         }
@@ -152,7 +165,7 @@ async fn main() -> Result<()> {
 }
 
 /// Build the wallet-enabled HTTP provider used to broadcast trades.
-fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider> {
+fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider + Clone + 'static> {
     use alloy::network::EthereumWallet;
     use alloy::signers::local::PrivateKeySigner;
 
@@ -166,12 +179,16 @@ fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider> {
 /// Event-driven scanning: subscribe to newHeads via WebSocket, scan per block.
 /// On subscription failure or stream end, falls back to polling so the bot
 /// keeps running (a dropped WSS connection must not kill the process).
-async fn run_event_driven<B: alloy::providers::Provider>(
+async fn run_event_driven<B>(
     cfg: &Config,
     cache: &VenueCache,
     wss_url: &str,
     broadcaster: &B,
-) -> Result<()> {
+    inflight: &InflightFlag,
+) -> Result<()>
+where
+    B: alloy::providers::Provider + Clone + 'static,
+{
     use alloy::providers::Provider;
     use futures::StreamExt;
 
@@ -184,97 +201,186 @@ async fn run_event_driven<B: alloy::providers::Provider>(
     let mut stream = sub.into_stream();
     while let Some(header) = stream.next().await {
         info!(block = header.number, "new block; scanning");
-        if let Err(e) = run_once_with_provider(cfg, cache, &provider, broadcaster).await {
+        if let Err(e) =
+            run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await
+        {
             warn!(error = %e, "event-driven scan failed");
         }
     }
     warn!("block subscription ended; falling back to polling");
     loop {
-        if let Err(e) = run_once(cfg, cache, broadcaster).await {
+        if let Err(e) = run_once(cfg, cache, broadcaster, Some(inflight)).await {
             warn!(error = %e, "scan iteration failed");
         }
         tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms)).await;
     }
 }
 
-/// Run one scan iteration with a given provider. All chain reads are served
-/// by ONE JSON-RPC batch (reserves + V3 state + gas price).
+/// Shared "a trade is in flight" flag. Because broadcasting is
+/// fire-and-forget, the next scan would re-detect the same opportunity
+/// (prices are unchanged until the pending tx is included) and broadcast a
+/// competing duplicate that burns gas on revert. The flag is cleared by the
+/// background receipt watcher once the tx is included.
+type InflightFlag = Arc<std::sync::atomic::AtomicBool>;
+
+/// Run one scan iteration with a given provider. Chain reads happen in two
+/// JSON-RPC batches, both pinned to the same block: phase 1 fetches V2
+/// reserves, V3 leg-1 quotes (one QuoterV2 call per venue x loan size) and
+/// the gas price; phase 2 quotes V3 leg 2, whose inputs are only known once
+/// leg 1 has been priced. Pinning both phases to one block keeps the two
+/// legs of a cycle priced against a consistent chain state.
 async fn run_once_with_provider<P, B>(
     cfg: &Config,
     cache: &VenueCache,
     provider: &P,
     broadcaster: &B,
+    inflight: Option<&InflightFlag>,
 ) -> Result<()>
 where
     P: alloy::providers::Provider,
-    B: alloy::providers::Provider,
+    B: alloy::providers::Provider + Clone + 'static,
 {
-    let snapshot = fetch_scan_snapshot(provider, &cache.v2_pairs, &cache.v3_pools).await?;
+    let sizes = &cfg.loan_amounts;
+
+    // Pin both phases to one block so the legs of a cycle are priced
+    // against the same chain state ("latest" could advance between the
+    // two batches).
+    let block = alloy::eips::BlockId::number(provider.get_block_number().await?);
+
+    // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
+    let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
+    for &idx in &cache.v3_idx {
+        for &size in sizes {
+            leg1_requests.push(QuoteRequest {
+                token_in: cfg.loan_token,
+                token_out: cfg.quote_token,
+                fee_tier: cfg.venues[idx].fee_tier,
+                amount_in: size,
+            });
+        }
+    }
+    let snapshot = fetch_scan_snapshot(
+        provider,
+        cfg.quoter_v2,
+        &cache.v2_pairs,
+        &leg1_requests,
+        block,
+    )
+    .await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
 
-    let mut pools: Vec<PoolState> = Vec::with_capacity(cfg.venues.len());
+    // Assemble leg-1 outputs per venue; V3 quotes come straight from the
+    // snapshot, V2 outputs are exact constant-product math on reserves.
+    // Each entry keeps its reserves for the local leg-2 computation below.
+    struct Leg1 {
+        quotes: VenueQuotes,
+        v2_reserves: Option<morpho_arbitrage_bot::dex::PoolReserves>,
+    }
+    let mut legs: Vec<Leg1> = Vec::with_capacity(cfg.venues.len());
     for (j, &idx) in cache.v2_idx.iter().enumerate() {
         let Some((r0, r1)) = snapshot.v2_raw[j] else {
             warn!(venue = idx, pair = %cfg.venues[idx].pair, "reserve fetch reverted; skipping venue");
             continue;
         };
         let venue = &cfg.venues[idx];
-        match orient_reserves(r0, r1, &cache.pair_tokens[idx], venue.pair, cfg.loan_token) {
-            Ok(reserves) => pools.push(PoolState {
-                venue: idx,
-                reserves,
-                v3_state: None,
-                fee_bps: venue.fee_bps,
-                fee_tier: venue.fee_tier,
-            }),
-            Err(e) => warn!(venue = idx, error = %e, "skipping venue"),
-        }
+        let reserves =
+            match orient_reserves(r0, r1, &cache.pair_tokens[idx], venue.pair, cfg.loan_token) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(venue = idx, error = %e, "skipping venue");
+                    continue;
+                }
+            };
+        legs.push(Leg1 {
+            quotes: v2_quotes(idx, reserves, venue.fee_bps, sizes, &[]),
+            v2_reserves: Some(reserves),
+        });
     }
+    let n_sizes = sizes.len();
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
-        let Some((sqrt_price_x96, liquidity)) = snapshot.v3_raw[j] else {
-            warn!(venue = idx, pool = %cfg.venues[idx].pair, "V3 state fetch reverted; skipping venue");
-            continue;
-        };
-        let venue = &cfg.venues[idx];
-        let v3 = V3PoolState {
-            sqrt_price_x96,
-            liquidity,
-            loan_is_token0: cache.pair_tokens[idx].token0 == cfg.loan_token,
-        };
-        // Drop V3 venues whose spot price can't be computed (extreme
-        // ticks), rather than feeding the scanner garbage.
-        if !v3_priceable(&v3) {
-            warn!(venue = idx, pool = %venue.pair, "V3 pool state unpriceable; skipping venue");
+        let leg1: Vec<Option<U256>> = snapshot.v3_quotes[j * n_sizes..(j + 1) * n_sizes].to_vec();
+        if leg1.iter().all(|q| q.is_none()) {
+            warn!(
+                venue = idx,
+                "V3 venue returned no usable quotes; skipping venue"
+            );
             continue;
         }
-        pools.push(PoolState {
-            venue: idx,
-            reserves: PoolReserves {
-                reserve_in: U256::ZERO,
-                reserve_out: U256::ZERO,
+        legs.push(Leg1 {
+            quotes: VenueQuotes {
+                venue: idx,
+                leg1,
+                leg2: Vec::new(),
             },
-            v3_state: Some(v3),
-            fee_bps: venue.fee_bps,
-            fee_tier: venue.fee_tier,
+            v2_reserves: None,
         });
     }
 
-    let best = cfg
-        .loan_amounts
-        .iter()
-        .filter_map(|&size| find_opportunity(size, &pools, cfg.min_profit))
-        .max_by_key(|o| o.profit);
+    // Phase 2: leg 2 (quote -> loan) for every distinct leg-1 output of the
+    // OTHER venues. V2 legs are exact local math; V3 legs go through one
+    // more QuoterV2 batch.
+    let mut phase2: Vec<(usize, QuoteRequest)> = Vec::new(); // (position in legs, request)
+    for s in 0..legs.len() {
+        let mut inputs: Vec<U256> = Vec::new();
+        for (f, other) in legs.iter().enumerate() {
+            if f == s {
+                continue;
+            }
+            for q in other.quotes.leg1.iter().flatten() {
+                if !inputs.contains(q) {
+                    inputs.push(*q);
+                }
+            }
+        }
+        let venue_idx = legs[s].quotes.venue;
+        if let Some(reserves) = legs[s].v2_reserves {
+            legs[s].quotes.leg2 = v2_quotes(
+                venue_idx,
+                reserves,
+                cfg.venues[venue_idx].fee_bps,
+                &[],
+                &inputs,
+            )
+            .leg2;
+        } else {
+            for q in inputs {
+                phase2.push((
+                    s,
+                    QuoteRequest {
+                        token_in: cfg.quote_token,
+                        token_out: cfg.loan_token,
+                        fee_tier: cfg.venues[venue_idx].fee_tier,
+                        amount_in: q,
+                    },
+                ));
+            }
+        }
+    }
+    if !phase2.is_empty() {
+        let requests: Vec<QuoteRequest> = phase2.iter().map(|(_, r)| *r).collect();
+        let results = fetch_quotes(provider, cfg.quoter_v2, &requests, block).await?;
+        let mut grouped: Vec<Vec<(U256, Option<U256>)>> =
+            (0..legs.len()).map(|_| Vec::new()).collect();
+        for ((s, req), out) in phase2.iter().zip(results) {
+            grouped[*s].push((req.amount_in, out));
+        }
+        for (s, leg2) in grouped.into_iter().enumerate() {
+            if !leg2.is_empty() {
+                legs[s].quotes.leg2 = leg2;
+            }
+        }
+    }
 
-    let Some(opp) = best else {
+    let quotes: Vec<VenueQuotes> = legs.into_iter().map(|l| l.quotes).collect();
+    let Some(opp) = find_opportunity(sizes, &quotes, cfg.min_profit) else {
         info!("no profitable opportunity");
         return Ok(());
     };
 
     // Estimate gas cost and subtract from profit. Gas is paid in ETH
-    // (wrapped_native on L2); when the loan token differs, converting wei
-    // into loan-token units would require a native/quote pool we don't
-    // track, so conservatively compare gross profit instead of mixing
-    // units (a false-negative is safer than a false-positive).
+    // (wrapped_native on L2); when the loan token differs there is no
+    // on-the-fly conversion, so the configured GAS_COST_LOAN fallback is
+    // used instead (warned about at startup when unset).
     //
     // Two-stage build: estimate gas with a provisional params (minProfit
     // barely affects calldata size/gas), then rebuild with the on-chain
@@ -291,12 +397,7 @@ where
         if cfg.loan_token == cfg.wrapped_native {
             gas_cost_wei
         } else {
-            warn!(
-                loan_token = %cfg.loan_token,
-                wrapped_native = %cfg.wrapped_native,
-                "loan token is not wrapped native; gas cost conversion unavailable, comparing gross profit"
-            );
-            U256::ZERO
+            cfg.gas_cost_loan
         }
     };
 
@@ -323,25 +424,66 @@ where
         "opportunity found"
     );
 
-    executor::simulate(provider, cfg.arb_contract, cache.owner, params.clone()).await?;
-
     if cfg.dry_run {
+        executor::simulate(provider, cfg.arb_contract, cache.owner, params).await?;
         info!("dry-run enabled; skipping broadcast");
         return Ok(());
     }
 
-    let tx = executor::execute(broadcaster, cfg.arb_contract, params).await?;
-    info!(tx = %tx, "arbitrage transaction confirmed");
+    // eth_estimateGas fully executes the tx, so this call doubles as the
+    // pre-broadcast simulation gate on the FINAL params — a separate
+    // eth_call would only repeat the same execution and add latency.
+    executor::estimate_gas(provider, cfg.arb_contract, cache.owner, params.clone()).await?;
+
+    // Claim the in-flight slot before broadcasting so subsequent scans
+    // skip trading while this tx is pending inclusion. Without this the
+    // very next scan would re-detect the same opportunity and broadcast a
+    // competing duplicate (distinct nonce) that only burns gas on revert.
+    if let Some(flag) = inflight {
+        if flag
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            info!("trade already in flight; skipping duplicate broadcast");
+            return Ok(());
+        }
+    }
+    // Fire-and-forget: returns once the node accepts the tx; the receipt
+    // watcher clears the in-flight flag on inclusion.
+    match executor::execute(
+        broadcaster.clone(),
+        cfg.arb_contract,
+        params,
+        inflight.cloned(),
+    )
+    .await
+    {
+        Ok(tx) => info!(tx = %tx, "arbitrage transaction broadcast"),
+        Err(e) => {
+            if let Some(flag) = inflight {
+                flag.store(false, std::sync::atomic::Ordering::Release);
+            }
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
 /// Run one scan iteration (convenience wrapper for polling mode).
-async fn run_once<B: alloy::providers::Provider>(
+async fn run_once<B>(
     cfg: &Config,
     cache: &VenueCache,
     broadcaster: &B,
-) -> Result<()> {
-    let provider = alloy::providers::ProviderBuilder::new()
-        .connect_http(cfg.rpc_url.parse()?);
-    run_once_with_provider(cfg, cache, &provider, broadcaster).await
+    inflight: Option<&InflightFlag>,
+) -> Result<()>
+where
+    B: alloy::providers::Provider + Clone + 'static,
+{
+    let provider = alloy::providers::ProviderBuilder::new().connect_http(cfg.rpc_url.parse()?);
+    run_once_with_provider(cfg, cache, &provider, broadcaster, inflight).await
 }
