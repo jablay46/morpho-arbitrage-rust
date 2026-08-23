@@ -264,6 +264,7 @@ mod tests {
             gas_price_wei: None,
             slippage_bps: 50,
             poll_interval_ms: 0,
+            sweep_interval_blocks: 10,
             dry_run: true,
             quoter_v2: Address::ZERO,
         };

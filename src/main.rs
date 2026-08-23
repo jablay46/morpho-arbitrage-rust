@@ -41,6 +41,8 @@ struct VenueCache {
     v2_pairs: Vec<Address>,
     /// V3 venue indices (priced via QuoterV2, no per-scan pool reads).
     v3_idx: Vec<usize>,
+    /// All resolved pool addresses (V2 + V3), for the event filter.
+    pool_addrs: Vec<Address>,
     /// Contract owner, used as `from` in simulations/gas estimates.
     owner: Address,
 }
@@ -51,6 +53,7 @@ impl VenueCache {
         let mut v2_idx = Vec::new();
         let mut v2_pairs = Vec::new();
         let mut v3_idx = Vec::new();
+        let mut pool_addrs = Vec::with_capacity(cfg.venues.len());
         for (idx, venue) in cfg.venues.iter().enumerate() {
             // Auto-resolve the pool from the venue's factory when the
             // config says "auto" (pair = Address::ZERO).
@@ -89,6 +92,7 @@ impl VenueCache {
                 }
             }
             pair_tokens.push(tokens);
+            pool_addrs.push(pool);
         }
         let owner = executor::fetch_owner(provider, cfg.arb_contract).await?;
         Ok(Self {
@@ -96,6 +100,7 @@ impl VenueCache {
             v2_idx,
             v2_pairs,
             v3_idx,
+            pool_addrs,
             owner,
         })
     }
@@ -201,9 +206,31 @@ fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider + C
         .connect_http(cfg.rpc_url.parse()?))
 }
 
-/// Event-driven scanning: subscribe to newHeads via WebSocket, scan per block.
-/// On subscription failure or stream end, falls back to polling so the bot
-/// keeps running (a dropped WSS connection must not kill the process).
+/// Topic-0 signatures of pool events that can move the price of a watched
+/// pool: V2 Sync/Swap/Mint/Burn and V3 Swap/Mint/Burn.
+fn pool_event_signatures() -> Vec<alloy::primitives::B256> {
+    [
+        "Sync(uint112,uint112)",
+        "Swap(address,uint256,uint256,uint256,uint256,address)",
+        "Mint(address,uint256,uint256)",
+        "Burn(address,uint256,uint256,address)",
+        "Swap(address,address,int256,int256,uint160,uint128,int24)",
+        "Mint(address,address,int24,int24,uint128,uint256,uint256)",
+        "Burn(address,int24,int24,uint128,uint256,uint256)",
+    ]
+    .into_iter()
+    .map(alloy::primitives::keccak256)
+    .collect()
+}
+
+/// Event-driven scanning: a scan is triggered by a price-moving event on any
+/// watched pool (eth_logs subscription), with a full sweep forced every
+/// `cfg.sweep_interval_blocks` blocks as a safety net against missed events.
+/// newHeads drives the sweep clock; several pool events in one block still
+/// cause only one scan, since chain reads are pinned to the sealed latest
+/// block anyway. On subscription failure or stream end, falls back to
+/// polling so the bot keeps running (a dropped WSS connection must not kill
+/// the process).
 async fn run_event_driven<B>(
     cfg: &Config,
     cache: &VenueCache,
@@ -221,15 +248,72 @@ where
     let client = alloy::rpc::client::RpcClient::connect_pubsub(ws).await?;
     let provider = alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
 
-    let sub = provider.subscribe_blocks().await?;
-    info!("subscribed to newHeads; scanning per block");
-    let mut stream = sub.into_stream();
-    while let Some(header) = stream.next().await {
-        info!(block = header.number, "new block; scanning");
-        if let Err(e) =
-            run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await
-        {
-            warn!(error = %e, "event-driven scan failed");
+    let heads_sub = provider.subscribe_blocks().await?;
+    let mut heads = heads_sub.into_stream();
+
+    // Without the log subscription (provider rejects the filter, etc.) the
+    // sweep interval becomes 1 block, reproducing scan-per-block behavior.
+    let filter = alloy::rpc::types::Filter::new()
+        .address(cache.pool_addrs.clone())
+        .event_signature(pool_event_signatures());
+    let mut sweep_every = cfg.sweep_interval_blocks;
+    let mut logs = match provider.subscribe_logs(&filter).await {
+        Ok(sub) => {
+            info!(
+                pools = cache.pool_addrs.len(),
+                sweep_every, "subscribed to newHeads + pool logs; scanning on pool events"
+            );
+            sub.into_stream().boxed()
+        }
+        Err(e) => {
+            warn!(error = %e, "log subscription failed; scanning every block");
+            sweep_every = 1;
+            futures::stream::pending().boxed()
+        }
+    };
+
+    // Block number of the last scan; any scan (event- or sweep-triggered)
+    // resets the sweep clock because both run the same full scan.
+    let mut last_scanned = 0u64;
+    loop {
+        let trigger = tokio::select! {
+            header = heads.next() => {
+                let Some(header) = header else { break };
+                let block = header.number;
+                if block >= last_scanned + sweep_every {
+                    Some(("sweep", block))
+                } else {
+                    None
+                }
+            }
+            log = logs.next() => {
+                match log {
+                    // Degraded mode: fall back to scanning every block.
+                    None => {
+                        warn!("log subscription ended; scanning every block");
+                        sweep_every = 1;
+                        logs = futures::stream::pending().boxed();
+                        None
+                    }
+                    // Reorged-away events must not trigger a scan.
+                    Some(log) if log.removed => None,
+                    Some(log) => match log.block_number {
+                        // Multiple pool events within one block coalesce into
+                        // a single scan: reads are pinned to the sealed
+                        // latest block, so later events add nothing.
+                        Some(block) if block > last_scanned => Some(("pool event", block)),
+                        _ => None,
+                    },
+                }
+            }
+        };
+        let Some((reason, block)) = trigger else {
+            continue;
+        };
+        info!(block, reason, "scanning");
+        match run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await {
+            Ok(()) => last_scanned = last_scanned.max(block),
+            Err(e) => warn!(error = %e, "event-driven scan failed"),
         }
     }
     warn!("block subscription ended; falling back to polling");
@@ -495,6 +579,28 @@ where
 {
     let provider = alloy::providers::ProviderBuilder::new().connect_http(cfg.rpc_url.parse()?);
     run_once_with_provider(cfg, cache, &provider, broadcaster, inflight).await
+}
+
+#[cfg(test)]
+mod pool_event_tests {
+    use super::pool_event_signatures;
+    use alloy::primitives::{b256, B256};
+
+    #[test]
+    fn signatures_match_canonical_topic0() {
+        let sigs = pool_event_signatures();
+        // Well-known topic0 values, cross-checked against Uniswap V2/V3
+        // deployments; a typo in the signature strings would silently
+        // disable event triggers.
+        let v2_sync = b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+        let v3_swap = b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+        assert!(sigs.contains(&v2_sync));
+        assert!(sigs.contains(&v3_swap));
+        assert_eq!(sigs.len(), 7);
+        // All distinct: a duplicate would only bloat the filter.
+        let unique: std::collections::HashSet<B256> = sigs.iter().copied().collect();
+        assert_eq!(unique.len(), sigs.len());
+    }
 }
 
 #[cfg(test)]

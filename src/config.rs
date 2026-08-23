@@ -80,6 +80,9 @@ pub struct Config {
     pub slippage_bps: u64,
     /// Poll interval between scans, milliseconds.
     pub poll_interval_ms: u64,
+    /// Safety-net sweep interval in blocks for event-driven mode: even when
+    /// no pool event fires, a full scan is forced at least every N blocks.
+    pub sweep_interval_blocks: u64,
     /// If true, never broadcast transactions; only log simulated results.
     pub dry_run: bool,
     /// Uniswap QuoterV2 used to price V3 legs off-chain (real tick/liquidity
@@ -316,6 +319,14 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(500);
 
+        // A sweep interval of 0 would disable the safety net entirely;
+        // clamp to 1 (sweep every block, i.e. pre-log-trigger behavior).
+        let sweep_interval_blocks = env::var("SWEEP_INTERVAL_BLOCKS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10)
+            .max(1);
+
         // Uniswap QuoterV2 on Base. This address is Base-specific; other
         // chains deploy QuoterV2 elsewhere (e.g. Ethereum mainnet uses
         // 0x61fFE014bA17989E743c5F6cB21bF9697530B21e), so QUOTER_V2 must be
@@ -346,6 +357,7 @@ impl Config {
             gas_price_wei,
             slippage_bps,
             poll_interval_ms,
+            sweep_interval_blocks,
             dry_run,
             quoter_v2,
         })

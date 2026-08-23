@@ -215,7 +215,7 @@ Variabel yang tersedia:
 | Variabel | Wajib | Keterangan |
 |---|---|---|
 | `RPC_URL` | Ya | HTTP RPC endpoint (Base). |
-| `WSS_URL` | Tidak | WebSocket endpoint; mengaktifkan scanning per-block. Kosongkan untuk mode polling. |
+| `WSS_URL` | Tidak | WebSocket endpoint; mengaktifkan scanning event-driven (dipicu event pool + sweep per N block). Kosongkan untuk mode polling. |
 | `PRIVATE_KEY` | Ya | Private key wallet bot (= owner kontrak). **Jangan pernah commit.** |
 | `MORPHO_ADDRESS` | Ya | Morpho Blue: `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb`. |
 | `ARB_CONTRACT` | Ya | Alamat kontrak hasil deploy langkah 4. |
@@ -229,6 +229,7 @@ Variabel yang tersedia:
 | `GAS_PRICE_WEI` | Tidak | Override gas price; default diambil on-chain. |
 | `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (**khusus Base**; chain lain wajib diisi, mis. Ethereum mainnet `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`). |
 | `POLL_INTERVAL_MS` | Tidak | Interval polling untuk mode `scan` tanpa WSS. Default `500`. |
+| `SWEEP_INTERVAL_BLOCKS` | Tidak | Interval sweep penuh (block) sebagai safety net di mode event-driven: scan dipicu event pool, tapi tetap dipaksa minimal tiap N block. Default `10`. |
 | `DRY_RUN` | Tidak | Default `true` = hanya simulasi, tidak broadcast. Set `false` untuk live trading. |
 
 Format `DEX_VENUES` (koma-separated):
