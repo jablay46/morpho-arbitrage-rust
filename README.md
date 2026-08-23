@@ -173,10 +173,15 @@ Binary release tersedia di `./target/release/morpho-arbitrage-bot`.
 ## 4. Deploy Kontrak FlashArbitrage
 
 Kontrak `contracts/FlashArbitrage.sol` adalah penerima flash loan yang
-mengeksekusi kedua swap on-chain. Deploy dengan Foundry:
+mengeksekusi kedua swap on-chain. Deploy dengan Foundry. Repo sudah
+menyertakan `foundry.toml` (dengan `src = "contracts"`), jadi tidak perlu
+`forge init` — cukup pastikan command dijalankan **dari root repo**,
+karena forge me-resolve path relatif terhadap konfigurasi proyek
+(tanpanya deploy gagal dengan `cannot resolve file`).
+
+Deploy:
 
 ```bash
-# dari root repo
 forge create contracts/FlashArbitrage.sol:FlashArbitrage --rpc-url https://base-mainnet.g.alchemy.com/v2/KEY_ANDA --private-key 0xPRIVATE_KEY_BOT --broadcast --constructor-args 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
 ```
 
