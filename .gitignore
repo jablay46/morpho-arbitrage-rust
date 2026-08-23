@@ -1,2 +1,6 @@
 /target
 .env
+
+# Foundry build artifacts
+out/
+cache/
