@@ -126,9 +126,20 @@ async fn main() -> Result<()> {
         loan_token = %cfg.loan_token,
         quote_token = %cfg.quote_token,
         venues = cfg.venues.len(),
+        loan_amounts = ?cfg.loan_amounts,
         dry_run = cfg.dry_run,
         "bot configured"
     );
+    for (i, v) in cfg.venues.iter().enumerate() {
+        info!(
+            venue = i,
+            pair = %v.pair,
+            kind = ?v.kind,
+            fee_bps = v.fee_bps,
+            fee_tier = v.fee_tier,
+            "configured venue"
+        );
+    }
 
     match cli.command {
         Command::Once => run_once(&cfg, &cache, &broadcaster, None).await?,

@@ -3,6 +3,7 @@ use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
+use tracing::debug;
 
 sol! {
     #[sol(rpc)]
@@ -333,10 +334,32 @@ pub async fn fetch_scan_snapshot<P: Provider>(
         v2_raw.push(entry);
     }
     let mut v3_quotes = Vec::with_capacity(quotes.len());
-    for waiter in quote_waiters {
+    for (waiter, req) in quote_waiters.into_iter().zip(quotes.iter()) {
         v3_quotes.push(match waiter.await {
-            Ok(raw) => decode_quote(&raw),
-            Err(_) => None,
+            Ok(raw) => match decode_quote(&raw) {
+                Some(q) => Some(q),
+                None => {
+                    debug!(
+                        token_in = %req.token_in,
+                        token_out = %req.token_out,
+                        fee_tier = req.fee_tier,
+                        amount_in = %req.amount_in,
+                        "V3 quote returned undecodable result"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                debug!(
+                    token_in = %req.token_in,
+                    token_out = %req.token_out,
+                    fee_tier = req.fee_tier,
+                    amount_in = %req.amount_in,
+                    error = %e,
+                    "V3 quote reverted"
+                );
+                None
+            }
         });
     }
     let gas_price = gas_price_waiter.await.map_err(eyre::Error::from)?;
