@@ -276,9 +276,15 @@ fn quote_tx(quoter: Address, req: &QuoteRequest) -> alloy::rpc::types::eth::Tran
 }
 
 fn decode_quote(raw: &Bytes) -> Option<U256> {
-    IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw)
-        .ok()
-        .map(|r| r.amountOut)
+    // QuoterV2 returns (amountOut, sqrtPriceX96AfterList,
+    // initializedTicksCrossedList, gasEstimate); alloy's abi_decode_returns
+    // is strict about trailing words, and older call sites may only model
+    // amountOut — decode the first word directly so a well-formed quote is
+    // never discarded just because the tail fields are present.
+    if raw.len() < 32 {
+        return None;
+    }
+    Some(U256::from_be_slice(&raw[..32]))
 }
 
 /// Fetch a full scan snapshot in a single JSON-RPC batch. Every eth_call
