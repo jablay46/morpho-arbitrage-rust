@@ -74,19 +74,30 @@ pub async fn fetch_pair_tokens<P: Provider>(provider: &P, pair: Address) -> Resu
     Ok(PairTokens { token0, token1 })
 }
 
+/// Inputs for resolving a pool address from a venue's factory.
+pub struct PoolQuery {
+    pub kind: crate::config::VenueKind,
+    pub factory: Address,
+    pub router: Address,
+    pub token_a: Address,
+    pub token_b: Address,
+    pub stable: bool,
+    pub fee_tier: u32,
+}
+
 /// Resolve the pool address for a token pair from a venue's factory.
-/// `venue` must describe the DEX; `factory` of zero for Aerodrome means the
-/// router's default factory (resolved on-chain).
-pub async fn resolve_pool<P: Provider>(
-    provider: &P,
-    kind: crate::config::VenueKind,
-    factory: Address,
-    router: Address,
-    token_a: Address,
-    token_b: Address,
-    stable: bool,
-    fee_tier: u32,
-) -> Result<Address> {
+/// `factory` of zero for Aerodrome means the router's default factory
+/// (resolved on-chain).
+pub async fn resolve_pool<P: Provider>(provider: &P, q: &PoolQuery) -> Result<Address> {
+    let PoolQuery {
+        kind,
+        factory,
+        router,
+        token_a,
+        token_b,
+        stable,
+        fee_tier,
+    } = *q;
     use crate::config::VenueKind;
     let pool = match kind {
         VenueKind::UniswapV2 => {
@@ -215,11 +226,12 @@ pub async fn fetch_reserves<P: Provider>(
 /// ONE JSON-RPC batch: getReserves per V2/Aero venue, slot0+liquidity per
 /// V3 venue, and the current gas price.
 pub struct ScanSnapshot {
-    /// Raw (reserve0, reserve1) per V2/Aero venue index, aligned with the
-    /// `v2_venues` slice passed to `fetch_scan_snapshot`.
-    pub v2_raw: Vec<(U256, U256)>,
-    /// (sqrtPriceX96, liquidity) per V3 venue index, aligned with `v3_venues`.
-    pub v3_raw: Vec<(U256, U256)>,
+    /// Raw (reserve0, reserve1) per V2/Aero venue, aligned with the
+    /// `v2_venues` slice passed to `fetch_scan_snapshot`. None when that
+    /// venue's eth_call reverted (caller skips it instead of aborting).
+    pub v2_raw: Vec<Option<(U256, U256)>>,
+    /// (sqrtPriceX96, liquidity) per V3 venue; None on per-venue failure.
+    pub v3_raw: Vec<Option<(U256, U256)>>,
     pub gas_price: U256,
 }
 
@@ -242,7 +254,11 @@ pub async fn fetch_scan_snapshot<P: Provider>(
         let tx = TransactionRequest::default()
             .to(*pair)
             .input(IUniswapV2Pair::getReservesCall {}.abi_encode().into());
-        waiters.push(batch.add_call("eth_call", &(tx, block)).map_err(eyre::Error::from)?);
+        waiters.push(
+            batch
+                .add_call::<_, Bytes>("eth_call", &(tx, block))
+                .map_err(eyre::Error::from)?,
+        );
     }
     for pool in v3_venues {
         for data in [
@@ -250,7 +266,11 @@ pub async fn fetch_scan_snapshot<P: Provider>(
             IUniswapV3Pool::liquidityCall {}.abi_encode(),
         ] {
             let tx = TransactionRequest::default().to(*pool).input(data.into());
-            waiters.push(batch.add_call("eth_call", &(tx, block)).map_err(eyre::Error::from)?);
+            waiters.push(
+                batch
+                    .add_call::<_, Bytes>("eth_call", &(tx, block))
+                    .map_err(eyre::Error::from)?,
+            );
         }
     }
     let gas_price_waiter = batch
@@ -259,20 +279,40 @@ pub async fn fetch_scan_snapshot<P: Provider>(
 
     batch.send().await.map_err(eyre::Error::from)?;
 
+    // Per-venue error handling: a single reverted call (dead/misconfigured
+    // pool) yields None for that venue instead of failing the whole scan.
     let mut waiters = waiters.into_iter();
     let mut v2_raw = Vec::with_capacity(v2_venues.len());
     for _ in v2_venues {
-        let raw: Bytes = waiters.next().expect("one waiter per V2 venue").await.map_err(eyre::Error::from)?;
-        let r = IUniswapV2Pair::getReservesCall::abi_decode_returns(&raw)?;
-        v2_raw.push((U256::from(r.reserve0), U256::from(r.reserve1)));
+        let entry: Option<(U256, U256)> =
+            match waiters.next().expect("one waiter per V2 venue").await {
+                Ok(raw) => IUniswapV2Pair::getReservesCall::abi_decode_returns(&raw)
+                    .ok()
+                    .map(|r| (U256::from(r.reserve0), U256::from(r.reserve1))),
+                Err(_) => None,
+            };
+        v2_raw.push(entry);
     }
     let mut v3_raw = Vec::with_capacity(v3_venues.len());
     for _ in v3_venues {
-        let s_raw: Bytes = waiters.next().expect("two waiters per V3 venue").await.map_err(eyre::Error::from)?;
-        let l_raw: Bytes = waiters.next().expect("two waiters per V3 venue").await.map_err(eyre::Error::from)?;
-        let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(&s_raw)?;
-        let liquidity = IUniswapV3Pool::liquidityCall::abi_decode_returns(&l_raw)?;
-        v3_raw.push((U256::from(slot0.sqrtPriceX96), U256::from(liquidity)));
+        let entry: Option<(U256, U256)> = match (
+            waiters.next().expect("two waiters per V3 venue").await,
+            waiters.next().expect("two waiters per V3 venue").await,
+        ) {
+            (Ok(s_raw), Ok(l_raw)) => {
+                match (
+                    IUniswapV3Pool::slot0Call::abi_decode_returns(&s_raw),
+                    IUniswapV3Pool::liquidityCall::abi_decode_returns(&l_raw),
+                ) {
+                    (Ok(slot0), Ok(liquidity)) => {
+                        Some((U256::from(slot0.sqrtPriceX96), U256::from(liquidity)))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        v3_raw.push(entry);
     }
     let gas_price = gas_price_waiter.await.map_err(eyre::Error::from)?;
 

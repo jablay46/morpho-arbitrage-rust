@@ -43,24 +43,6 @@ pub struct Opportunity {
     pub profit: U256,
 }
 
-/// Widen-multiply then divide without overflowing U256:
-/// `a * b / den` computed via U512 intermediates. Returns None when the
-/// result does not fit back into U256 (or den is zero).
-fn mul_div(a: U256, b: U256, den: U256) -> Option<U256> {
-    use alloy::primitives::U512;
-    if den.is_zero() {
-        return None;
-    }
-    let product = a.widening_mul::<256, 4, 512, 8>(b);
-    let (quotient, _) = product.div_rem(U512::from_limbs_slice(den.as_limbs()));
-    // quotient fits U256 only if its high half is zero.
-    let limbs = quotient.as_limbs();
-    if limbs[4..].iter().any(|&l| l != 0) {
-        return None;
-    }
-    Some(U256::from_limbs_slice(&limbs[..4]))
-}
-
 /// True when the pool's spot output can be computed without overflow.
 /// Kept for symmetry with the scanner's venue filtering; pools at extreme
 /// ticks are skipped rather than mispriced.
@@ -301,32 +283,41 @@ mod tests {
     }
 
     #[test]
-    fn mul_div_handles_large_intermediates_without_overflow() {
-        // liquidity ~2^120, sqrtPriceX96 ~2^100 -> product ~2^220 fits U256.
-        let liq = U256::from(1u128) << 120;
-        let px = U256::from(1u128) << 100;
-        let q96 = U256::from(1u128) << 96;
-        let r = mul_div(liq, px, q96).expect("fits");
-        assert_eq!(r, U256::from(1u128) << 124);
+    fn v3_spot_price_scales_linearly_and_applies_fee() {
+        // A pool priced at exactly 1:1 (sqrtP = 2^96) with 0.05% fee.
+        let v3 = V3PoolState {
+            sqrt_price_x96: U256::from(1u128) << 96,
+            liquidity: U256::ZERO,
+            loan_is_token0: true,
+        };
+        let out = v3_spot_amount_out(&v3, 500, U256::from(10_000u64)).unwrap();
+        assert_eq!(out, U256::from(9_995u64));
+        // Inverse direction at the same price is also 1:1.
+        let inv = V3PoolState {
+            loan_is_token0: false,
+            ..v3
+        };
+        let out_inv = v3_spot_amount_out(&inv, 500, U256::from(10_000u64)).unwrap();
+        assert_eq!(out_inv, U256::from(9_995u64));
     }
 
     #[test]
-    fn mul_div_wide_product_exceeding_u256_still_computes() {
-        // Realistic V3 magnitudes: liquidity ~2^120, sqrtPriceX96 ~2^157
-        // (mid-range price). The raw product ~2^277 overflows U256, but the
-        // U512 intermediate keeps it exact and the quotient fits.
-        let liq = U256::from(1u128) << 120;
-        let px = U256::from(1u128) << 157;
-        let q96 = U256::from(1u128) << 96;
-        let r = mul_div(liq, px, q96).expect("quotient fits U256");
-        assert_eq!(r, U256::from(1u128) << 181);
-    }
-
-    #[test]
-    fn mul_div_returns_none_on_zero_denominator_or_oversize_quotient() {
-        assert!(mul_div(U256::from(1u64), U256::from(1u64), U256::ZERO).is_none());
-        // quotient ~2^256 does not fit U256.
-        assert!(mul_div(U256::MAX, U256::MAX, U256::from(1u64)).is_none());
+    fn v3_spot_price_quadratic_in_sqrt_price() {
+        // sqrtP = 2 * 2^96 => price 4:1; buying token1 with token0 yields 4x.
+        let v3 = V3PoolState {
+            sqrt_price_x96: U256::from(2u128) << 96,
+            liquidity: U256::ZERO,
+            loan_is_token0: true,
+        };
+        let out = v3_spot_amount_out(&v3, 0, U256::from(1_000u64)).unwrap();
+        assert_eq!(out, U256::from(4_000u64));
+        // Selling token1 (flipped orientation) yields 1/4.
+        let inv = V3PoolState {
+            loan_is_token0: false,
+            ..v3
+        };
+        let out_inv = v3_spot_amount_out(&inv, 0, U256::from(4_000u64)).unwrap();
+        assert_eq!(out_inv, U256::from(1_000u64));
     }
 
     #[test]

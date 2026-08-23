@@ -55,13 +55,15 @@ impl VenueCache {
             let pool = if venue.pair == Address::ZERO {
                 let pool = morpho_arbitrage_bot::dex::resolve_pool(
                     provider,
-                    venue.kind,
-                    venue.factory,
-                    venue.router,
-                    cfg.loan_token,
-                    cfg.quote_token,
-                    venue.stable,
-                    venue.fee_tier,
+                    &morpho_arbitrage_bot::dex::PoolQuery {
+                        kind: venue.kind,
+                        factory: venue.factory,
+                        router: venue.router,
+                        token_a: cfg.loan_token,
+                        token_b: cfg.quote_token,
+                        stable: venue.stable,
+                        fee_tier: venue.fee_tier,
+                    },
                 )
                 .await?;
                 info!(venue = idx, pool = %pool, kind = ?venue.kind, "pool auto-resolved");
@@ -212,7 +214,10 @@ where
 
     let mut pools: Vec<PoolState> = Vec::with_capacity(cfg.venues.len());
     for (j, &idx) in cache.v2_idx.iter().enumerate() {
-        let (r0, r1) = snapshot.v2_raw[j];
+        let Some((r0, r1)) = snapshot.v2_raw[j] else {
+            warn!(venue = idx, pair = %cfg.venues[idx].pair, "reserve fetch reverted; skipping venue");
+            continue;
+        };
         let venue = &cfg.venues[idx];
         match orient_reserves(r0, r1, &cache.pair_tokens[idx], venue.pair, cfg.loan_token) {
             Ok(reserves) => pools.push(PoolState {
@@ -226,16 +231,18 @@ where
         }
     }
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
-        let (sqrt_price_x96, liquidity) = snapshot.v3_raw[j];
+        let Some((sqrt_price_x96, liquidity)) = snapshot.v3_raw[j] else {
+            warn!(venue = idx, pool = %cfg.venues[idx].pair, "V3 state fetch reverted; skipping venue");
+            continue;
+        };
         let venue = &cfg.venues[idx];
         let v3 = V3PoolState {
             sqrt_price_x96,
             liquidity,
             loan_is_token0: cache.pair_tokens[idx].token0 == cfg.loan_token,
         };
-        // Drop V3 venues whose virtual reserves can't be priced (extreme
-        // ticks make L*sqrt(P) overflow U256's representable range), rather
-        // than feeding the scanner zeros it would misread as free money.
+        // Drop V3 venues whose spot price can't be computed (extreme
+        // ticks), rather than feeding the scanner garbage.
         if !v3_priceable(&v3) {
             warn!(venue = idx, pool = %venue.pair, "V3 pool state unpriceable; skipping venue");
             continue;

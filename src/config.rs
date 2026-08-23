@@ -139,7 +139,13 @@ impl Config {
                     "v2" => VenueKind::UniswapV2,
                     "aero" => VenueKind::Aerodrome,
                     "v3" => VenueKind::UniswapV3,
-                    "v4" => VenueKind::UniswapV4,
+                    // V4 reverts on-chain (unlock/lock pattern unsupported);
+                    // fail fast at config time instead of at execution.
+                    "v4" => {
+                        return Err(eyre!(
+                            "kind 'v4' in DEX_VENUES '{entry}' is not supported yet"
+                        ));
+                    }
                     other => return Err(eyre!("invalid kind '{other}' in DEX_VENUES '{entry}'")),
                 };
                 let fee_bps = parts
