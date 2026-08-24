@@ -265,6 +265,7 @@ mod tests {
             slippage_bps: 50,
             poll_interval_ms: 0,
             sweep_interval_blocks: 10,
+            min_scan_interval_ms: 0,
             dry_run: true,
             quoter_v2: Address::ZERO,
         };

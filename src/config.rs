@@ -83,6 +83,9 @@ pub struct Config {
     /// Safety-net sweep interval in blocks for event-driven mode: even when
     /// no pool event fires, a full scan is forced at least every N blocks.
     pub sweep_interval_blocks: u64,
+    /// Minimum wall-clock gap between event-driven scans, milliseconds
+    /// (0 = no limit). Caps request bursts against RPS-limited RPC plans.
+    pub min_scan_interval_ms: u64,
     /// If true, never broadcast transactions; only log simulated results.
     pub dry_run: bool,
     /// Uniswap QuoterV2 used to price V3 legs off-chain (real tick/liquidity
@@ -327,6 +330,17 @@ impl Config {
             .unwrap_or(10)
             .max(1);
 
+        // Minimum wall-clock gap between event-driven scans. Active pairs
+        // emit pool events nearly every block, and each scan costs several
+        // JSON-RPC requests; without a floor the bot bursts past the RPC
+        // plan's RPS limit. Events arriving during the cooldown are not
+        // lost: the next scan reads the latest block, which already
+        // includes their state changes.
+        let min_scan_interval_ms = env::var("MIN_SCAN_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
         // Uniswap QuoterV2 on Base. This address is Base-specific; other
         // chains deploy QuoterV2 elsewhere (e.g. Ethereum mainnet uses
         // 0x61fFE014bA17989E743c5F6cB21bF9697530B21e), so QUOTER_V2 must be
@@ -358,6 +372,7 @@ impl Config {
             slippage_bps,
             poll_interval_ms,
             sweep_interval_blocks,
+            min_scan_interval_ms,
             dry_run,
             quoter_v2,
         })

@@ -285,6 +285,10 @@ where
     // Block number of the last scan; any scan (event- or sweep-triggered)
     // resets the sweep clock because both run the same full scan.
     let mut last_scanned = 0u64;
+    // Wall-clock start of the last scan; enforces the RPS-protecting
+    // minimum gap between scans when configured.
+    let mut last_scan_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    let min_gap = std::time::Duration::from_millis(cfg.min_scan_interval_ms);
     loop {
         let trigger = tokio::select! {
             header = heads.next() => {
@@ -320,6 +324,13 @@ where
         let Some((reason, block)) = trigger else {
             continue;
         };
+        // Rate-limit scans: drop triggers arriving inside the cooldown
+        // window instead of queueing them — by the next scan, `latest`
+        // already includes their state changes.
+        if last_scan_at.elapsed() < min_gap {
+            continue;
+        }
+        last_scan_at = std::time::Instant::now();
         info!(block, reason, "scanning");
         match run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await {
             // Advance by the block the scan actually read (latest at scan
