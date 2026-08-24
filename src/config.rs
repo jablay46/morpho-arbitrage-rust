@@ -336,10 +336,12 @@ impl Config {
         // plan's RPS limit. Events arriving during the cooldown are not
         // lost: the next scan reads the latest block, which already
         // includes their state changes.
-        let min_scan_interval_ms = env::var("MIN_SCAN_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        let min_scan_interval_ms = match env::var("MIN_SCAN_INTERVAL_MS") {
+            Ok(raw) => raw
+                .parse::<u64>()
+                .map_err(|e| eyre!("invalid MIN_SCAN_INTERVAL_MS '{raw}': {e}"))?,
+            Err(_) => 0,
+        };
 
         // Uniswap QuoterV2 on Base. This address is Base-specific; other
         // chains deploy QuoterV2 elsewhere (e.g. Ethereum mainnet uses

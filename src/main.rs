@@ -287,7 +287,9 @@ where
     let mut last_scanned = 0u64;
     // Wall-clock start of the last scan; enforces the RPS-protecting
     // minimum gap between scans when configured.
-    let mut last_scan_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    let mut last_scan_at = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .unwrap_or_else(std::time::Instant::now);
     let min_gap = std::time::Duration::from_millis(cfg.min_scan_interval_ms);
     loop {
         let trigger = tokio::select! {
