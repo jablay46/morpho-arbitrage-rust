@@ -281,7 +281,7 @@ impl Config {
         }
 
         let dry_run = env::var("DRY_RUN")
-            .map(|s| matches!(s.as_str(), "1" | "true" | "yes"))
+            .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(true);
 
         let min_profit = env::var("MIN_PROFIT")
