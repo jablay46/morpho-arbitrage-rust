@@ -556,7 +556,6 @@ where
         "opportunity found"
     );
 
-    let params = executor::build_params(cfg, &opp, onchain_min_profit);
     if cfg.dry_run {
         // No simulate() here: it costs one eth_call per scan and reverts
         // whenever the owner wallet holds no WETH/approval — pure noise in
@@ -564,6 +563,8 @@ where
         info!("dry-run enabled; skipping broadcast");
         return Ok(block_number);
     }
+
+    let params = executor::build_params(cfg, &opp, onchain_min_profit);
 
     // Claim the in-flight slot before broadcasting so subsequent scans
     // skip trading while this tx is pending inclusion. Without this the
