@@ -514,14 +514,20 @@ where
     // config enforces loan_token == wrapped_native, so the wei estimate
     // is directly comparable to profit in loan-token units.
     //
-    // Two-stage build: estimate gas with a provisional params (minProfit
-    // barely affects calldata size/gas), then rebuild with the on-chain
-    // backstop raised to min_profit + gas so the contract itself reverts
-    // net-unprofitable trades before they waste gas on-chain. Skipped
-    // entirely in dry-run mode (no trade will be sent anyway).
+    // In dry-run, apply a constant gas-units estimate instead of skipping
+    // the cost entirely: with gas=0 the MIN_PROFIT filter runs against
+    // gross profit, so dry-run reports "opportunities" that live mode
+    // (which subtracts the real estimate_gas result) always rejects. The
+    // constant intentionally needs no RPC call and errs high for the
+    // Morpho flashloan + two router swaps path.
     let gas_cost_loan = if cfg.dry_run {
-        U256::ZERO
+        const DRY_RUN_GAS_UNITS: u64 = 400_000;
+        U256::from(DRY_RUN_GAS_UNITS) * gas_price
     } else {
+        // Two-stage build: estimate gas with a provisional params
+        // (minProfit barely affects calldata size/gas), then rebuild below
+        // with the on-chain backstop raised to min_profit + gas so the
+        // contract itself reverts net-unprofitable trades.
         let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
         let gas_estimate =
             executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional).await?;
@@ -530,7 +536,6 @@ where
 
     let net_profit = opp.profit.saturating_sub(gas_cost_loan);
     let onchain_min_profit = cfg.min_profit + gas_cost_loan;
-    let params = executor::build_params(cfg, &opp, onchain_min_profit);
     if net_profit < cfg.min_profit {
         info!(
             gross = %opp.profit,
@@ -551,8 +556,11 @@ where
         "opportunity found"
     );
 
+    let params = executor::build_params(cfg, &opp, onchain_min_profit);
     if cfg.dry_run {
-        executor::simulate(provider, cfg.arb_contract, cache.owner, params).await?;
+        // No simulate() here: it costs one eth_call per scan and reverts
+        // whenever the owner wallet holds no WETH/approval — pure noise in
+        // a mode whose only purpose is to observe the scanner's verdicts.
         info!("dry-run enabled; skipping broadcast");
         return Ok(block_number);
     }
