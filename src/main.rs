@@ -528,10 +528,21 @@ where
         // (minProfit barely affects calldata size/gas), then rebuild below
         // with the on-chain backstop raised to min_profit + gas so the
         // contract itself reverts net-unprofitable trades.
+        //
+        // estimate_gas executes the real swaps in simulation, so it
+        // reverts whenever minOut is unattainable (e.g. the spread is
+        // thinner than the per-leg slippage tolerance on a volatile
+        // pair). That is not a scan failure — it is a per-opportunity
+        // rejection, same as the net-profit filter; skip and keep
+        // scanning instead of failing the whole scan.
         let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
-        let gas_estimate =
-            executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional).await?;
-        gas_estimate * gas_price
+        match executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional).await {
+            Ok(gas_estimate) => gas_estimate * gas_price,
+            Err(e) => {
+                info!(error = %e, "opportunity rejected: simulated execution reverted");
+                return Ok(block_number);
+            }
+        }
     };
 
     let net_profit = opp.profit.saturating_sub(gas_cost_loan);
