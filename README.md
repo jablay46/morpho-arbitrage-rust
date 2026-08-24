@@ -230,6 +230,7 @@ Variabel yang tersedia:
 | `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (**khusus Base**; chain lain wajib diisi, mis. Ethereum mainnet `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`). |
 | `POLL_INTERVAL_MS` | Tidak | Interval polling untuk mode `scan` tanpa WSS. Default `500`. |
 | `SWEEP_INTERVAL_BLOCKS` | Tidak | Interval sweep penuh (block) sebagai safety net di mode event-driven: scan dipicu event pool, tapi tetap dipaksa minimal tiap N block. Default `10`. |
+| `MIN_SCAN_INTERVAL_MS` | Tidak | Jeda minimum antar scan event-driven (ms). Membatasi burst JSON-RPC pada plan dengan RPS rendah (mis. Chainstack 25 RPS); trigger dalam masa cooldown di-drop karena scan berikutnya membaca block `latest` yang sudah mencakup perubahannya. Default `0` (tanpa batas). |
 | `DRY_RUN` | Tidak | Default `true` = hanya simulasi, tidak broadcast. Set `false` untuk live trading. |
 
 Format `DEX_VENUES` (koma-separated):
