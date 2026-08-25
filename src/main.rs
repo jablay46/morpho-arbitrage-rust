@@ -179,18 +179,14 @@ async fn main() -> Result<()> {
 }
 
 /// Pick the quoter for a V3 venue: its per-venue override when set,
-/// otherwise the global QUOTER_V2. Slipstream pools are priced by the
-/// Aerodrome CL Quoter (0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0 on
-/// Base), whose `quoteExactInputSingle` discriminates by tickSpacing.
+/// otherwise the global config quoter (QUOTER_V2 for Uniswap-style V3,
+/// QUOTER_SLIPSTREAM for Aerodrome CL).
 fn resolve_quoter(cfg: &Config, venue: &morpho_arbitrage_bot::config::Venue) -> Address {
-    const SLIPSTREAM_QUOTER: &str = "0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0";
     if venue.quoter != Address::ZERO {
         return venue.quoter;
     }
     if venue.kind == VenueKind::Slipstream {
-        return SLIPSTREAM_QUOTER
-            .parse()
-            .expect("valid constant address");
+        return cfg.quoter_slipstream;
     }
     cfg.quoter_v2
 }

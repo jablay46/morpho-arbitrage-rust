@@ -268,6 +268,7 @@ mod tests {
             min_scan_interval_ms: 0,
             dry_run: true,
             quoter_v2: Address::ZERO,
+            quoter_slipstream: Address::ZERO,
         };
         let opp = Opportunity {
             first: 0,

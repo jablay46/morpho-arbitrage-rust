@@ -97,6 +97,9 @@ pub struct Config {
     /// traversal via eth_call). Defaults to the Base deployment; QUOTER_V2
     /// must be set explicitly for any other chain.
     pub quoter_v2: Address,
+    /// Aerodrome Slipstream Quoter used to price CL legs. Defaults to the
+    /// Base deployment; set QUOTER_SLIPSTREAM explicitly for other chains.
+    pub quoter_slipstream: Address,
 }
 
 impl Config {
@@ -373,6 +376,17 @@ impl Config {
                     .expect("valid constant address")
             });
 
+        // Aerodrome Slipstream Quoter on Base; chain-specific like QUOTER_V2.
+        let quoter_slipstream = env::var("QUOTER_SLIPSTREAM")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| Address::from_str(&s).map_err(|e| eyre!("invalid QUOTER_SLIPSTREAM: {e}")))
+            .transpose()?
+            .unwrap_or_else(|| {
+                Address::from_str("0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0")
+                    .expect("valid constant address")
+            });
+
         Ok(Self {
             rpc_url,
             wss_url,
@@ -392,6 +406,7 @@ impl Config {
             min_scan_interval_ms,
             dry_run,
             quoter_v2,
+            quoter_slipstream,
         })
     }
 }
