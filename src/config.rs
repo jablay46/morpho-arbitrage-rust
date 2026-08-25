@@ -15,6 +15,11 @@ pub enum VenueKind {
     UniswapV3 = 2,
     /// Uniswap-V4-style PoolManager using `unlock` + `swap` with hooks.
     UniswapV4 = 3,
+    /// Aerodrome Slipstream concentrated-liquidity router. Structurally the
+    /// same exactInputSingle shape as Uniswap V3, but the pool discriminator
+    /// is `int24 tickSpacing` instead of `uint24 fee`, so it has a different
+    /// selector and is NOT callable through the V3 branch.
+    Slipstream = 4,
 }
 
 /// One tradable venue: a pool plus its swap router and fee model.
@@ -92,6 +97,9 @@ pub struct Config {
     /// traversal via eth_call). Defaults to the Base deployment; QUOTER_V2
     /// must be set explicitly for any other chain.
     pub quoter_v2: Address,
+    /// Aerodrome Slipstream Quoter used to price CL legs. Defaults to the
+    /// Base deployment; set QUOTER_SLIPSTREAM explicitly for other chains.
+    pub quoter_slipstream: Address,
 }
 
 impl Config {
@@ -163,6 +171,7 @@ impl Config {
                     "v2" => VenueKind::UniswapV2,
                     "aero" => VenueKind::Aerodrome,
                     "v3" => VenueKind::UniswapV3,
+                    "slipstream" | "cl" => VenueKind::Slipstream,
                     // V4 reverts on-chain (unlock/lock pattern unsupported);
                     // fail fast at config time instead of at execution.
                     "v4" => {
@@ -237,6 +246,15 @@ impl Config {
                     .unwrap_or(Address::ZERO);
                 if parts.next().is_some() {
                     return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
+                }
+                // Slipstream CL pools are discriminated by tickSpacing (not a
+                // fee), stored in `fee_tier` (uint24) so the leg carries it to
+                // both the quoter call and the on-chain exactInputSingle.
+                if kind == VenueKind::Slipstream && !matches!(fee_tier, 1 | 50 | 100 | 200 | 2000) {
+                    return Err(eyre!(
+                        "DEX_VENUES '{entry}': slipstream fee_tier must be a tickSpacing \
+                         in {{1, 50, 100, 200, 2000}}"
+                    ));
                 }
                 // "auto" = resolve the pool from the factory at startup.
                 let pair = if pair.trim().eq_ignore_ascii_case("auto") {
@@ -358,6 +376,17 @@ impl Config {
                     .expect("valid constant address")
             });
 
+        // Aerodrome Slipstream Quoter on Base; chain-specific like QUOTER_V2.
+        let quoter_slipstream = env::var("QUOTER_SLIPSTREAM")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| Address::from_str(&s).map_err(|e| eyre!("invalid QUOTER_SLIPSTREAM: {e}")))
+            .transpose()?
+            .unwrap_or_else(|| {
+                Address::from_str("0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0")
+                    .expect("valid constant address")
+            });
+
         Ok(Self {
             rpc_url,
             wss_url,
@@ -377,6 +406,7 @@ impl Config {
             min_scan_interval_ms,
             dry_run,
             quoter_v2,
+            quoter_slipstream,
         })
     }
 }

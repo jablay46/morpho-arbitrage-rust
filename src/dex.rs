@@ -41,6 +41,36 @@ sol! {
             );
     }
 
+    // Aerodrome Slipstream CL pool state, used for on-chain validation.
+    #[sol(rpc)]
+    interface ICLPool {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+    }
+
+    struct QuoteExactInputSingleClParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        int24 tickSpacing;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    // Aerodrome Slipstream Quoter (0x254cF9E1...15b0 on Base): same shape as
+    // Uniswap QuoterV2 but discriminates pools by tickSpacing, not fee. Not
+    // `view` — must be eth_call.
+    #[sol(rpc)]
+    interface IQuoterSlipstream {
+        function quoteExactInputSingle(QuoteExactInputSingleClParams memory params)
+            external
+            returns (
+                uint256 amountOut,
+                uint160 sqrtPriceX96After,
+                uint32 initializedTicksCrossed,
+                uint256 gasEstimate
+            );
+    }
+
     #[sol(rpc)]
     interface IUniswapV2Factory {
         function getPair(address tokenA, address tokenB) external view returns (address pair);
@@ -54,6 +84,12 @@ sol! {
     #[sol(rpc)]
     interface IUniswapV3Factory {
         function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+    }
+
+    // Aerodrome Slipstream CL pool factory (0x5e7BB104...5809A on Base).
+    #[sol(rpc)]
+    interface ISlipstreamFactory {
+        function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address pool);
     }
 
     // Aerodrome router can resolve its default factory.
@@ -139,6 +175,17 @@ pub async fn resolve_pool<P: Provider>(provider: &P, q: &PoolQuery) -> Result<Ad
                     token_a,
                     token_b,
                     alloy::primitives::Uint::<24, 1>::from(fee_tier),
+                )
+                .call()
+                .await?
+        }
+        VenueKind::Slipstream => {
+            ISlipstreamFactory::new(factory, provider)
+                .getPool(
+                    token_a,
+                    token_b,
+                    alloy::primitives::aliases::I24::try_from(fee_tier)
+                        .map_err(|_| eyre::eyre!("slipstream tickSpacing {fee_tier} out of i24 range"))?,
                 )
                 .call()
                 .await?
@@ -234,7 +281,8 @@ pub async fn fetch_reserves<P: Provider>(
 
 /// One QuoterV2 `quoteExactInputSingle` request. The fee tier must be the
 /// venue's actual pool fee — quoting with a different tier prices a
-/// different pool.
+/// different pool. For Slipstream venues the field carries tickSpacing and
+/// the call goes through `IQuoterSlipstream`.
 #[derive(Debug, Clone, Copy)]
 pub struct QuoteRequest {
     pub token_in: Address,
@@ -246,6 +294,9 @@ pub struct QuoteRequest {
     /// Uniswap vs PancakeSwap), which have distinct factories and therefore
     /// distinct quoter contracts.
     pub quoter: Address,
+    /// When true, encode with `IQuoterSlipstream` (int24 tickSpacing)
+    /// instead of `IQuoterV2` (uint24 fee). Set per venue kind.
+    pub slipstream: bool,
 }
 
 /// Per-scan bundle of everything the bot needs from the chain, fetched in
@@ -266,18 +317,37 @@ pub struct ScanSnapshot {
 /// Encode one quote request as an eth_call transaction against its quoter.
 fn quote_tx(req: &QuoteRequest) -> alloy::rpc::types::eth::TransactionRequest {
     use alloy::rpc::types::eth::TransactionRequest;
-    let call = IQuoterV2::quoteExactInputSingleCall {
-        params: QuoteExactInputSingleParams {
-            tokenIn: req.token_in,
-            tokenOut: req.token_out,
-            amountIn: req.amount_in,
-            fee: alloy::primitives::Uint::<24, 1>::from(req.fee_tier),
-            sqrtPriceLimitX96: Default::default(),
-        },
+    let input: Bytes = if req.slipstream {
+        IQuoterSlipstream::quoteExactInputSingleCall {
+            params: QuoteExactInputSingleClParams {
+                tokenIn: req.token_in,
+                tokenOut: req.token_out,
+                amountIn: req.amount_in,
+                // Config validation already bounds slipstream fee_tier to
+                // {1, 50, 100, 200, 2000}, well inside i24.
+                tickSpacing: alloy::primitives::aliases::I24::try_from(req.fee_tier)
+                    .expect("slipstream tickSpacing validated at config"),
+                sqrtPriceLimitX96: Default::default(),
+            },
+        }
+        .abi_encode()
+        .into()
+    } else {
+        IQuoterV2::quoteExactInputSingleCall {
+            params: QuoteExactInputSingleParams {
+                tokenIn: req.token_in,
+                tokenOut: req.token_out,
+                amountIn: req.amount_in,
+                fee: alloy::primitives::Uint::<24, 1>::from(req.fee_tier),
+                sqrtPriceLimitX96: Default::default(),
+            },
+        }
+        .abi_encode()
+        .into()
     };
     TransactionRequest::default()
         .to(req.quoter)
-        .input(call.abi_encode().into())
+        .input(input.into())
 }
 
 fn decode_quote(raw: &Bytes) -> Option<U256> {
@@ -415,6 +485,15 @@ pub async fn fetch_quotes<P: Provider>(
 /// direction explicitly, so no orientation state is kept).
 pub async fn fetch_v3_pair_tokens<P: Provider>(provider: &P, pool: Address) -> Result<PairTokens> {
     let pool_contract = IUniswapV3Pool::new(pool, provider);
+    let token0 = pool_contract.token0().call().await?;
+    let token1 = pool_contract.token1().call().await?;
+    Ok(PairTokens { token0, token1 })
+}
+
+/// Same as `fetch_v3_pair_tokens` but for a Slipstream CL pool (token0/token1
+/// are the same standard getters; only the factory/quoter ABIs differ).
+pub async fn fetch_cl_pair_tokens<P: Provider>(provider: &P, pool: Address) -> Result<PairTokens> {
+    let pool_contract = ICLPool::new(pool, provider);
     let token0 = pool_contract.token0().call().await?;
     let token1 = pool_contract.token1().call().await?;
     Ok(PairTokens { token0, token1 })

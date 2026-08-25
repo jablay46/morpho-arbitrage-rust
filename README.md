@@ -57,12 +57,16 @@ Pricing V3 memakai **QuoterV2**, yaitu traversal tick/liquidity riil yang
 dilakukan on-chain via `eth_call` — bukan estimasi spot price — sehingga
 output untuk trade besar akurat dan pemilihan ukuran pinjaman benar.
 
-Kontrak mendukung tiga keluarga router lewat `SwapLeg.kind`:
+Kontrak mendukung empat keluarga router lewat `SwapLeg.kind`:
 
 - `0` = Uniswap-V2-style (`address[] path`) — Uniswap V2, Sushiswap V2,
   Pancakeswap V2.
 - `1` = Aerodrome-style (`Route[]{from,to,stable,factory}`).
-- `2` = Uniswap-V3-style (`exactInputSingle` dengan `feeTier`).
+- `2` = Uniswap-V3-style (`exactInputSingle` dengan `uint24 fee`).
+- `4` = Aerodrome Slipstream (CL) — bentuk `exactInputSingle` yang sama
+  seperti V3, tetapi pool dipilah lewat `int24 tickSpacing` (selector
+  `0xa026383e`, bukan `0x414bf389`), jadi **tidak** bisa dilewatkan lewat
+  branch V3.
 
 Setiap leg membawa `minOut` (dari quote riil dikali `1 - SLIPPAGE_BPS`)
 untuk membatasi drift harga antara simulasi dan inklusi; toleransi leg B
@@ -228,6 +232,7 @@ Variabel yang tersedia:
 | `SLIPPAGE_BPS` | Tidak | Toleransi slippage per leg dalam bps. Default `50` (0.5%). |
 | `GAS_PRICE_WEI` | Tidak | Override gas price; default diambil on-chain. |
 | `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (**khusus Base**; chain lain wajib diisi, mis. Ethereum mainnet `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`). |
+| `QUOTER_SLIPSTREAM` | Tidak | Alamat Quoter Aerodrome Slipstream untuk pricing venue `slipstream`. Default `0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0` (**khusus Base**). |
 | `POLL_INTERVAL_MS` | Tidak | Interval polling untuk mode `scan` tanpa WSS. Default `500`. |
 | `SWEEP_INTERVAL_BLOCKS` | Tidak | Interval sweep penuh (block) sebagai safety net di mode event-driven: scan dipicu event pool, tapi tetap dipaksa minimal tiap N block. Default `10`. |
 | `MIN_SCAN_INTERVAL_MS` | Tidak | Jeda minimum antar scan event-driven (ms). Membatasi burst JSON-RPC pada plan dengan RPS rendah (mis. Chainstack 25 RPS); trigger dalam masa cooldown di-drop karena scan berikutnya membaca block `latest` yang sudah mencakup perubahannya. Default `0` (tanpa batas). |
@@ -240,9 +245,10 @@ Format `DEX_VENUES` (koma-separated):
 ```
 
 - `POOL` = alamat pool/pair, atau `auto` untuk resolve dari `factory` saat startup.
-- `kind` = `v2` (default) | `aero` | `v3` (`v4` belum didukung).
+- `kind` = `v2` (default) | `aero` | `v3` | `slipstream` (`v4` belum didukung).
 - `fee_bps` = fee pool dalam basis point (default 30; untuk V2/Aero).
 - `fee_tier` = fee tier Uniswap V3 dalam hundredths of a bip (500/3000/10000).
+  Untuk `slipstream` field ini membawa **tickSpacing** pool (1/50/100/200/2000).
 - `stable` = `true` untuk pool stable Aerodrome.
 - `quoter` = override QuoterV2 per-venue (V3, opsional). Kosongkan untuk
   memakai `QUOTER_V2` global. Wajib diisi untuk V3 venue non-Uniswap
@@ -261,6 +267,9 @@ QuoterV2            0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a
 Pancake V3  router  0x1b81D678ffb9C0263b24A97847620C99d213eB14
             factory 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865
 QuoterV2            0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
+Slipstream  router  0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5
+            factory 0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A
+            quoter  0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0
 Morpho Blue         0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
 WETH                0x4200000000000000000000000000000000000006
 USDC                0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
@@ -284,6 +293,14 @@ Catatan: `auto` untuk V3 me-resolve pool lewat `getPool(loan, quote,
 fee_tier)` di factory — jadi `fee_tier` menentukan pool mana yang dipakai,
 dan `quoter` menentukan kontrak yang meng-quote-nya. Keduanya harus milik
 DEX yang sama.
+
+Contoh menambah Aerodrome Slipstream (CL). Di sini `fee_tier` membawa
+tickSpacing=100, dan quoter Slipstream (0x254c...) dipakai otomatis —
+tidak perlu mengisi kolom `quoter`:
+
+```bash
+DEX_VENUES=...,auto:0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5:slipstream:30:0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A:false:100
+```
 
 ## 6. Menjalankan Bot
 

@@ -268,6 +268,7 @@ mod tests {
             min_scan_interval_ms: 0,
             dry_run: true,
             quoter_v2: Address::ZERO,
+            quoter_slipstream: Address::ZERO,
         };
         let opp = Opportunity {
             first: 0,
@@ -288,5 +289,26 @@ mod tests {
             * U256::from(9_950u64)
             / U256::from(10_000u64);
         assert_eq!(params.legB.minOut, expected_b);
+    }
+
+    /// The Slipstream leg kind (4) must round-trip through the alloy binding
+    /// and match the contract's `KIND_SLIPSTREAM` constant.
+    #[test]
+    fn slipstream_leg_kind_round_trips() {
+        use crate::config::VenueKind;
+        assert_eq!(VenueKind::Slipstream as u8, 4);
+        let venue = SwapLeg {
+            router: address!("3333333333333333333333333333333333333333"),
+            kind: VenueKind::Slipstream as u8,
+            factory: Address::ZERO,
+            stable: false,
+            feeTier: alloy::primitives::Uint::<24, 1>::from(100u32),
+            poolId: alloy::primitives::FixedBytes([0u8; 32]),
+            minOut: U256::from(900u64),
+        };
+        let encoded = venue.abi_encode();
+        let decoded = SwapLeg::abi_decode(&encoded).expect("leg decodes");
+        assert_eq!(decoded.kind, 4);
+        assert_eq!(decoded.feeTier, alloy::primitives::Uint::<24, 1>::from(100u32));
     }
 }
