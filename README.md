@@ -218,6 +218,7 @@ Variabel yang tersedia:
 
 | Variabel | Wajib | Keterangan |
 |---|---|---|
+| `ENV_FILE` | Tidak | Path file dotenv alternatif (mis. `.env.virtual`). Default `.env`. Set saat menjalankan: `ENV_FILE=.env.virtual ./target/release/morpho-arbitrage-bot`. |
 | `RPC_URL` | Ya | HTTP RPC endpoint (Base). |
 | `WSS_URL` | Tidak | WebSocket endpoint; mengaktifkan scanning event-driven (dipicu event pool + sweep per N block). Kosongkan untuk mode polling. |
 | `PRIVATE_KEY` | Ya | Private key wallet bot (= owner kontrak). **Jangan pernah commit.** |

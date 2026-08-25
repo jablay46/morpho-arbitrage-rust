@@ -104,7 +104,15 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let _ = dotenvy::dotenv();
+        // ENV_FILE selects an alternate dotenv file (e.g. .env.virtual);
+        // unset = default .env lookup, missing file = hard error since the
+        // user explicitly asked for it.
+        if let Some(path) = env::var("ENV_FILE").ok().filter(|s| !s.is_empty()) {
+            dotenvy::from_filename(&path)
+                .map_err(|e| eyre!("failed to load ENV_FILE={path}: {e}"))?;
+        } else {
+            let _ = dotenvy::dotenv();
+        }
 
         let parse_addr = |key: &str| -> Result<Address> {
             let raw = env::var(key).map_err(|_| eyre!("missing env var {key}"))?;
