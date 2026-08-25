@@ -4,8 +4,8 @@ use eyre::Result;
 use morpho_arbitrage_bot::arbitrage::{find_opportunity, v2_quotes, VenueQuotes};
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
-    fetch_pair_tokens, fetch_quotes, fetch_scan_snapshot, fetch_v3_pair_tokens, orient_reserves,
-    PairTokens, QuoteRequest,
+    fetch_cl_pair_tokens, fetch_pair_tokens, fetch_quotes, fetch_scan_snapshot,
+    fetch_v3_pair_tokens, orient_reserves, PairTokens, QuoteRequest,
 };
 use morpho_arbitrage_bot::executor;
 use std::sync::Arc;
@@ -79,6 +79,12 @@ impl VenueCache {
             let tokens = if venue.kind == VenueKind::UniswapV3 {
                 v3_idx.push(idx);
                 fetch_v3_pair_tokens(provider, pool).await?
+            } else if venue.kind == VenueKind::Slipstream {
+                // Slipstream CL pools are priced via their own quoter; from the
+                // scanner's perspective they behave like V3 (no per-scan reserve
+                // reads), so they ride the same index.
+                v3_idx.push(idx);
+                fetch_cl_pair_tokens(provider, pool).await?
             } else {
                 v2_idx.push(idx);
                 v2_pairs.push(pool);
@@ -173,13 +179,20 @@ async fn main() -> Result<()> {
 }
 
 /// Pick the quoter for a V3 venue: its per-venue override when set,
-/// otherwise the global QUOTER_V2.
+/// otherwise the global QUOTER_V2. Slipstream pools are priced by the
+/// Aerodrome CL Quoter (0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0 on
+/// Base), whose `quoteExactInputSingle` discriminates by tickSpacing.
 fn resolve_quoter(cfg: &Config, venue: &morpho_arbitrage_bot::config::Venue) -> Address {
-    if venue.quoter == Address::ZERO {
-        cfg.quoter_v2
-    } else {
-        venue.quoter
+    const SLIPSTREAM_QUOTER: &str = "0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0";
+    if venue.quoter != Address::ZERO {
+        return venue.quoter;
     }
+    if venue.kind == VenueKind::Slipstream {
+        return SLIPSTREAM_QUOTER
+            .parse()
+            .expect("valid constant address");
+    }
+    cfg.quoter_v2
 }
 
 /// Strip credentials from a URL for logging: keep scheme + host, drop the
@@ -211,6 +224,8 @@ fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider + C
 /// pool: V2 Sync/Swap/Mint/Burn, V3 Swap/Mint/Burn, plus the Aerodrome
 /// (Velodrome fork) variants, whose Sync/Swap/Burn declarations differ
 /// from Uniswap V2 and therefore hash to different topic0 values.
+/// Aerodrome Slipstream (CL) is a UniV3 fork with identical event
+/// signatures, so its Swap/Mint/Burn topic0s are already covered here.
 fn pool_event_signatures() -> Vec<alloy::primitives::B256> {
     [
         // Uniswap V2 (also Sushiswap/Pancakeswap V2).
@@ -218,12 +233,12 @@ fn pool_event_signatures() -> Vec<alloy::primitives::B256> {
         "Swap(address,uint256,uint256,uint256,uint256,address)",
         "Mint(address,uint256,uint256)",
         "Burn(address,uint256,uint256,address)",
-        // Aerodrome: Sync/Swap use uint256 and Burn orders `to` before the
-        // amounts, so all three hash differently from the V2 originals.
+        // Aerodrome vAMM: Sync/Swap use uint256 and Burn orders `to` before
+        // the amounts, so all three hash differently from the V2 originals.
         "Sync(uint256,uint256)",
         "Swap(address,address,uint256,uint256,uint256,uint256)",
         "Burn(address,address,uint256,uint256)",
-        // Uniswap V3. Aerodrome's Mint is identical to V2's, already above.
+        // Uniswap V3 (also Aerodrome Slipstream CL pools).
         "Swap(address,address,int256,int256,uint160,uint128,int24)",
         "Mint(address,address,int24,int24,uint128,uint256,uint256)",
         "Burn(address,int24,int24,uint128,uint256,uint256)",
@@ -388,13 +403,16 @@ where
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
     for &idx in &cache.v3_idx {
+        let venue = &cfg.venues[idx];
+        let slipstream = venue.kind == VenueKind::Slipstream;
         for &size in sizes {
             leg1_requests.push(QuoteRequest {
                 token_in: cfg.loan_token,
                 token_out: cfg.quote_token,
-                fee_tier: cfg.venues[idx].fee_tier,
+                fee_tier: venue.fee_tier,
                 amount_in: size,
-                quoter: resolve_quoter(cfg, &cfg.venues[idx]),
+                quoter: resolve_quoter(cfg, venue),
+                slipstream,
             });
         }
     }
@@ -432,9 +450,14 @@ where
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
         let leg1: Vec<Option<U256>> = snapshot.v3_quotes[j * n_sizes..(j + 1) * n_sizes].to_vec();
         if leg1.iter().all(|q| q.is_none()) {
+            let label = if cfg.venues[idx].kind == VenueKind::Slipstream {
+                "Slipstream"
+            } else {
+                "V3"
+            };
             warn!(
                 venue = idx,
-                "V3 venue returned no usable quotes; skipping venue"
+                "{label} venue returned no usable quotes; skipping venue"
             );
             continue;
         }
@@ -465,25 +488,28 @@ where
             }
         }
         let venue_idx = legs[s].quotes.venue;
+        let venue = &cfg.venues[venue_idx];
         if let Some(reserves) = legs[s].v2_reserves {
             legs[s].quotes.leg2 = v2_quotes(
                 venue_idx,
                 reserves,
-                cfg.venues[venue_idx].fee_bps,
+                venue.fee_bps,
                 &[],
                 &inputs,
             )
             .leg2;
         } else {
+            let slipstream = venue.kind == VenueKind::Slipstream;
             for q in inputs {
                 phase2.push((
                     s,
                     QuoteRequest {
                         token_in: cfg.quote_token,
                         token_out: cfg.loan_token,
-                        fee_tier: cfg.venues[venue_idx].fee_tier,
+                        fee_tier: venue.fee_tier,
                         amount_in: q,
-                        quoter: resolve_quoter(cfg, &cfg.venues[venue_idx]),
+                        quoter: resolve_quoter(cfg, venue),
+                        slipstream,
                     },
                 ));
             }

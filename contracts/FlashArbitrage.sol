@@ -56,6 +56,23 @@ interface IUniswapV3Router {
         returns (uint256 amountOut);
 }
 
+interface ISlipstreamRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        int24 tickSpacing;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external
+        returns (uint256 amountOut);
+}
+
 interface IUniswapV4PoolManager {
     struct PoolKey {
         address currency0;
@@ -76,13 +93,15 @@ interface IUniswapV4PoolManager {
  * @notice Executes a two-DEX cycle funded by a Morpho Blue flash loan.
  *         Morpho Blue flash loans are fee-free; the loan is repaid by
  *         approving Morpho to pull `assets` back inside the callback.
- *         Supports Uniswap-V2-style routers and Aerodrome-style routers.
+ *         Supports Uniswap-V2-style, Aerodrome vAMM, Uniswap-V3-style, and
+ *         Aerodrome Slipstream (CL) routers.
  */
 contract FlashArbitrage {
     uint8 internal constant KIND_UNISWAP_V2 = 0;
     uint8 internal constant KIND_AERODROME = 1;
     uint8 internal constant KIND_UNISWAP_V3 = 2;
     uint8 internal constant KIND_UNISWAP_V4 = 3;
+    uint8 internal constant KIND_SLIPSTREAM = 4;
 
     struct SwapLeg {
         address router;
@@ -196,6 +215,24 @@ contract FlashArbitrage {
                 sqrtPriceLimitX96: 0
             });
             return IUniswapV3Router(leg.router).exactInputSingle(params);
+        }
+        if (leg.kind == KIND_SLIPSTREAM) {
+            // Aerodrome Slipstream (CL) router: structurally identical to V3
+            // but the pool discriminator is int24 tickSpacing, not uint24 fee
+            // (selector 0xa026383e, not 0x414bf389).
+            ISlipstreamRouter.ExactInputSingleParams memory params = ISlipstreamRouter.ExactInputSingleParams({
+                tokenIn: from,
+                tokenOut: to,
+                // feeTier holds the Slipstream tickSpacing (1..2000, all
+                // positive); widen via uint256 then narrow through int256.
+                tickSpacing: int24(int256(uint256(leg.feeTier))),
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountIn: amountIn,
+                amountOutMinimum: leg.minOut,
+                sqrtPriceLimitX96: 0
+            });
+            return ISlipstreamRouter(leg.router).exactInputSingle(params);
         }
         if (leg.kind == KIND_UNISWAP_V4) {
             // V4 uses an unlock/lock pattern that doesn't fit this flashloan
