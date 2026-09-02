@@ -8,14 +8,15 @@ Aerodrome, dan Uniswap V3 — dengan memindai semua pasangan arah terurut.
 ## Daftar Isi
 
 1. [Arsitektur](#arsitektur)
-2. [Prasyarat & Instalasi](#prasyarat--instalasi)
-3. [Build & Test](#3-build--test)
-4. [Deploy Kontrak FlashArbitrage](#4-deploy-kontrak-flasharbitrage)
-5. [Konfigurasi (.env)](#5-konfigurasi-env)
-6. [Menjalankan Bot](#6-menjalankan-bot)
-7. [Mode Produksi](#7-mode-produksi)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Catatan Keamanan](#catatan-keamanan)
+2. [Flashblocks](#flashblocks)
+3. [Prasyarat & Instalasi](#prasyarat--instalasi)
+4. [Build & Test](#4-build--test)
+5. [Deploy Kontrak FlashArbitrage](#4-deploy-kontrak-flasharbitrage)
+6. [Konfigurasi (.env)](#5-konfigurasi-env)
+7. [Menjalankan Bot](#6-menjalankan-bot)
+8. [Mode Produksi](#7-mode-produksi)
+9. [Troubleshooting](#8-troubleshooting)
+10. [Catatan Keamanan](#catatan-keamanan)
 
 ## Arsitektur
 
@@ -74,13 +75,68 @@ dikompound dua kali karena input-nya adalah output aktual leg A; cek
 `minProfit` on-chain tetap menjadi backstop terakhir.
 
 Catatan MEV di Base: sequencer terpusat dengan mempool privat, jadi tidak
-ada sandwich/frontrunning. Risiko nyata adalah kalah balapan dengan bot arb
-lain — tx yang kalah revert dan rugi gas. Mitigasi: RPC latensi rendah,
-`WSS_URL` untuk scanning per-block, dan estimateGas sebagai gate simulasi
-tepat sebelum kirim.
+ada sandwich/frontrunning *pada level block sealed*. Sejak Flashblocks aktif
+(Juli 2025), ordering transaksi dipindahkan ke level sub-block 200ms:
+kompetisi MEV intra-block (terutama balapan fee di Flashblock pertama) tetap
+ada, dan bot yang membaca state Flashblock + submit sinkron dulang ~10×
+dibanding bot yang hanya melihat block sealed. Risiko nyata adalah kalah
+balapan dengan bot arb lain — tx yang kalah revert dan rugi gas. Mitigasi:
+endpoint Flashblock-aware, `WSS_URL`, baca state `pending` (lihat
+[Flashblocks](#flashblocks)), dan estimateGas sebagai gate simulasi tepat
+sebelum kirim.
 
 Catatan: pool Aerodrome **stable** memakai kurva x^3y+y^3x, bukan constant
 product; simulasi off-chain bot ini hanya akurat untuk pool volatile (vAMM).
+
+## Flashblocks
+
+[Flashblocks](https://docs.base.org/base-chain/flashblocks/) memecah setiap
+block Base 2-detik menjadi ~10 sub-block 200ms (preconfirmation). Bot ini
+membaca state Flashblock agar peluang terdeteksi ~10× lebih segar dan kalah
+balapan lebih sedikit. **Wajib endpoint Flashblock-aware** (Chainstack,
+Dwellir, QuickNode, dll.) — tanpanya, opsi-opsi di bawah otomatis fallback
+ke perilaku lama (block sealed 2-detik).
+
+Bot mem-probe endpoint saat startup **hanya** dengan subscribe WS
+`newFlashblocks` — method non-standar yang hanya di-implement endpoint
+Flashblock-aware (stock OP-Stack menolaknya). Heuristik `pending > latest`
+**tidak** dipakai karena node Ethereum biasa juga mengembalikan
+`pending = latest + 1` (false-positive). Tanpa `WSS_URL`, semua lapisan
+otomatis fallback ke sealed. Hasil probe di-cache sekali di startup dan
+dipakai untuk semua lapisan. Empat lapisan (semuanya default **aktif** kecuali
+`USE_PENDING_SIM`):
+
+| Opsi env | Default | Efek |
+|---|---|---|
+| `FLASHBLOCKS` | `true` | Master switch; `false` mematikan keempat lapisan sekaligus. |
+| `USE_PENDING_STATE` | `true` | Baca reserves/quote/gasPrice dari tag `pending` (~200ms) bukan `latest` (2s). Peluang ~10× lebih segar; drift harga antara simulasi & inklusi mengecil. |
+| `USE_FLASHBLOCK_SYNC` | `true` | Submit via path sinkron (~200ms receipt), bukan fire-and-forget. Flag in-flight dibersihkan ~10× lebih cepat sehingga bot tidak buta selama satu block penuh. |
+| `USE_PENDING_LOGS` | `true` | Subscribe `pendingLogs` (subscription type Base, bukan filter `logs` biasa) agar scan dipicu ~200ms setelah pool event, bukan menunggu block sealed. Best-effort; fallback ke log sealed bila endpoint menolak. |
+| `USE_PENDING_SIM` | `false` | Gate `estimate_gas` terhadap state `pending` agar menangkap kasus Flashblock lain sudah menggeser harga → reject sebelum kirim (hemat gas). Hanya aktif bila `USE_PENDING_STATE` juga efektif; bila endpoint non-Flashblock, otomatis downgrade ke `latest` (bukan silent sealed-state gate). |
+
+Peringatan penting:
+
+- **Bukan finalitas.** State `pending` dan receipt sinkron adalah
+  *preconfirmation* — bisa reorg vs block sealed (jarang, tapi mungkin di rilis
+  awal). Tetap andalkan backstop on-chain `minOut`/`minProfit`; kerugian
+  terburuk = gas, bukan principal. Revert protection Flashblocks belum aktif
+  di rilis awal, jadi revert tetap menghabiskan gas.
+- **Provider-spesifik.** Method `pending` / `pendingLogs` bersifat per-RPC;
+  tidak semua endpoint mendukungnya. Probe startup + fallback memastikan bot
+  tetap jalan di endpoint biasa.
+- **Reorg handling.** Log Flashblock yang reorg (`log.removed`) di-drop;
+  stream log sealed + sweep interval menjadi backstop. Saat stream
+  `pendingLogs` berakhir (endpoint tutup/koneksi putus), branch-nya
+  dimatikan agar loop tidak spin; bot kembali ke log sealed.
+- **State-advancement guard.** Tag `pending` mutable (maju ~200ms). Bot
+  snapshot nomor block sealed di awal scan dan mengecek **dua kali**: antara
+  phase-1 & phase-2, dan lagi tepat sebelum broadcast. Bila Flashblock baru
+  mendarat (state berubah), peluang di-discard & rescan agar leg tidak
+  mencampur dua state berbeda yang berisiko revert.
+- **Duplicate protection.** Saat `eth_sendRawTransactionSync` timeout, tx
+  tetap pending — flag in-flight ditahan oleh background watcher (bukan
+  di-clear) sampai receipt konklusif, sehingga scan berikutnya tidak
+  broadcast tx duplikat bersaing.
 
 ## Prasyarat & Instalasi
 
@@ -238,6 +294,11 @@ Variabel yang tersedia:
 | `SWEEP_INTERVAL_BLOCKS` | Tidak | Interval sweep penuh (block) sebagai safety net di mode event-driven: scan dipicu event pool, tapi tetap dipaksa minimal tiap N block. Default `10`. |
 | `MIN_SCAN_INTERVAL_MS` | Tidak | Jeda minimum antar scan event-driven (ms). Membatasi burst JSON-RPC pada plan dengan RPS rendah (mis. Chainstack 25 RPS); trigger dalam masa cooldown di-drop karena scan berikutnya membaca block `latest` yang sudah mencakup perubahannya. Default `0` (tanpa batas). |
 | `DRY_RUN` | Tidak | Default `true` = hanya simulasi, tidak broadcast. Set `false` untuk live trading. |
+| `FLASHBLOCKS` | Tidak | Master switch Base Flashblocks (sub-block 200ms). Default `true`; `false` mematikan keempat opsi di bawah. Lihat [Flashblocks](#flashblocks). |
+| `USE_PENDING_STATE` | Tidak | Baca state dari tag `pending` (~200ms) bukan `latest` (2s). Default `true`. Butuh endpoint Flashblock-aware; otomatis fallback bila tidak tersedia. |
+| `USE_FLASHBLOCK_SYNC` | Tidak | Submit trade via path sinkron (~200ms receipt). Default `true`. Clear flag in-flight ~10× lebih cepat. |
+| `USE_PENDING_LOGS` | Tidak | Subscribe `pendingLogs` (Flashblock-level). Default `true`. Picu scan ~200ms setelah pool event. Best-effort fallback ke log sealed. |
+| `USE_PENDING_SIM` | Tidak | Gate `estimate_gas` terhadap state `pending`. Default `false` (off; menambah eth_call per peluang). |
 
 Format `DEX_VENUES` (koma-separated):
 

@@ -2,7 +2,9 @@ use crate::arbitrage::Opportunity;
 use crate::config::{Config, Venue};
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
+use alloy::sol_types::SolCall;
 use eyre::Result;
 
 sol! {
@@ -86,27 +88,38 @@ pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbPar
 
 /// Simulate `execute` via eth_call without broadcasting. The call must carry
 /// `from` = the contract owner (cached at startup), otherwise the contract's
-/// `onlyOwner` guard reverts the simulation.
+/// `onlyOwner` guard reverts the simulation. When `block` is `pending`, the
+/// simulation runs against Flashblock preconfirmed state (~200ms fresh),
+/// catching price moves from other Flashblocks before our tx lands.
 pub async fn simulate<P: Provider>(
     provider: &P,
     contract: Address,
     owner: Address,
     params: ArbParams,
+    block: alloy::eips::BlockId,
 ) -> Result<()> {
     let arb = IFlashArbitrage::new(contract, provider);
-    arb.execute(params).from(owner).call().await?;
+    arb.execute(params).from(owner).block(block).call().await?;
     Ok(())
 }
 
-/// Estimate gas for `execute` via eth_estimateGas.
+/// Estimate gas for `execute` via eth_estimateGas. When `block` is `pending`,
+/// the estimate runs against Flashblock preconfirmed state, so a trade that
+/// would revert because a competing Flashblock already moved the pool price
+/// is rejected here instead of burning gas on inclusion.
 pub async fn estimate_gas<P: Provider>(
     provider: &P,
     contract: Address,
     owner: Address,
     params: ArbParams,
+    block: Option<alloy::eips::BlockId>,
 ) -> Result<U256> {
     let arb = IFlashArbitrage::new(contract, provider);
-    let gas = arb.execute(params).from(owner).estimate_gas().await?;
+    let call = arb.execute(params).from(owner);
+    let gas = match block {
+        Some(b) => call.block(b).estimate_gas().await?,
+        None => call.estimate_gas().await?,
+    };
     Ok(U256::from(gas))
 }
 
@@ -153,6 +166,100 @@ where
     });
     Ok(tx_hash)
 }
+
+/// Submit `execute` and return as soon as the node reports Flashblock
+/// inclusion (~200ms on a Base Flashblock-aware endpoint). Uses the wallet-
+/// enabled provider to build, sign, and broadcast the `execute()` call, then
+/// waits for the receipt with a short timeout bound well under one sealed
+/// block. On a Flashblock endpoint the node returns the receipt within ~200ms
+/// (the synchronous inclusion path); the scanner's in-flight flag is cleared
+/// here, so the bot unblocks for the next opportunity ~10x sooner than
+/// fire-and-forget. The receipt is a preconfirmation, not finality — it can
+/// reorg against the sealed block, so the on-chain `minProfit`/`minOut`
+/// backstops must stay in place.
+///
+/// If the receipt does not arrive within the timeout (slow node, or an
+/// endpoint without Flashblocks), the already-broadcast transaction is still
+/// pending and must not be replaced. Rather than clear the in-flight flag
+/// (which would let the next scan broadcast a competing duplicate), the
+/// receipt future is handed to a background watcher — exactly like the
+/// asynchronous `execute` path — which clears the flag once the tx lands or
+/// fails conclusively. The scan loop resumes immediately, but duplicate
+/// protection stays intact.
+pub async fn execute_sync<P>(
+    provider: P,
+    contract: Address,
+    params: ArbParams,
+    inflight: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<TxHash>
+where
+    P: Provider + 'static,
+{
+    use alloy::network::TransactionBuilder;
+
+    let tx = TransactionRequest::default()
+        .with_to(contract)
+        .with_input(alloy::primitives::Bytes::from(
+            IFlashArbitrage::executeCall { params }.abi_encode(),
+        ));
+    let pending = provider.send_transaction(tx).await?;
+    let tx_hash = *pending.tx_hash();
+
+    // Move the receipt future into a background task that owns `pending`
+    // (get_receipt takes self by value) and clears the in-flight flag on any
+    // conclusive outcome. We then wait on the task's *result* with a short
+    // timeout. On a Flashblock endpoint the receipt returns ~200ms and the
+    // flag clears here; on timeout the task keeps running and clears the flag
+    // later — the already-broadcast tx stays pending and the next scan cannot
+    // broadcast a competing duplicate because the flag is still held.
+    let flag = inflight.clone();
+    let receipt_task = tokio::spawn(async move {
+        let receipt = pending.get_receipt().await;
+        match &receipt {
+            Ok(r) if r.status() => {
+                tracing::info!(tx = %r.transaction_hash, "arbitrage transaction flash-confirmed");
+            }
+            Ok(r) => {
+                tracing::warn!(
+                    tx = %r.transaction_hash,
+                    "arbitrage transaction reverted (gas lost; minProfit backstop held)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(tx = %tx_hash, error = %e, "failed to fetch transaction receipt");
+            }
+        }
+        if let Some(flag) = flag {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+        }
+        receipt
+    });
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(SYNC_RECEIPT_TIMEOUT_MS),
+        receipt_task,
+    )
+    .await
+    {
+        // Receipt arrived (or a fatal fetch error) within the Flashblock
+        // window: the task has already cleared the flag.
+        Ok(_) => {}
+        // Timed out waiting for the receipt. The background task still owns
+        // `pending` and the in-flight flag; it will clear the flag when the
+        // tx lands or fails conclusively. Resume scanning immediately, but
+        // duplicate protection stays intact — no competing broadcast.
+        Err(_) => {
+            tracing::info!(tx = %tx_hash, "flash-sync receipt timed out; background watcher holds in-flight flag");
+        }
+    }
+    Ok(tx_hash)
+}
+
+/// How long `execute_sync` waits for a Flashblock receipt before resuming
+/// the scan loop. 200ms is the Flashblock cadence; pad to ~2s (one full
+/// block) to absorb jitter on busy blocks while still bounding the wait so a
+/// non-Flashblock endpoint cannot stall scanning.
+const SYNC_RECEIPT_TIMEOUT_MS: u64 = 2000;
 
 #[cfg(test)]
 mod tests {
@@ -269,6 +376,10 @@ mod tests {
             dry_run: true,
             quoter_v2: Address::ZERO,
             quoter_slipstream: Address::ZERO,
+            use_pending_state: false,
+            use_flashblock_sync: false,
+            use_pending_logs: false,
+            use_pending_sim: false,
         };
         let opp = Opportunity {
             first: 0,

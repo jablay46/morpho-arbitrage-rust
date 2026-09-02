@@ -5,7 +5,8 @@ use morpho_arbitrage_bot::arbitrage::{find_opportunity, v2_quotes, VenueQuotes};
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
     fetch_cl_pair_tokens, fetch_pair_tokens, fetch_quotes, fetch_scan_snapshot,
-    fetch_v3_pair_tokens, orient_reserves, PairTokens, QuoteRequest,
+    fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id,
+    PairTokens, QuoteRequest,
 };
 use morpho_arbitrage_bot::executor;
 use std::sync::Arc;
@@ -45,6 +46,13 @@ struct VenueCache {
     pool_addrs: Vec<Address>,
     /// Contract owner, used as `from` in simulations/gas estimates.
     owner: Address,
+    /// Startup-probed, cached Flashblock capability: `true` only when the
+    /// endpoint actually streams Flashblock preconfirmations. Probed once
+    /// here (WS `newFlashblocks` subscription if a pubsub provider, else the
+    /// `pending`-vs-`latest` HTTP heuristic) so the per-scan path makes no
+    /// extra RPC calls. When `false`, all Flashblock layers fall back to
+    /// sealed-block behavior regardless of the requested env flags.
+    flashblocks_available: bool,
 }
 
 impl VenueCache {
@@ -101,6 +109,20 @@ impl VenueCache {
             pool_addrs.push(pool);
         }
         let owner = executor::fetch_owner(provider, cfg.arb_contract).await?;
+        // Probe Flashblock capability once, at startup, using ONLY the
+        // Flashblock-specific `newFlashblocks` WebSocket subscription. The
+        // `pending`-vs-`latest` block-number heuristic is deliberately NOT
+        // used: ordinary Ethereum nodes number their pending candidate
+        // `latest + 1` and would be misclassified as Flashblock-aware,
+        // bypassing the sealed-state fallback and exposing scans to mutable
+        // state. A Flashblock-aware WSS endpoint is required to enable any
+        // pending layer; without one, every layer stays on sealed behavior.
+        // The result is cached so the per-scan path never re-probes.
+        let flashblocks_available = if cfg.flashblocks_enabled() {
+            probe_flashblocks_via_ws(cfg).await
+        } else {
+            false
+        };
         Ok(Self {
             pair_tokens,
             v2_idx,
@@ -108,8 +130,46 @@ impl VenueCache {
             v3_idx,
             pool_addrs,
             owner,
+            flashblocks_available,
         })
     }
+}
+
+/// Probe Flashblock support by attempting the Flashblock-specific
+/// `newFlashblocks` subscription against the configured WebSocket endpoint
+/// (`WSS_URL`). This subscription is only implemented by Flashblock-aware
+/// nodes (absent from stock OP-Stack), so a successful subscribe is a strong,
+/// Flashblock-specific signal — unlike the `pending > latest` block-number
+/// heuristic, which ordinary nodes also satisfy. Requires a WSS endpoint; an
+/// HTTP-only config returns `false` (sealed-block behavior) rather than
+/// guessing, because inferring Flashblock support from `pending` numbers is
+/// unreliable and would silently enable mutable-state reads on plain nodes.
+async fn probe_flashblocks_via_ws(cfg: &Config) -> bool {
+    let Some(url) = &cfg.wss_url else {
+        warn!(
+            "FLASHBLOCKS enabled but no WSS_URL: Flashblock-specific probe \
+             requires a WebSocket endpoint; falling back to sealed-block behavior"
+        );
+        return false;
+    };
+    let client = match alloy::rpc::client::RpcClient::connect_pubsub(
+        alloy::rpc::client::WsConnect::new(url.clone()),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                wss = %redact_url(url),
+                error = %e,
+                "Flashblock WS probe failed to connect; falling back to sealed-block behavior"
+            );
+            return false;
+        }
+    };
+    let provider =
+        alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
+    probe_flashblocks_ws(&provider).await
 }
 
 #[tokio::main]
@@ -139,7 +199,13 @@ async fn main() -> Result<()> {
         venues = cfg.venues.len(),
         loan_amounts = ?cfg.loan_amounts,
         dry_run = cfg.dry_run,
-        "bot configured"
+        flashblocks_available = cache.flashblocks_available,
+        pending_state = cfg.use_pending_state,
+        flashblock_sync = cfg.use_flashblock_sync,
+        pending_logs = cfg.use_pending_logs,
+        pending_sim = cfg.use_pending_sim,
+        "bot configured (effective Flashblock flags reflect the startup probe; \
+         layers whose RPC is unavailable auto-fall back to sealed-block behavior)"
     );
     for (i, v) in cfg.venues.iter().enumerate() {
         info!(
@@ -274,11 +340,42 @@ where
 
     // Without the log subscription (provider rejects the filter, etc.) the
     // sweep interval becomes 1 block, reproducing scan-per-block behavior.
-    let filter = alloy::rpc::types::Filter::new()
+    let base_filter = alloy::rpc::types::Filter::new()
         .address(cache.pool_addrs.clone())
         .event_signature(pool_event_signatures());
     let mut sweep_every = cfg.sweep_interval_blocks;
-    let mut logs = match provider.subscribe_logs(&filter).await {
+
+    // Flashblock preconfirmed logs: when enabled, subscribe to Base's
+    // non-standard `pendingLogs` subscription type. Crucially this must be a
+    // real `pendingLogs` subscription, not a `logs` filter with pending block
+    // bounds (that still streams sealed-block logs). A non-Flashblock endpoint
+    // rejects `pendingLogs`, in which case the sealed-block `logs` stream
+    // below still drives scans.
+    let mut pending_logs = if cfg.use_pending_logs {
+        match subscribe_pending_logs(&provider, &base_filter).await {
+            Ok(sub) => {
+                info!(
+                    pools = cache.pool_addrs.len(),
+                    "subscribed to preconfirmed (Flashblock) pool logs; \
+                     scanning on 200ms events"
+                );
+                Some(sub.into_stream().boxed())
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "pendingLogs subscription failed; \
+                     falling back to sealed-block pool events"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut pending_available = pending_logs.is_some();
+
+    let mut logs = match provider.subscribe_logs(&base_filter).await {
         Ok(sub) => {
             info!(
                 pools = cache.pool_addrs.len(),
@@ -333,6 +430,40 @@ where
                     },
                 }
             }
+            // Preconfirmed (Flashblock) pool logs: fire ~200ms after the
+            // event, well before the sealed block. These can reorg against
+            // the final block, so drop reorged entries and let the sealed
+            // stream + sweep interval act as the backstop. The trigger
+            // block is the current latest, since the preconfirmed log's
+            // block number is the in-progress block; the scan reads fresh
+            // state regardless.
+            log = async {
+                match &mut pending_logs {
+                    Some(s) => s.next().await,
+                    None => std::future::pending().await,
+                }
+            }, if pending_available => {
+                match log {
+                    // Stream ended: disable this branch permanently and
+                    // degrade to sealed logs + sweeps. Keeping the branch
+                    // enabled would spin: `next()` resolves immediately with
+                    // None forever.
+                    None => {
+                        warn!("pendingLogs stream ended; falling back to sealed logs");
+                        pending_available = false;
+                        pending_logs = None;
+                        None
+                    }
+                    Some(log) if log.removed => None,
+                    Some(_) => {
+                        // Use the latest sealed block as the watermark so
+                        // the sweep clock advances; the actual scan reads
+                        // pending state when USE_PENDING_STATE is on.
+                        let block = last_scanned;
+                        Some(("flashblock event", block))
+                    }
+                }
+            }
         };
         let Some((reason, block)) = trigger else {
             continue;
@@ -369,6 +500,31 @@ where
 /// background receipt watcher once the tx is included.
 type InflightFlag = Arc<std::sync::atomic::AtomicBool>;
 
+/// Subscribe to Base's non-standard `pendingLogs` subscription: emits the
+/// logs of transactions as they are pre-confirmed in Flashblocks (~200ms),
+/// well before the sealed block. This is distinct from `eth_subscribe "logs"`
+/// with a pending block filter, which still yields sealed-block logs. The
+/// address/topic filter is passed as the second subscribe parameter so we
+/// only get logs from watched pools.
+///
+/// Returns the raw subscription stream of `Log`; the caller drops reorged
+/// (`removed`) entries and falls back to sealed logs if this fails.
+async fn subscribe_pending_logs<P: alloy::providers::Provider>(
+    provider: &P,
+    filter: &alloy::rpc::types::Filter,
+) -> eyre::Result<alloy::pubsub::Subscription<alloy::rpc::types::eth::Log>>
+where
+    P: 'static,
+{
+    // eth_subscribe("pendingLogs", filter) — params serialize as the
+    // 2-element array Base expects: [subscription-kind, filter-object].
+    let params = ("pendingLogs", filter.clone());
+    let sub = provider
+        .subscribe::<(&str, alloy::rpc::types::Filter), alloy::rpc::types::eth::Log>(params)
+        .await?;
+    Ok(sub)
+}
+
 /// Run one scan iteration with a given provider. Chain reads happen in two
 /// JSON-RPC batches, both pinned to the same block: phase 1 fetches V2
 /// reserves, V3 leg-1 quotes (one QuoterV2 call per venue x loan size) and
@@ -391,10 +547,26 @@ where
     let sizes = &cfg.loan_amounts;
 
     // Pin both phases to one block so the legs of a cycle are priced
-    // against the same chain state ("latest" could advance between the
-    // two batches).
+    // against the same chain state. When Flashblock preconfirmed state is
+    // enabled and the endpoint streams it, this is the ~200ms-fresh `pending`
+    // tag; otherwise a sealed `latest` block number. The cached startup
+    // capability (`cache.flashblocks_available`) decides pending vs sealed,
+    // so the per-scan path makes no extra probe RPC.
+    let want_pending = cfg.use_pending_state && cache.flashblocks_available;
+    let block = read_block_id(provider, want_pending, Some(cache.flashblocks_available)).await?;
+    // The `pending` tag is mutable — Base advances it ~every 200ms as new
+    // Flashblocks land. Snapshot its current sealed block number now so we can
+    // detect, before broadcasting, that a fresh Flashblock rewrote the state
+    // the scan read (mixed-state legs would revert and waste gas).
+    let scan_block_number = if want_pending {
+        provider.get_block_number().await?
+    } else {
+        0
+    };
+    // Track the sealed block for sweep bookkeeping; in pending mode the
+    // preconfirmed state maps to the in-progress sealed block, so
+    // get_block_number (latest) is the correct watermark.
     let block_number = provider.get_block_number().await?;
-    let block = alloy::eips::BlockId::number(block_number);
 
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
@@ -527,10 +699,47 @@ where
     }
 
     let quotes: Vec<VenueQuotes> = legs.into_iter().map(|l| l.quotes).collect();
+
+    // Phase-1 → phase-2 state-advancement guard. When scanning preconfirmed
+    // `pending` state, the tag is mutable — Base advances it ~every 200ms. If
+    // a new Flashblock landed between the phase-1 batch (reserves/leg-1
+    // quotes) and the phase-2 batch, leg-1 and leg-2 are priced against two
+    // different states, so the computed spread is invalid and any trade built
+    // on it would likely revert. Detect the advancement by re-checking the
+    // sealed block number; if it moved, discard the whole scan and let the
+    // caller rescan rather than act on mixed-state legs.
+    if want_pending {
+        let now = provider.get_block_number().await?;
+        if now != scan_block_number {
+            info!(
+                scan_block = scan_block_number,
+                now_block = now,
+                "pending state advanced between phase 1 and phase 2; discarding mixed-state scan"
+            );
+            return Ok(block_number);
+        }
+    }
+
     let Some(opp) = find_opportunity(sizes, &quotes, cfg.min_profit) else {
         info!("no profitable opportunity");
         return Ok(block_number);
     };
+
+    // Pre-broadcast state-advancement guard (second check). Even after the
+    // phase-1→phase-2 check above, a Flashblock may land between then and the
+    // broadcast, so the priced state no longer matches what we'd submit
+    // against. Re-check; if it advanced, discard and rescan.
+    if want_pending {
+        let now = provider.get_block_number().await?;
+        if now != scan_block_number {
+            info!(
+                scan_block = scan_block_number,
+                now_block = now,
+                "pending state advanced during scan; discarding to avoid mixed-state legs"
+            );
+            return Ok(block_number);
+        }
+    }
 
     // Estimate gas cost and subtract from profit. Gas is paid in ETH;
     // config enforces loan_token == wrapped_native, so the wei estimate
@@ -558,7 +767,20 @@ where
         // rejection, same as the net-profit filter; skip and keep
         // scanning instead of failing the whole scan.
         let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
-        match executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional).await {
+        // Gate the gas estimate against the preconfirmed `pending` state only
+        // when both USE_PENDING_SIM is requested AND the endpoint actually
+        // streams Flashblocks (cached capability). Otherwise the scan's block
+        // id is a sealed `latest` number and "pending sim" would silently run
+        // against sealed state — pointless and misleading. Falls back to the
+        // node default (latest) state when not pending.
+        let sim_block = if cfg.use_pending_sim && want_pending {
+            Some(block)
+        } else {
+            None
+        };
+        match executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional, sim_block)
+            .await
+        {
             Ok(gas_estimate) => gas_estimate * gas_price,
             Err(e) => {
                 info!(error = %e, "opportunity rejected: simulated execution reverted");
@@ -618,15 +840,28 @@ where
         }
     }
     // Fire-and-forget: returns once the node accepts the tx; the receipt
-    // watcher clears the in-flight flag on inclusion.
-    match executor::execute(
-        broadcaster.clone(),
-        cfg.arb_contract,
-        params,
-        inflight.cloned(),
-    )
-    .await
-    {
+    // watcher clears the in-flight flag on inclusion. When Flashblock sync
+    // is enabled, the submit blocks ~200ms for a synchronous receipt
+    // instead (clearing the flag ~10x sooner), but falls back to this
+    // fire-and-forget path on timeout/unsupported endpoints.
+    let outcome = if cfg.use_flashblock_sync {
+        executor::execute_sync(
+            broadcaster.clone(),
+            cfg.arb_contract,
+            params,
+            inflight.cloned(),
+        )
+        .await
+    } else {
+        executor::execute(
+            broadcaster.clone(),
+            cfg.arb_contract,
+            params,
+            inflight.cloned(),
+        )
+        .await
+    };
+    match outcome {
         Ok(tx) => info!(tx = %tx, "arbitrage transaction broadcast"),
         Err(e) => {
             if let Some(flag) = inflight {
