@@ -100,6 +100,30 @@ pub struct Config {
     /// Aerodrome Slipstream Quoter used to price CL legs. Defaults to the
     /// Base deployment; set QUOTER_SLIPSTREAM explicitly for other chains.
     pub quoter_slipstream: Address,
+    /// Read chain state (reserves, quotes, gas) against the `pending` block
+    /// tag, i.e. the latest Flashblock preconfirmation (~200ms fresh on Base)
+    /// instead of the sealed `latest` block (~2s). Requires a Flashblock-aware
+    /// RPC endpoint; the bot probes the endpoint at startup and falls back to
+    /// `latest` if `pending` is not meaningfully newer.
+    pub use_pending_state: bool,
+    /// Submit trades with `eth_sendRawTransactionSync`, which returns a full
+    /// receipt within ~200ms (Flashblock inclusion) instead of fire-and-forget
+    /// `eth_sendRawTransaction`. The scanner then unblocks for the next
+    /// opportunity ~10x sooner instead of waiting for the sealed block. Still
+    /// a preconfirmation, not finality — reverts can still cost gas until
+    /// Base enables revert protection.
+    pub use_flashblock_sync: bool,
+    /// Subscribe to `pendingLogs` (Flashblock-level logs) in event-driven
+    /// mode, triggering scans ~200ms after a pool event instead of at the
+    /// next sealed block. Requires a Flashblock-aware WSS endpoint; falls
+    /// back to sealed-block `newHeads`/`logs` if the subscription is refused.
+    pub use_pending_logs: bool,
+    /// Gate trades by simulating `execute` against the `pending` block tag
+    /// (Flashblock state) rather than `latest`. Catches the case where another
+    /// Flashblock already moved pool prices before our tx lands, reducing
+    /// reverts-on-inclusion. Requires `use_pending_state` semantics; falls
+    /// back to `latest` on error.
+    pub use_pending_sim: bool,
 }
 
 impl Config {
@@ -395,6 +419,41 @@ impl Config {
                     .expect("valid constant address")
             });
 
+        // Flashblock (Base 200ms preconfirmation) options. All default off so
+        // a non-Flashblock endpoint behaves exactly as before; enabling them
+        // only helps when the RPC/WSS endpoint streams Flashblocks.
+        let parse_bool = |key: &str, default: bool| -> Result<bool> {
+            env::var(key)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" => Ok(true),
+                    "0" | "false" | "no" => Ok(false),
+                    other => Err(eyre!("invalid {key} '{other}', expected 0/1/true/false")),
+                })
+                .unwrap_or(Ok(default))
+        };
+        // Reading preconfirmed state is the foundation; the other options
+        // (sync submit, pending sim) only make sense against state that is at
+        // least as fresh as a Flashblock. Default the state flag on so the
+        // single-toggle `FLASHBLOCKS=true` enables the coherent bundle.
+        let use_pending_state = parse_bool("USE_PENDING_STATE", true)?;
+        let use_flashblock_sync = parse_bool("USE_FLASHBLOCK_SYNC", true)?;
+        let use_pending_logs = parse_bool("USE_PENDING_LOGS", true)?;
+        // The simulation gate is the most conservative of the four (it adds
+        // an eth_call per opportunity); default it off so it must be opted
+        // into explicitly to avoid extra RPC cost on RPS-limited plans.
+        let use_pending_sim = parse_bool("USE_PENDING_SIM", false)?;
+        // Convenience master switch: FLASHBLOCKS=false disables all four at
+        // once without touching the individual flags. Keeps .env minimal.
+        let flashblocks = parse_bool("FLASHBLOCKS", true)?;
+        let (use_pending_state, use_flashblock_sync, use_pending_logs, use_pending_sim) =
+            if flashblocks {
+                (use_pending_state, use_flashblock_sync, use_pending_logs, use_pending_sim)
+            } else {
+                (false, false, false, false)
+            };
+
         Ok(Self {
             rpc_url,
             wss_url,
@@ -415,6 +474,10 @@ impl Config {
             dry_run,
             quoter_v2,
             quoter_slipstream,
+            use_pending_state,
+            use_flashblock_sync,
+            use_pending_logs,
+            use_pending_sim,
         })
     }
 }

@@ -139,6 +139,10 @@ async fn main() -> Result<()> {
         venues = cfg.venues.len(),
         loan_amounts = ?cfg.loan_amounts,
         dry_run = cfg.dry_run,
+        pending_state = cfg.use_pending_state,
+        flashblock_sync = cfg.use_flashblock_sync,
+        pending_logs = cfg.use_pending_logs,
+        pending_sim = cfg.use_pending_sim,
         "bot configured"
     );
     for (i, v) in cfg.venues.iter().enumerate() {
@@ -274,11 +278,45 @@ where
 
     // Without the log subscription (provider rejects the filter, etc.) the
     // sweep interval becomes 1 block, reproducing scan-per-block behavior.
-    let filter = alloy::rpc::types::Filter::new()
+    let base_filter = alloy::rpc::types::Filter::new()
         .address(cache.pool_addrs.clone())
         .event_signature(pool_event_signatures());
     let mut sweep_every = cfg.sweep_interval_blocks;
-    let mut logs = match provider.subscribe_logs(&filter).await {
+
+    // Flashblock preconfirmed logs: when enabled, also subscribe against the
+    // `pending` block tag so a scan fires ~200ms after a pool event, inside
+    // the 2s sealed block. The subscription is best-effort — a non-
+    // Flashblock endpoint refuses `pending` filters, in which case the
+    // sealed-block `logs` stream below still drives scans.
+    let mut pending_logs = if cfg.use_pending_logs {
+        let pf = base_filter
+            .clone()
+            .from_block(alloy::eips::BlockNumberOrTag::Pending)
+            .to_block(alloy::eips::BlockNumberOrTag::Pending);
+        match provider.subscribe_logs(&pf).await {
+            Ok(sub) => {
+                info!(
+                    pools = cache.pool_addrs.len(),
+                    "subscribed to preconfirmed (Flashblock) pool logs; \
+                     scanning on 200ms events"
+                );
+                Some(sub.into_stream().boxed())
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "pendingLogs subscription failed; \
+                     falling back to sealed-block pool events"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let pending_available = pending_logs.is_some();
+
+    let mut logs = match provider.subscribe_logs(&base_filter).await {
         Ok(sub) => {
             info!(
                 pools = cache.pool_addrs.len(),
@@ -331,6 +369,31 @@ where
                         Some(block) if block > last_scanned => Some(("pool event", block)),
                         _ => None,
                     },
+                }
+            }
+            // Preconfirmed (Flashblock) pool logs: fire ~200ms after the
+            // event, well before the sealed block. These can reorg against
+            // the final block, so drop reorged entries and let the sealed
+            // stream + sweep interval act as the backstop. The trigger
+            // block is the current latest, since the preconfirmed log's
+            // block number is the in-progress block; the scan reads fresh
+            // state regardless.
+            log = async {
+                match &mut pending_logs {
+                    Some(s) => s.next().await,
+                    None => std::future::pending().await,
+                }
+            }, if pending_available => {
+                match log {
+                    None => None,
+                    Some(log) if log.removed => None,
+                    Some(_) => {
+                        // Use the latest sealed block as the watermark so
+                        // the sweep clock advances; the actual scan reads
+                        // pending state when USE_PENDING_STATE is on.
+                        let block = last_scanned;
+                        Some(("flashblock event", block))
+                    }
                 }
             }
         };
@@ -391,10 +454,16 @@ where
     let sizes = &cfg.loan_amounts;
 
     // Pin both phases to one block so the legs of a cycle are priced
-    // against the same chain state ("latest" could advance between the
-    // two batches).
+    // against the same chain state. When Flashblock preconfirmed state is
+    // enabled and the endpoint streams it, this is the ~200ms-fresh `pending`
+    // tag; otherwise a sealed `latest` block number. `read_block_id` also
+    // returns the sealed number for the event-loop bookkeeping below even
+    // in pending mode (we track which sealed block the reads covered).
+    let block = morpho_arbitrage_bot::dex::read_block_id(provider, cfg.use_pending_state).await?;
+    // Track the sealed block for sweep bookkeeping; in pending mode the
+    // preconfirmed state maps to the in-progress sealed block, so
+    // get_block_number (latest) is the correct watermark.
     let block_number = provider.get_block_number().await?;
-    let block = alloy::eips::BlockId::number(block_number);
 
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
@@ -558,7 +627,15 @@ where
         // rejection, same as the net-profit filter; skip and keep
         // scanning instead of failing the whole scan.
         let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
-        match executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional).await {
+        // When USE_PENDING_SIM is on, run the gas-estimate gate against the
+        // same Flashblock preconfirmed state the scan read (`block`), so a
+        // competing Flashblock that already moved pool prices reverts the
+        // estimate here instead of on inclusion. Falls back to the default
+        // (latest) state otherwise.
+        let sim_block = if cfg.use_pending_sim { Some(block) } else { None };
+        match executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional, sim_block)
+            .await
+        {
             Ok(gas_estimate) => gas_estimate * gas_price,
             Err(e) => {
                 info!(error = %e, "opportunity rejected: simulated execution reverted");
@@ -618,15 +695,28 @@ where
         }
     }
     // Fire-and-forget: returns once the node accepts the tx; the receipt
-    // watcher clears the in-flight flag on inclusion.
-    match executor::execute(
-        broadcaster.clone(),
-        cfg.arb_contract,
-        params,
-        inflight.cloned(),
-    )
-    .await
-    {
+    // watcher clears the in-flight flag on inclusion. When Flashblock sync
+    // is enabled, the submit blocks ~200ms for a synchronous receipt
+    // instead (clearing the flag ~10x sooner), but falls back to this
+    // fire-and-forget path on timeout/unsupported endpoints.
+    let outcome = if cfg.use_flashblock_sync {
+        executor::execute_sync(
+            broadcaster.clone(),
+            cfg.arb_contract,
+            params,
+            inflight.cloned(),
+        )
+        .await
+    } else {
+        executor::execute(
+            broadcaster.clone(),
+            cfg.arb_contract,
+            params,
+            inflight.cloned(),
+        )
+        .await
+    };
+    match outcome {
         Ok(tx) => info!(tx = %tx, "arbitrage transaction broadcast"),
         Err(e) => {
             if let Some(flag) = inflight {

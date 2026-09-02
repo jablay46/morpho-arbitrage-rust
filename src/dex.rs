@@ -5,6 +5,43 @@ use alloy::sol_types::SolCall;
 use eyre::Result;
 use tracing::debug;
 
+/// Whether the RPC endpoint exposes Flashblock preconfirmed state via the
+/// `pending` block tag. Probed once at startup so `use_pending_state` can be
+/// honored only when meaningful — a non-Flashblock node returns `pending`
+/// equal to `latest`, in which case reading `pending` just adds latency and
+/// reorg risk with no freshness benefit. The probe compares block numbers of
+/// `pending` vs `latest`; if `pending` is ahead, Flashblocks are streaming.
+pub async fn pending_is_fresher<P: Provider>(provider: &P) -> bool {
+    let pending = provider
+        .get_block_by_number(alloy::eips::BlockNumberOrTag::Pending)
+        .await;
+    let latest = provider
+        .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+        .await;
+    match (pending, latest) {
+        (Ok(Some(p)), Ok(Some(l))) => {
+            p.header.number > l.header.number
+        }
+        _ => false,
+    }
+}
+
+/// Pick the block id to pin chain reads to. When Flashblock preconfirmed
+/// state is both enabled and available, reads the ~200ms-fresh `pending`
+/// tag; otherwise falls back to a sealed `latest` block number. Sealed
+/// blocks never reorg, so the two-phase scan stays consistent.
+pub async fn read_block_id<P: Provider>(
+    provider: &P,
+    use_pending: bool,
+) -> Result<alloy::eips::BlockId> {
+    if use_pending && pending_is_fresher(provider).await {
+        Ok(alloy::eips::BlockId::pending())
+    } else {
+        let block_number = provider.get_block_number().await?;
+        Ok(alloy::eips::BlockId::number(block_number))
+    }
+}
+
 sol! {
     #[sol(rpc)]
     interface IUniswapV2Pair {
