@@ -97,14 +97,14 @@ balapan lebih sedikit. **Wajib endpoint Flashblock-aware** (Chainstack,
 Dwellir, QuickNode, dll.) — tanpanya, opsi-opsi di bawah otomatis fallback
 ke perilaku lama (block sealed 2-detik).
 
-Bot mem-probe endpoint saat startup dengan dua sinyal: (1) subscribe WS
+Bot mem-probe endpoint saat startup **hanya** dengan subscribe WS
 `newFlashblocks` — method non-standar yang hanya di-implement endpoint
-Flashblock-aware (stock OP-Stack menolaknya), sinyal kuat dan spesifik; (2)
-fallback heuristik HTTP `pending` > `latest` bila hanya RPC HTTP tersedia.
-Hasil probe di-cache sekali di startup (tidak diulang per-scan) dan dipakai
-untuk semua lapisan. Bila Flashblocks tidak tersedia, semua opsi otomatis
-fallback ke perilaku block-sealed. Empat lapisan (semuanya default **aktif**
-kecuali `USE_PENDING_SIM`):
+Flashblock-aware (stock OP-Stack menolaknya). Heuristik `pending > latest`
+**tidak** dipakai karena node Ethereum biasa juga mengembalikan
+`pending = latest + 1` (false-positive). Tanpa `WSS_URL`, semua lapisan
+otomatis fallback ke sealed. Hasil probe di-cache sekali di startup dan
+dipakai untuk semua lapisan. Empat lapisan (semuanya default **aktif** kecuali
+`USE_PENDING_SIM`):
 
 | Opsi env | Default | Efek |
 |---|---|---|
@@ -129,9 +129,10 @@ Peringatan penting:
   `pendingLogs` berakhir (endpoint tutup/koneksi putus), branch-nya
   dimatikan agar loop tidak spin; bot kembali ke log sealed.
 - **State-advancement guard.** Tag `pending` mutable (maju ~200ms). Bot
-  snapshot nomor block sealed di awal scan; bila Flashblock baru mendarat
-  sebelum broadcast (state berubah), peluang di-discard & rescan agar leg
-  tidak mencampur dua state berbeda yang berisiko revert.
+  snapshot nomor block sealed di awal scan dan mengecek **dua kali**: antara
+  phase-1 & phase-2, dan lagi tepat sebelum broadcast. Bila Flashblock baru
+  mendarat (state berubah), peluang di-discard & rescan agar leg tidak
+  mencampur dua state berbeda yang berisiko revert.
 - **Duplicate protection.** Saat `eth_sendRawTransactionSync` timeout, tx
   tetap pending — flag in-flight ditahan oleh background watcher (bukan
   di-clear) sampai receipt konklusif, sehingga scan berikutnya tidak

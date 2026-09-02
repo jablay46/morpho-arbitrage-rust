@@ -5,8 +5,8 @@ use morpho_arbitrage_bot::arbitrage::{find_opportunity, v2_quotes, VenueQuotes};
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
     fetch_cl_pair_tokens, fetch_pair_tokens, fetch_quotes, fetch_scan_snapshot,
-    fetch_v3_pair_tokens, orient_reserves, pending_is_fresher, probe_flashblocks_ws,
-    read_block_id, PairTokens, QuoteRequest,
+    fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id,
+    PairTokens, QuoteRequest,
 };
 use morpho_arbitrage_bot::executor;
 use std::sync::Arc;
@@ -109,13 +109,17 @@ impl VenueCache {
             pool_addrs.push(pool);
         }
         let owner = executor::fetch_owner(provider, cfg.arb_contract).await?;
-        // Probe Flashblock capability once, at startup. Prefer the
-        // Flashblock-specific `newFlashblocks` WebSocket subscription when the
-        // provider is pubsub-capable (event-driven mode); otherwise fall back
-        // to the `pending`-vs-`latest` HTTP heuristic on the broadcaster. The
-        // result is cached so the per-scan path never re-probes.
+        // Probe Flashblock capability once, at startup, using ONLY the
+        // Flashblock-specific `newFlashblocks` WebSocket subscription. The
+        // `pending`-vs-`latest` block-number heuristic is deliberately NOT
+        // used: ordinary Ethereum nodes number their pending candidate
+        // `latest + 1` and would be misclassified as Flashblock-aware,
+        // bypassing the sealed-state fallback and exposing scans to mutable
+        // state. A Flashblock-aware WSS endpoint is required to enable any
+        // pending layer; without one, every layer stays on sealed behavior.
+        // The result is cached so the per-scan path never re-probes.
         let flashblocks_available = if cfg.flashblocks_enabled() {
-            probe_flashblocks(provider).await
+            probe_flashblocks_via_ws(cfg).await
         } else {
             false
         };
@@ -131,26 +135,41 @@ impl VenueCache {
     }
 }
 
-/// Probe whether the provider's endpoint streams Base Flashblock
-/// preconfirmations. Tries the Flashblock-specific `newFlashblocks`
-/// subscription first (only pubsub/WS providers accept it; stock OP-Stack
-/// HTTP RPCs reject the method), then falls back to the `pending`-vs-`latest`
-/// block-number heuristic. The result is a *capability*: a node that does not
-/// stream Flashblocks returns `false`, and all Flashblock layers then fall
-/// back to sealed-block behavior regardless of the requested env flags.
-async fn probe_flashblocks<P: alloy::providers::Provider>(provider: &P) -> bool {
-    // Strong signal: a pubsub provider that accepts `newFlashblocks` is
-    // Flashblock-aware. HTTP-only providers surface this as a pubsub-unavailable
-    // or method-not-found error, so we fall through to the heuristic.
-    if probe_flashblocks_ws(provider).await {
-        return true;
-    }
-    // Weak signal fallback for HTTP broadcasters: a `pending` block numbered
-    // ahead of `latest`. This can false-positive on nodes that number their
-    // pending candidate `latest + 1`, so we only treat it as enabling pending
-    // *state* reads (the cheapest layer) and keep the stricter WS probe as the
-    // source of truth for pendingLogs/sync submit where available.
-    pending_is_fresher(provider).await
+/// Probe Flashblock support by attempting the Flashblock-specific
+/// `newFlashblocks` subscription against the configured WebSocket endpoint
+/// (`WSS_URL`). This subscription is only implemented by Flashblock-aware
+/// nodes (absent from stock OP-Stack), so a successful subscribe is a strong,
+/// Flashblock-specific signal — unlike the `pending > latest` block-number
+/// heuristic, which ordinary nodes also satisfy. Requires a WSS endpoint; an
+/// HTTP-only config returns `false` (sealed-block behavior) rather than
+/// guessing, because inferring Flashblock support from `pending` numbers is
+/// unreliable and would silently enable mutable-state reads on plain nodes.
+async fn probe_flashblocks_via_ws(cfg: &Config) -> bool {
+    let Some(url) = &cfg.wss_url else {
+        warn!(
+            "FLASHBLOCKS enabled but no WSS_URL: Flashblock-specific probe \
+             requires a WebSocket endpoint; falling back to sealed-block behavior"
+        );
+        return false;
+    };
+    let client = match alloy::rpc::client::RpcClient::connect_pubsub(
+        alloy::rpc::client::WsConnect::new(url.clone()),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                wss = %redact_url(url),
+                error = %e,
+                "Flashblock WS probe failed to connect; falling back to sealed-block behavior"
+            );
+            return false;
+        }
+    };
+    let provider =
+        alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
+    probe_flashblocks_ws(&provider).await
 }
 
 #[tokio::main]
@@ -680,18 +699,36 @@ where
     }
 
     let quotes: Vec<VenueQuotes> = legs.into_iter().map(|l| l.quotes).collect();
+
+    // Phase-1 → phase-2 state-advancement guard. When scanning preconfirmed
+    // `pending` state, the tag is mutable — Base advances it ~every 200ms. If
+    // a new Flashblock landed between the phase-1 batch (reserves/leg-1
+    // quotes) and the phase-2 batch, leg-1 and leg-2 are priced against two
+    // different states, so the computed spread is invalid and any trade built
+    // on it would likely revert. Detect the advancement by re-checking the
+    // sealed block number; if it moved, discard the whole scan and let the
+    // caller rescan rather than act on mixed-state legs.
+    if want_pending {
+        let now = provider.get_block_number().await?;
+        if now != scan_block_number {
+            info!(
+                scan_block = scan_block_number,
+                now_block = now,
+                "pending state advanced between phase 1 and phase 2; discarding mixed-state scan"
+            );
+            return Ok(block_number);
+        }
+    }
+
     let Some(opp) = find_opportunity(sizes, &quotes, cfg.min_profit) else {
         info!("no profitable opportunity");
         return Ok(block_number);
     };
 
-    // Flashblock state-advancement guard (Fix: pending tag is mutable). When
-    // the scan read preconfirmed `pending` state, a new Flashblock may have
-    // landed between phase 1 and now, so the legs can mix two distinct states
-    // and the opportunity be invalid. Re-check the sealed block number; if it
-    // advanced, the `pending` tag now points at a different preconfirmation
-    // than the one we priced — discard and rescan rather than broadcast a
-    // trade likely to revert.
+    // Pre-broadcast state-advancement guard (second check). Even after the
+    // phase-1→phase-2 check above, a Flashblock may land between then and the
+    // broadcast, so the priced state no longer matches what we'd submit
+    // against. Re-check; if it advanced, discard and rescan.
     if want_pending {
         let now = provider.get_block_number().await?;
         if now != scan_block_number {
