@@ -97,18 +97,22 @@ balapan lebih sedikit. **Wajib endpoint Flashblock-aware** (Chainstack,
 Dwellir, QuickNode, dll.) — tanpanya, opsi-opsi di bawah otomatis fallback
 ke perilaku lama (block sealed 2-detik).
 
-Bot mem-probe endpoint saat startup: bila `eth_getBlockByNumber("pending")`
-tidak lebih baru dari `latest`, Flashblocks tidak tersedia dan semua opsi
-dinonaktifkan secara otomatis. Empat lapisan (semuanya default **aktif** kecuali
-`USE_PENDING_SIM`):
+Bot mem-probe endpoint saat startup dengan dua sinyal: (1) subscribe WS
+`newFlashblocks` — method non-standar yang hanya di-implement endpoint
+Flashblock-aware (stock OP-Stack menolaknya), sinyal kuat dan spesifik; (2)
+fallback heuristik HTTP `pending` > `latest` bila hanya RPC HTTP tersedia.
+Hasil probe di-cache sekali di startup (tidak diulang per-scan) dan dipakai
+untuk semua lapisan. Bila Flashblocks tidak tersedia, semua opsi otomatis
+fallback ke perilaku block-sealed. Empat lapisan (semuanya default **aktif**
+kecuali `USE_PENDING_SIM`):
 
 | Opsi env | Default | Efek |
 |---|---|---|
 | `FLASHBLOCKS` | `true` | Master switch; `false` mematikan keempat lapisan sekaligus. |
 | `USE_PENDING_STATE` | `true` | Baca reserves/quote/gasPrice dari tag `pending` (~200ms) bukan `latest` (2s). Peluang ~10× lebih segar; drift harga antara simulasi & inklusi mengecil. |
 | `USE_FLASHBLOCK_SYNC` | `true` | Submit via path sinkron (~200ms receipt), bukan fire-and-forget. Flag in-flight dibersihkan ~10× lebih cepat sehingga bot tidak buta selama satu block penuh. |
-| `USE_PENDING_LOGS` | `true` | Subscribe `pendingLogs` agar scan dipicu ~200ms setelah pool event, bukan menunggu block sealed. Best-effort; fallback ke log sealed bila endpoint menolak. |
-| `USE_PENDING_SIM` | `false` | Gate `estimate_gas` terhadap state `pending` agar menangkap kasus Flashblock lain sudah menggeser harga → reject sebelum kirim (hemat gas). Off by default karena menambah satu eth_call per peluang. |
+| `USE_PENDING_LOGS` | `true` | Subscribe `pendingLogs` (subscription type Base, bukan filter `logs` biasa) agar scan dipicu ~200ms setelah pool event, bukan menunggu block sealed. Best-effort; fallback ke log sealed bila endpoint menolak. |
+| `USE_PENDING_SIM` | `false` | Gate `estimate_gas` terhadap state `pending` agar menangkap kasus Flashblock lain sudah menggeser harga → reject sebelum kirim (hemat gas). Hanya aktif bila `USE_PENDING_STATE` juga efektif; bila endpoint non-Flashblock, otomatis downgrade ke `latest` (bukan silent sealed-state gate). |
 
 Peringatan penting:
 
@@ -121,7 +125,17 @@ Peringatan penting:
   tidak semua endpoint mendukungnya. Probe startup + fallback memastikan bot
   tetap jalan di endpoint biasa.
 - **Reorg handling.** Log Flashblock yang reorg (`log.removed`) di-drop;
-  stream log sealed + sweep interval menjadi backstop.
+  stream log sealed + sweep interval menjadi backstop. Saat stream
+  `pendingLogs` berakhir (endpoint tutup/koneksi putus), branch-nya
+  dimatikan agar loop tidak spin; bot kembali ke log sealed.
+- **State-advancement guard.** Tag `pending` mutable (maju ~200ms). Bot
+  snapshot nomor block sealed di awal scan; bila Flashblock baru mendarat
+  sebelum broadcast (state berubah), peluang di-discard & rescan agar leg
+  tidak mencampur dua state berbeda yang berisiko revert.
+- **Duplicate protection.** Saat `eth_sendRawTransactionSync` timeout, tx
+  tetap pending — flag in-flight ditahan oleh background watcher (bukan
+  di-clear) sampai receipt konklusif, sehingga scan berikutnya tidak
+  broadcast tx duplikat bersaing.
 
 ## Prasyarat & Instalasi
 

@@ -6,11 +6,20 @@ use eyre::Result;
 use tracing::debug;
 
 /// Whether the RPC endpoint exposes Flashblock preconfirmed state via the
-/// `pending` block tag. Probed once at startup so `use_pending_state` can be
-/// honored only when meaningful — a non-Flashblock node returns `pending`
-/// equal to `latest`, in which case reading `pending` just adds latency and
-/// reorg risk with no freshness benefit. The probe compares block numbers of
-/// `pending` vs `latest`; if `pending` is ahead, Flashblocks are streaming.
+/// `pending` block tag. This is a heuristic: a node that streams Flashblocks
+/// reports a `pending` block whose number is *ahead* of `latest` (it is the
+/// in-progress sealed block being built from 200ms sub-blocks). A plain node
+/// without Flashblocks may still number its pending candidate `latest + 1`,
+/// so this is best treated as a soft signal rather than a hard guarantee.
+///
+/// For a stronger, Flashblock-specific check on a WebSocket endpoint, prefer
+/// [`probe_flashblocks_ws`], which tries the non-standard `newFlashblocks`
+/// subscription. This HTTP heuristic is the fallback when only an HTTP RPC
+/// is available (the broadcaster path).
+///
+/// Returns `true` only when `pending` is strictly ahead of `latest`, so a
+/// node that returns `pending == latest` (the common non-Flashblock case) is
+/// correctly classified as not streaming Flashblocks.
 pub async fn pending_is_fresher<P: Provider>(provider: &P) -> bool {
     let pending = provider
         .get_block_by_number(alloy::eips::BlockNumberOrTag::Pending)
@@ -19,9 +28,7 @@ pub async fn pending_is_fresher<P: Provider>(provider: &P) -> bool {
         .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
         .await;
     match (pending, latest) {
-        (Ok(Some(p)), Ok(Some(l))) => {
-            p.header.number > l.header.number
-        }
+        (Ok(Some(p)), Ok(Some(l))) => p.header.number > l.header.number,
         _ => false,
     }
 }
@@ -30,16 +37,58 @@ pub async fn pending_is_fresher<P: Provider>(provider: &P) -> bool {
 /// state is both enabled and available, reads the ~200ms-fresh `pending`
 /// tag; otherwise falls back to a sealed `latest` block number. Sealed
 /// blocks never reorg, so the two-phase scan stays consistent.
+///
+/// `flashblocks_available` is a startup-probed, cached capability decision
+/// (see [`pending_is_fresher`]) so the per-scan path makes no extra RPC
+/// calls. When `None`, the probe is run inline (kept for the `once` path
+/// which has no shared cache).
 pub async fn read_block_id<P: Provider>(
     provider: &P,
     use_pending: bool,
+    flashblocks_available: Option<bool>,
 ) -> Result<alloy::eips::BlockId> {
-    if use_pending && pending_is_fresher(provider).await {
+    let want_pending = use_pending
+        && match flashblocks_available {
+            Some(ok) => ok,
+            None => pending_is_fresher(provider).await,
+        };
+    if want_pending {
         Ok(alloy::eips::BlockId::pending())
     } else {
         let block_number = provider.get_block_number().await?;
         Ok(alloy::eips::BlockId::number(block_number))
     }
+}
+
+/// The sealed `latest` block number observed alongside a pending read. When
+/// scanning preconfirmed state, the scan's watermark is the in-progress
+/// sealed block (the `pending` tag maps to it), so callers track that number
+/// for event-loop bookkeeping rather than the mutable `pending` tag.
+pub async fn latest_block_number<P: Provider>(provider: &P) -> Result<u64> {
+    Ok(provider.get_block_number().await?)
+}
+
+/// Probe a WebSocket endpoint for the Flashblock-specific subscription
+/// `newFlashblocks`. Unlike the `pending`-vs-`latest` block-number heuristic,
+/// this subscription method is only implemented by Flashblock-aware nodes
+/// (it is absent from stock OP-Stack clients), so a successful subscribe is
+/// a strong, Flashblock-specific signal. The subscription is immediately
+/// dropped (we only care that it was accepted); returns `true` on success.
+///
+/// Falls back to `false` on any error (method not found, non-pubsub HTTP
+/// provider, etc.) so the caller degrades to sealed-block behavior. Kept
+/// generic over `Provider` so the WS provider built for event-driven mode
+/// can be reused for the probe.
+pub async fn probe_flashblocks_ws<P: Provider>(provider: &P) -> bool {
+    // eth_subscribe with kind "newFlashblocks" and no params. A non-Flashblock
+    // node rejects the method, which surfaces as an error from the subscribe
+    // call. We only care that the subscription was accepted; dropping the
+    // returned `Subscription` releases it (the pubsub frontend tracks local
+    // subscriptions and tears them down on drop).
+    provider
+        .subscribe::<(String,), alloy::primitives::Bytes>(("newFlashblocks".to_string(),))
+        .await
+        .is_ok()
 }
 
 sol! {

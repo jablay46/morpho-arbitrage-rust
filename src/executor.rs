@@ -179,11 +179,13 @@ where
 /// backstops must stay in place.
 ///
 /// If the receipt does not arrive within the timeout (slow node, or an
-/// endpoint without Flashblocks), the in-flight flag is cleared immediately
-/// anyway so scanning resumes — a reverted-or-not outcome is unknowable until
-/// inclusion, and blocking longer would cost more in missed opportunities
-/// than it saves in flag churn. This keeps the behavior a strict improvement
-/// over fire-and-forget on Flashblock endpoints and a no-op elsewhere.
+/// endpoint without Flashblocks), the already-broadcast transaction is still
+/// pending and must not be replaced. Rather than clear the in-flight flag
+/// (which would let the next scan broadcast a competing duplicate), the
+/// receipt future is handed to a background watcher — exactly like the
+/// asynchronous `execute` path — which clears the flag once the tx lands or
+/// fails conclusively. The scan loop resumes immediately, but duplicate
+/// protection stays intact.
 pub async fn execute_sync<P>(
     provider: P,
     contract: Address,
@@ -203,36 +205,51 @@ where
     let pending = provider.send_transaction(tx).await?;
     let tx_hash = *pending.tx_hash();
 
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(SYNC_RECEIPT_TIMEOUT_MS),
-        pending.get_receipt(),
-    )
-    .await
-    {
-        Ok(Ok(receipt)) => {
-            if receipt.status() {
-                tracing::info!(tx = %receipt.transaction_hash, "arbitrage transaction flash-confirmed");
-            } else {
+    // Move the receipt future into a background task that owns `pending`
+    // (get_receipt takes self by value) and clears the in-flight flag on any
+    // conclusive outcome. We then wait on the task's *result* with a short
+    // timeout. On a Flashblock endpoint the receipt returns ~200ms and the
+    // flag clears here; on timeout the task keeps running and clears the flag
+    // later — the already-broadcast tx stays pending and the next scan cannot
+    // broadcast a competing duplicate because the flag is still held.
+    let flag = inflight.clone();
+    let receipt_task = tokio::spawn(async move {
+        let receipt = pending.get_receipt().await;
+        match &receipt {
+            Ok(r) if r.status() => {
+                tracing::info!(tx = %r.transaction_hash, "arbitrage transaction flash-confirmed");
+            }
+            Ok(r) => {
                 tracing::warn!(
-                    tx = %receipt.transaction_hash,
+                    tx = %r.transaction_hash,
                     "arbitrage transaction reverted (gas lost; minProfit backstop held)"
                 );
             }
-            if let Some(flag) = inflight {
-                flag.store(false, std::sync::atomic::Ordering::Release);
+            Err(e) => {
+                tracing::warn!(tx = %tx_hash, error = %e, "failed to fetch transaction receipt");
             }
         }
-        Ok(Err(e)) => {
-            tracing::warn!(tx = %tx_hash, error = %e, "failed to fetch transaction receipt");
-            if let Some(flag) = inflight {
-                flag.store(false, std::sync::atomic::Ordering::Release);
-            }
+        if let Some(flag) = flag {
+            flag.store(false, std::sync::atomic::Ordering::Release);
         }
+        receipt
+    });
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(SYNC_RECEIPT_TIMEOUT_MS),
+        receipt_task,
+    )
+    .await
+    {
+        // Receipt arrived (or a fatal fetch error) within the Flashblock
+        // window: the task has already cleared the flag.
+        Ok(_) => {}
+        // Timed out waiting for the receipt. The background task still owns
+        // `pending` and the in-flight flag; it will clear the flag when the
+        // tx lands or fails conclusively. Resume scanning immediately, but
+        // duplicate protection stays intact — no competing broadcast.
         Err(_) => {
-            tracing::info!(tx = %tx_hash, "flash-sync receipt timed out; resuming scan");
-            if let Some(flag) = inflight {
-                flag.store(false, std::sync::atomic::Ordering::Release);
-            }
+            tracing::info!(tx = %tx_hash, "flash-sync receipt timed out; background watcher holds in-flight flag");
         }
     }
     Ok(tx_hash)

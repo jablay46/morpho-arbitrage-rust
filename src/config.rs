@@ -127,6 +127,17 @@ pub struct Config {
 }
 
 impl Config {
+    /// Master switch: the single `FLASHBLOCKS` toggle. When false, all four
+    /// Flashblock layers are disabled and the bot behaves exactly as it did
+    /// pre-Flashblocks (sealed 2s blocks). The per-layer flags are still
+    /// parsed so they can be re-enabled by flipping only `FLASHBLOCKS=true`.
+    pub fn flashblocks_enabled(&self) -> bool {
+        self.use_pending_state
+            || self.use_flashblock_sync
+            || self.use_pending_logs
+            || self.use_pending_sim
+    }
+
     pub fn from_env() -> Result<Self> {
         // ENV_FILE selects an alternate dotenv file (e.g. .env.virtual);
         // unset = default .env lookup, missing file = hard error since the
