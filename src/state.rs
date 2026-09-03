@@ -164,7 +164,11 @@ impl StateStore {
 
     pub fn remove(&mut self, pool: &Address) {
         self.pools.remove(pool);
-        self.block = None;
+        // Keep the block pin while pools remain: surviving snapshots still
+        // reflect that block, and scans need the pin to detect staleness.
+        if self.pools.is_empty() {
+            self.block = None;
+        }
     }
 
     fn touch(&mut self) {

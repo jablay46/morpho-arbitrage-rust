@@ -798,13 +798,16 @@ where
     {
         let pin = if want_pending { None } else { block.as_u64() };
         let stale = !want_pending && cache.state.block.is_some() && cache.state.block != pin;
-        let aged = cache
+        // Age from the more recent of the last applied event and the last
+        // successful refresh — a refresh newer than the last event must not
+        // be evicted on the next scan while re-refresh is still gated.
+        let last_activity = cache
             .state
             .last_event_at
-            .unwrap_or(cache.state.last_refresh_at)
-            .elapsed()
-            .as_secs()
-            >= cfg.state_refresh_secs;
+            .map_or(cache.state.last_refresh_at, |e| {
+                e.max(cache.state.last_refresh_at)
+            });
+        let aged = last_activity.elapsed().as_secs() >= cfg.state_refresh_secs;
         if stale || aged {
             let removed = cache.v3_pairs.len();
             for pool in cache.v3_pairs.clone() {
@@ -1198,13 +1201,22 @@ where
         // first. A revert is a per-opportunity verdict (same as an
         // eth_estimateGas revert); a DB/transport error falls back to the
         // node's estimate so local sim can never strand a tradeable block.
+        // Local sim defaults to the scan's block id, but on a pending scan
+        // with USE_PENDING_SIM disabled that id is the mutable pending tag.
+        // Honor the opt-out by simulating against the sealed block number
+        // snapshotted at scan start instead.
+        let local_sim_block = match sim_block {
+            Some(b) => b,
+            None if want_pending => alloy::eips::BlockId::number(scan_block_number),
+            None => block,
+        };
         let local_gas = if cfg.use_local_sim {
             match executor::estimate_gas_local(
                 provider.clone(),
                 cfg.arb_contract,
                 cache.owner,
                 provisional.clone(),
-                sim_block.unwrap_or(block),
+                local_sim_block,
             )
             .await
             {
