@@ -388,8 +388,24 @@ where
     let client = alloy::rpc::client::RpcClient::connect_pubsub(ws).await?;
     let provider = alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
 
-    let heads_sub = provider.subscribe_blocks().await?;
-    let mut heads = heads_sub.into_stream();
+    // The sweep-timing stream yields Some(block) from real newHeads, or
+    // None per wall-clock tick. newHeads notifications are billed per byte
+    // (~28 CU every 2s on Alchemy ≈ 1.2M CU/day), so by default sweeps run
+    // on a timer of the same cadence instead; block numbers from a sweep
+    // trigger are only cosmetic anyway (scans pin to `latest` themselves).
+    fn sweep_timer(every_blocks: u64) -> futures::stream::BoxStream<'static, Option<u64>> {
+        let period = std::time::Duration::from_millis(2000u64.saturating_mul(every_blocks.max(1)));
+        let mut iv = tokio::time::interval(period);
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        use futures::StreamExt as _;
+        futures::stream::poll_fn(move |cx| iv.poll_tick(cx).map(|_| Some(None))).boxed()
+    }
+    let mut heads: futures::stream::BoxStream<'_, Option<u64>> = if cfg.use_new_heads {
+        let sub = provider.subscribe_blocks().await?;
+        sub.into_stream().map(|h| Some(h.number)).boxed()
+    } else {
+        sweep_timer(cfg.sweep_interval_blocks)
+    };
 
     // Without the log subscription (provider rejects the filter, etc.) the
     // sweep interval becomes 1 block, reproducing scan-per-block behavior.
@@ -432,13 +448,18 @@ where
         Ok(sub) => {
             info!(
                 pools = cache.pool_addrs.len(),
-                sweep_every, "subscribed to newHeads + pool logs; scanning on pool events"
+                sweep_every,
+                new_heads = cfg.use_new_heads,
+                "subscribed to pool logs; scanning on pool events"
             );
             sub.into_stream().boxed()
         }
         Err(e) => {
             warn!(error = %e, "log subscription failed; scanning every block");
             sweep_every = 1;
+            if !cfg.use_new_heads {
+                heads = sweep_timer(1);
+            }
             futures::stream::pending().boxed()
         }
     };
@@ -471,13 +492,16 @@ where
             PendingLog(alloy::rpc::types::eth::Log),
         }
         let trigger = tokio::select! {
-            header = heads.next() => {
-                let Some(header) = header else { break };
-                let block = header.number;
-                if block >= last_scanned + sweep_every {
-                    Some(Trig::Sweep(block))
-                } else {
-                    None
+            head = heads.next() => {
+                let Some(head) = head else { break };
+                match head {
+                    // Real header: sweep only when enough blocks passed.
+                    Some(block) if block >= last_scanned + sweep_every => {
+                        Some(Trig::Sweep(block))
+                    }
+                    // Timer ticks already carry the cadence; fire directly.
+                    None => Some(Trig::Sweep(last_scanned)),
+                    Some(_) => None,
                 }
             }
             log = logs.next() => {
@@ -486,6 +510,9 @@ where
                     None => {
                         warn!("log subscription ended; scanning every block");
                         sweep_every = 1;
+                        if !cfg.use_new_heads {
+                            heads = sweep_timer(1);
+                        }
                         logs = futures::stream::pending().boxed();
                         None
                     }
