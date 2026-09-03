@@ -204,6 +204,7 @@ where
         ));
     let pending = provider.send_transaction(tx).await?;
     let tx_hash = *pending.tx_hash();
+    tracing::debug!(tx = %tx_hash, "execute_sync: broadcast, awaiting flash receipt");
 
     // Move the receipt future into a background task that owns `pending`
     // (get_receipt takes self by value) and clears the in-flight flag on any
@@ -243,7 +244,19 @@ where
     {
         // Receipt arrived (or a fatal fetch error) within the Flashblock
         // window: the task has already cleared the flag.
-        Ok(_) => {}
+        Ok(Ok(Ok(r))) => {
+            tracing::debug!(
+                tx = %r.transaction_hash,
+                status = r.status(),
+                "execute_sync: receipt within flash window"
+            );
+        }
+        Ok(Ok(Err(e))) => {
+            tracing::debug!(tx = %tx_hash, error = %e, "execute_sync: receipt fetch failed within flash window");
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(tx = %tx_hash, error = %e, "execute_sync: receipt task panicked");
+        }
         // Timed out waiting for the receipt. The background task still owns
         // `pending` and the in-flight flag; it will clear the flag when the
         // tx lands or fails conclusively. Resume scanning immediately, but

@@ -10,7 +10,7 @@ use morpho_arbitrage_bot::dex::{
 };
 use morpho_arbitrage_bot::executor;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -169,7 +169,13 @@ async fn probe_flashblocks_via_ws(cfg: &Config) -> bool {
     };
     let provider =
         alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
-    probe_flashblocks_ws(&provider).await
+    let available = probe_flashblocks_ws(&provider).await;
+    debug!(
+        wss = %redact_url(url),
+        flashblocks_available = available,
+        "Flashblock probe complete (newFlashblocks subscribe accepted = capability)"
+    );
+    available
 }
 
 #[tokio::main]
@@ -567,6 +573,15 @@ where
     // preconfirmed state maps to the in-progress sealed block, so
     // get_block_number (latest) is the correct watermark.
     let block_number = provider.get_block_number().await?;
+    debug!(
+        block = ?block,
+        block_number,
+        scan_block_number,
+        want_pending,
+        flashblocks_available = cache.flashblocks_available,
+        pending_state = cfg.use_pending_state,
+        "scan pinned to block"
+    );
 
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
@@ -700,6 +715,15 @@ where
 
     let quotes: Vec<VenueQuotes> = legs.into_iter().map(|l| l.quotes).collect();
 
+    for (i, q) in quotes.iter().enumerate() {
+        debug!(
+            venue = i,
+            leg1 = ?q.leg1,
+            leg2 = ?q.leg2,
+            "venue quotes"
+        );
+    }
+
     // Phase-1 → phase-2 state-advancement guard. When scanning preconfirmed
     // `pending` state, the tag is mutable — Base advances it ~every 200ms. If
     // a new Flashblock landed between the phase-1 batch (reserves/leg-1
@@ -781,7 +805,17 @@ where
         match executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional, sim_block)
             .await
         {
-            Ok(gas_estimate) => gas_estimate * gas_price,
+            Ok(gas_estimate) => {
+                let gas_cost = gas_estimate * gas_price;
+                debug!(
+                    gas_units = ?gas_estimate,
+                    gas_price = %gas_price,
+                    gas_cost = %gas_cost,
+                    sim_block = ?sim_block,
+                    "gas estimate for opportunity"
+                );
+                gas_cost
+            }
             Err(e) => {
                 info!(error = %e, "opportunity rejected: simulated execution reverted");
                 return Ok(block_number);
