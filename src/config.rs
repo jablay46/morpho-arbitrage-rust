@@ -92,6 +92,12 @@ pub struct Config {
     /// Safety-net sweep interval in blocks for event-driven mode: even when
     /// no pool event fires, a full scan is forced at least every N blocks.
     pub sweep_interval_blocks: u64,
+    /// Subscribe to `newHeads` over WSS to time safety-net sweeps by block.
+    /// Off by default: every header notification is billed by the provider
+    /// (Alchemy: 0.04 CU/byte, ~28 CU per 2s block — over a million CU/day),
+    /// so sweeps run on a wall-clock timer derived from the sweep interval
+    /// instead. Enable when CU cost is irrelevant (e.g. own node).
+    pub use_new_heads: bool,
     /// Minimum wall-clock gap between event-driven scans, milliseconds
     /// (0 = no limit). Caps request bursts against RPS-limited RPC plans.
     pub min_scan_interval_ms: u64,
@@ -412,6 +418,14 @@ impl Config {
             .unwrap_or(10)
             .max(1);
 
+        // newHeads notifications are billed per byte delivered and arrive
+        // every ~2s on Base — a steady ~1.2M CU/day on Alchemy just to time
+        // sweeps. Default off: the sweep timer is wall-clock based.
+        let use_new_heads = env::var("USE_NEW_HEADS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         // Minimum wall-clock gap between event-driven scans. Active pairs
         // emit pool events nearly every block (every ~200ms flashblock with
         // USE_PENDING_LOGS), and each scan costs several JSON-RPC requests;
@@ -511,6 +525,7 @@ impl Config {
             poll_interval_ms,
             state_refresh_secs,
             sweep_interval_blocks,
+            use_new_heads,
             min_scan_interval_ms,
             dry_run,
             quoter_v2,

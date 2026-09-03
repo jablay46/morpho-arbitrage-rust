@@ -409,6 +409,7 @@ mod tests {
             poll_interval_ms: 0,
             state_refresh_secs: 60,
             sweep_interval_blocks: 10,
+            use_new_heads: false,
             min_scan_interval_ms: 0,
             dry_run: true,
             quoter_v2: Address::ZERO,

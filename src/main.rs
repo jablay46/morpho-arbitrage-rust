@@ -388,8 +388,29 @@ where
     let client = alloy::rpc::client::RpcClient::connect_pubsub(ws).await?;
     let provider = alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
 
-    let heads_sub = provider.subscribe_blocks().await?;
-    let mut heads = heads_sub.into_stream();
+    // newHeads times the safety-net sweeps — but every header notification
+    // is billed per byte (~28 CU every 2s on Alchemy ≈ 1.2M CU/day). With
+    // USE_NEW_HEADS off, sweeps run on a wall-clock timer approximating the
+    // same block cadence; the L2 block number in the sweep trigger is only
+    // cosmetic (scans pin to `latest` themselves), so 0 is fine.
+    let mut heads: futures::stream::BoxStream<'_, alloy::rpc::types::eth::Header> =
+        if cfg.use_new_heads {
+            let sub = provider.subscribe_blocks().await?;
+            sub.into_stream().boxed()
+        } else {
+            let period =
+                std::time::Duration::from_millis(2000u64.saturating_mul(cfg.sweep_interval_blocks));
+            let mut iv = tokio::time::interval(period);
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            futures::stream::poll_fn(move |cx| {
+                iv.poll_tick(cx).map(|_| {
+                    Some(alloy::rpc::types::eth::Header::new(
+                        alloy::consensus::Header::default(),
+                    ))
+                })
+            })
+            .boxed()
+        };
 
     // Without the log subscription (provider rejects the filter, etc.) the
     // sweep interval becomes 1 block, reproducing scan-per-block behavior.
@@ -432,7 +453,9 @@ where
         Ok(sub) => {
             info!(
                 pools = cache.pool_addrs.len(),
-                sweep_every, "subscribed to newHeads + pool logs; scanning on pool events"
+                sweep_every,
+                new_heads = cfg.use_new_heads,
+                "subscribed to pool logs; scanning on pool events"
             );
             sub.into_stream().boxed()
         }
