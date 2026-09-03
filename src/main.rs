@@ -8,7 +8,9 @@ use morpho_arbitrage_bot::dex::{
     fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id,
     PairTokens, QuoteRequest,
 };
+use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::executor;
+use morpho_arbitrage_bot::state::{self, bootstrap_cl, PoolState, StateStore};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
@@ -40,10 +42,15 @@ struct VenueCache {
     /// V2/Aero venue indices and their pair addresses, for the snapshot batch.
     v2_idx: Vec<usize>,
     v2_pairs: Vec<Address>,
-    /// V3 venue indices (priced via QuoterV2, no per-scan pool reads).
+    /// V3 venue indices and their pool addresses (priced via QuoterV2 when
+    /// uncached, or via local cl_math when bootstrap state is present).
     v3_idx: Vec<usize>,
+    v3_pairs: Vec<Address>,
     /// All resolved pool addresses (V2 + V3), for the event filter.
     pool_addrs: Vec<Address>,
+    /// Event-driven pool-state cache, bootstrapped at startup; CL venues
+    /// present here are priced locally on every scan.
+    state: StateStore,
     /// Contract owner, used as `from` in simulations/gas estimates.
     owner: Address,
     /// Startup-probed, cached Flashblock capability: `true` only when the
@@ -61,6 +68,7 @@ impl VenueCache {
         let mut v2_idx = Vec::new();
         let mut v2_pairs = Vec::new();
         let mut v3_idx = Vec::new();
+        let mut v3_pairs = Vec::new();
         let mut pool_addrs = Vec::with_capacity(cfg.venues.len());
         for (idx, venue) in cfg.venues.iter().enumerate() {
             // Auto-resolve the pool from the venue's factory when the
@@ -86,12 +94,13 @@ impl VenueCache {
             };
             let tokens = if venue.kind == VenueKind::UniswapV3 {
                 v3_idx.push(idx);
+                v3_pairs.push(pool);
                 fetch_v3_pair_tokens(provider, pool).await?
             } else if venue.kind == VenueKind::Slipstream {
                 // Slipstream CL pools are priced via their own quoter; from the
-                // scanner's perspective they behave like V3 (no per-scan reserve
-                // reads), so they ride the same index.
+                // scanner's perspective they behave like V3.
                 v3_idx.push(idx);
+                v3_pairs.push(pool);
                 fetch_cl_pair_tokens(provider, pool).await?
             } else {
                 v2_idx.push(idx);
@@ -123,12 +132,30 @@ impl VenueCache {
         } else {
             false
         };
+        // Bootstrap every resolved CL pool into the local state store; a
+        // failed bootstrap just keeps that venue on the QuoterV2 fallback.
+        let mut state = StateStore::new();
+        for pool in v3_pairs.iter() {
+            match bootstrap_cl(provider, *pool).await {
+                Ok(ps) => {
+                    let n_ticks = match &ps {
+                        PoolState::Cl { ticks, .. } => ticks.len(),
+                        PoolState::V2 { .. } => 0,
+                    };
+                    info!(pool = %pool, ticks = n_ticks, "CL pool bootstrapped into local state");
+                    state.insert(*pool, ps);
+                }
+                Err(e) => warn!(pool = %pool, error = %e, "CL bootstrap failed; using QuoterV2 fallback"),
+            }
+        }
         Ok(Self {
             pair_tokens,
             v2_idx,
             v2_pairs,
             v3_idx,
+            v3_pairs,
             pool_addrs,
+            state,
             owner,
             flashblocks_available,
         })
@@ -201,7 +228,7 @@ async fn main() -> Result<()> {
 
     // One-off startup resolution: pair tokens for orientation/validation and
     // the contract owner for simulations. ~3 RPC calls per venue, once.
-    let cache = VenueCache::build(&broadcaster, &cfg).await?;
+    let mut cache = VenueCache::build(&broadcaster, &cfg).await?;
 
     info!(
         morpho = %cfg.morpho,
@@ -238,7 +265,7 @@ async fn main() -> Result<()> {
             let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Some(wss_url) = &cfg.wss_url {
                 info!(wss = %redact_url(wss_url), "starting event-driven scanning via WebSocket");
-                run_event_driven(&cfg, &cache, wss_url, &broadcaster, &inflight).await?;
+                run_event_driven(&cfg, &mut cache, wss_url, &broadcaster, &inflight).await?;
             } else {
                 info!(
                     poll_ms = cfg.poll_interval_ms,
@@ -333,7 +360,7 @@ fn pool_event_signatures() -> Vec<alloy::primitives::B256> {
 /// the process).
 async fn run_event_driven<B>(
     cfg: &Config,
-    cache: &VenueCache,
+    cache: &mut VenueCache,
     wss_url: &str,
     broadcaster: &B,
     inflight: &InflightFlag,
@@ -434,13 +461,18 @@ where
                     }
                     // Reorged-away events must not trigger a scan.
                     Some(log) if log.removed => None,
-                    Some(log) => match log.block_number {
-                        // Multiple pool events within one block coalesce into
-                        // a single scan: reads are pinned to the sealed
-                        // latest block, so later events add nothing.
-                        Some(block) if block > last_scanned => Some(("pool event", block)),
-                        _ => None,
-                    },
+                    Some(log) => {
+                        // Fold the event into the local pool state first so
+                        // the triggered scan prices against fresh inventory.
+                        apply_pool_log(&mut *cache, &log);
+                        match log.block_number {
+                            // Multiple pool events within one block coalesce into
+                            // a single scan: reads are pinned to the sealed
+                            // latest block, so later events add nothing.
+                            Some(block) if block > last_scanned => Some(("pool event", block)),
+                            _ => None,
+                        }
+                    }
                 }
             }
             // Preconfirmed (Flashblock) pool logs: fire ~200ms after the
@@ -468,7 +500,10 @@ where
                         None
                     }
                     Some(log) if log.removed => None,
-                    Some(_) => {
+                    Some(log) => {
+                        // Same as the sealed branch: apply into local state
+                        // before scanning, so the scan reads fresh inventory.
+                        apply_pool_log(&mut *cache, &log);
                         // Use the latest sealed block as the watermark so
                         // the sweep clock advances; the actual scan reads
                         // pending state when USE_PENDING_STATE is on.
@@ -512,6 +547,74 @@ where
 /// competing duplicate that burns gas on revert. The flag is cleared by the
 /// background receipt watcher once the tx is included.
 type InflightFlag = Arc<std::sync::atomic::AtomicBool>;
+
+/// Look up a CL venue's bootstrapped state by real pool address; V2 pool
+/// lookups (Address::ZERO) yield None so the caller falls back to RPC.
+fn cached_cl(cache: &VenueCache, pool: Address) -> Option<&PoolState> {
+    if pool == Address::ZERO {
+        return None;
+    }
+    match cache.state.get(&pool) {
+        Some(PoolState::Cl { .. }) => cache.state.get(&pool),
+        _ => None,
+    }
+}
+
+/// Local CL quote for one exact-input swap; delegates to cl_math.
+fn cl_quote(amount_in: U256, state: &PoolState, zero_for_one: bool) -> Option<U256> {
+    cl_quote_exact_in(state, zero_for_one, amount_in)
+}
+
+/// Kind-tagged pool event hashes, computed once by the callers at the top
+/// of each classification (keccak of the Solidity signature). Only the
+/// payload-relevant events need decoding semantics here.
+fn v2_sync_hash() -> alloy::primitives::B256 {
+    alloy::primitives::keccak256("Sync(uint112,uint112)")
+}
+
+/// CL Swap/Mint/Burn identically agree between Uniswap V3 and Slipstream.
+fn cl_swap_hash() -> alloy::primitives::B256 {
+    alloy::primitives::keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
+}
+fn cl_mint_hash() -> alloy::primitives::B256 {
+    alloy::primitives::keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)")
+}
+fn cl_burn_hash() -> alloy::primitives::B256 {
+    alloy::primitives::keccak256("Burn(address,int24,int24,uint128,uint256,uint256)")
+}
+
+/// Fold one pool log into the local state store. Only Sync/CL-Swap/
+/// Mint/Burn events change price; anything else is skipped silently.
+/// Malformed payloads are ignored — one bad log never crashes the loop.
+fn apply_pool_log(cache: &mut VenueCache, log: &alloy::rpc::types::eth::Log) {
+    let pool = log.address();
+    let topics = log.topics();
+    let data = log.data();
+    let data: &[u8] = data.data.as_ref();
+    let Some(&topic0) = topics.first() else {
+        return;
+    };
+    let v2_sync = v2_sync_hash();
+    let cl_swap = cl_swap_hash();
+    let cl_mint = cl_mint_hash();
+    let cl_burn = cl_burn_hash();
+    if topic0 == v2_sync {
+        if let Some(ev) = state::decode_v2_sync(data) {
+            debug!(pool = %pool, kind = "sync", "applied pool log to state store");
+            cache.state.apply_v2_sync(pool, ev);
+        }
+    } else if topic0 == cl_swap {
+        if let Some(ev) = state::decode_cl_swap(data) {
+            cache.state.apply_cl_swap(pool, ev);
+        }
+    } else if topic0 == cl_mint || topic0 == cl_burn {
+        let is_burn = topic0 == cl_burn;
+        if let Some(ev) = state::decode_cl_liquidity(data, topics, is_burn) {
+            cache.state.apply_cl_liquidity(pool, ev, is_burn);
+        }
+    }
+}
+
 
 /// Subscribe to Base's non-standard `pendingLogs` subscription: emits the
 /// logs of transactions as they are pre-confirmed in Flashblocks (~200ms),
@@ -591,8 +694,13 @@ where
     );
 
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
-    let mut leg1_requests = Vec::with_capacity(cache.v3_idx.len() * sizes.len());
-    for &idx in &cache.v3_idx {
+    // CL venues with a bootstrapped PoolState are priced locally and
+    // excluded from this RPC batch; the rest still ride QuoterV2.
+    let mut leg1_requests = Vec::new();
+    for (j, &idx) in cache.v3_idx.iter().enumerate() {
+        if cached_cl(cache, cache.v3_pairs[j]).is_some() {
+            continue;
+        }
         let venue = &cfg.venues[idx];
         let slipstream = venue.kind == VenueKind::Slipstream;
         for &size in sizes {
@@ -637,8 +745,31 @@ where
         });
     }
     let n_sizes = sizes.len();
+    let mut next_unchecked = 0usize; // request index among uncached v3 venues
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
-        let leg1: Vec<Option<U256>> = snapshot.v3_quotes[j * n_sizes..(j + 1) * n_sizes].to_vec();
+        let pool = cache.v3_pairs[j];
+        if let Some(ps) = cached_cl(cache, pool) {
+            // Local CL quote path — identical math to the venue's quoter,
+            // validated against on-chain Quoter in tests/chain_cl.rs.
+            let zero_for_one = cache.pair_tokens[idx].token0 == cfg.loan_token;
+            let lo = ps;
+            let leg1: Vec<Option<U256>> = sizes
+                .iter()
+                .map(|&s| cl_quote(s, lo, zero_for_one))
+                .collect();
+            if leg1.iter().all(|q| q.is_none()) {
+                warn!(venue = idx, pool = %pool, "cached CL pool unusable; skipping venue");
+                continue;
+            }
+            legs.push(Leg1 {
+                quotes: VenueQuotes { venue: idx, leg1, leg2: Vec::new() },
+                v2_reserves: None,
+            });
+            continue;
+        }
+        let base = next_unchecked;
+        next_unchecked += n_sizes;
+        let leg1: Vec<Option<U256>> = snapshot.v3_quotes[base..base + n_sizes].to_vec();
         if leg1.iter().all(|q| q.is_none()) {
             let label = if cfg.venues[idx].kind == VenueKind::Slipstream {
                 "Slipstream"
@@ -679,6 +810,18 @@ where
         }
         let venue_idx = legs[s].quotes.venue;
         let venue = &cfg.venues[venue_idx];
+        // V3-index lookup; V2 pool lookups map to Address::ZERO so cached_cl
+        // finds nothing and keeps the fallthrough RPC behavior.
+        let v3_pos = cache
+            .v3_idx
+            .iter()
+            .position(|&i| i == venue_idx)
+            .unwrap_or(usize::MAX);
+        let pool = if v3_pos == usize::MAX {
+            Address::ZERO
+        } else {
+            cache.v3_pairs[v3_pos]
+        };
         if let Some(reserves) = legs[s].v2_reserves {
             legs[s].quotes.leg2 = v2_quotes(
                 venue_idx,
@@ -688,6 +831,13 @@ where
                 &inputs,
             )
             .leg2;
+        } else if let Some(ps) = cached_cl(cache, pool) {
+            // Local CL path for leg 2 (quote -> loan).
+            let zero_for_one = cache.pair_tokens[venue_idx].token0 == cfg.quote_token;
+            legs[s].quotes.leg2 = inputs
+                .iter()
+                .map(|&q| (q, cl_quote(q, ps, zero_for_one)))
+                .collect();
         } else {
             let slipstream = venue.kind == VenueKind::Slipstream;
             for q in inputs {

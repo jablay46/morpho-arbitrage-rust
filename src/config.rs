@@ -392,16 +392,18 @@ impl Config {
             .max(1);
 
         // Minimum wall-clock gap between event-driven scans. Active pairs
-        // emit pool events nearly every block, and each scan costs several
-        // JSON-RPC requests; without a floor the bot bursts past the RPC
-        // plan's RPS limit. Events arriving during the cooldown are not
-        // lost: the next scan reads the latest block, which already
-        // includes their state changes.
+        // emit pool events nearly every block (every ~200ms flashblock with
+        // USE_PENDING_LOGS), and each scan costs several JSON-RPC requests;
+        // without a floor the bot bursts past the RPC plan's RPS limit.
+        // Events arriving during the cooldown are not lost: the next scan
+        // reads the latest block, which already includes their state
+        // changes. Defaults to 2000ms (~0.5 scan/s), which keeps even a
+        // 25 RPS plan comfortable; set explicitly to 0 to disable the cap.
         let min_scan_interval_ms = match env::var("MIN_SCAN_INTERVAL_MS") {
             Ok(raw) => raw
                 .parse::<u64>()
                 .map_err(|e| eyre!("invalid MIN_SCAN_INTERVAL_MS '{raw}': {e}"))?,
-            Err(_) => 0,
+            Err(_) => 2000,
         };
 
         // Uniswap QuoterV2 on Base. This address is Base-specific; other
