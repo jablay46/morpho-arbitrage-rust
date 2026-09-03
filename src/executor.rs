@@ -214,11 +214,12 @@ where
 {
     use alloy::network::TransactionBuilder;
 
-    let tx = TransactionRequest::default()
-        .with_to(contract)
-        .with_input(alloy::primitives::Bytes::from(
-            IFlashArbitrage::executeCall { params }.abi_encode(),
-        ));
+    let tx =
+        TransactionRequest::default()
+            .with_to(contract)
+            .with_input(alloy::primitives::Bytes::from(
+                IFlashArbitrage::executeCall { params }.abi_encode(),
+            ));
     let pending = provider.send_transaction(tx).await?;
     let tx_hash = *pending.tx_hash();
     tracing::debug!(tx = %tx_hash, "execute_sync: broadcast, awaiting flash receipt");
@@ -401,6 +402,7 @@ mod tests {
             gas_price_wei: None,
             slippage_bps: 50,
             poll_interval_ms: 0,
+            state_refresh_secs: 60,
             sweep_interval_blocks: 10,
             min_scan_interval_ms: 0,
             dry_run: true,
@@ -451,6 +453,9 @@ mod tests {
         let encoded = venue.abi_encode();
         let decoded = SwapLeg::abi_decode(&encoded).expect("leg decodes");
         assert_eq!(decoded.kind, 4);
-        assert_eq!(decoded.feeTier, alloy::primitives::Uint::<24, 1>::from(100u32));
+        assert_eq!(
+            decoded.feeTier,
+            alloy::primitives::Uint::<24, 1>::from(100u32)
+        );
     }
 }

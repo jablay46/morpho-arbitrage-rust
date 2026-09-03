@@ -1,17 +1,19 @@
+use alloy::primitives::B256;
 use alloy::primitives::{Address, U256};
 use clap::{Parser, Subcommand};
 use eyre::{eyre, Result};
+use futures::FutureExt;
 use morpho_arbitrage_bot::arbitrage::{find_opportunity, v2_quotes, VenueQuotes};
+use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
     fetch_cl_pair_tokens, fetch_pair_tokens, fetch_quotes, fetch_scan_snapshot,
-    fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id,
-    PairTokens, QuoteRequest,
+    fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id, PairTokens,
+    QuoteRequest,
 };
-use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::executor;
 use morpho_arbitrage_bot::sim::SimOutcome;
-use morpho_arbitrage_bot::state::{self, bootstrap_cl, PoolState, StateStore};
+use morpho_arbitrage_bot::state::{self, bootstrap_cl, bootstrap_cl_at, PoolState, StateStore};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
@@ -54,6 +56,11 @@ struct VenueCache {
     state: StateStore,
     /// Contract owner, used as `from` in simulations/gas estimates.
     owner: Address,
+    /// Pending (Flashblock) overlay: preconfirmed logs land here, never in
+    /// `state`. Sealed scans price from `state` only; pending scans price
+    /// from `state` + `pending`. Cleared on every sealed trigger (the sealed
+    /// block supersedes preconfirmations) and on `removed` reorg flags.
+    pending: StateStore,
     /// Startup-probed, cached Flashblock capability: `true` only when the
     /// endpoint actually streams Flashblock preconfirmations. Probed once
     /// here (WS `newFlashblocks` subscription if a pubsub provider, else the
@@ -146,7 +153,9 @@ impl VenueCache {
                     info!(pool = %pool, ticks = n_ticks, "CL pool bootstrapped into local state");
                     state.insert(*pool, ps);
                 }
-                Err(e) => warn!(pool = %pool, error = %e, "CL bootstrap failed; using QuoterV2 fallback"),
+                Err(e) => {
+                    warn!(pool = %pool, error = %e, "CL bootstrap failed; using QuoterV2 fallback")
+                }
             }
         }
         Ok(Self {
@@ -159,6 +168,7 @@ impl VenueCache {
             state,
             owner,
             flashblocks_available,
+            pending: StateStore::new(),
         })
     }
 }
@@ -195,8 +205,7 @@ async fn probe_flashblocks_via_ws(cfg: &Config) -> bool {
             return false;
         }
     };
-    let provider =
-        alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
+    let provider = alloy::providers::RootProvider::<alloy::network::Ethereum>::new(client);
     let available = probe_flashblocks_ws(&provider).await;
     debug!(
         wss = %redact_url(url),
@@ -261,7 +270,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Command::Once => run_once(&cfg, &cache, &broadcaster, None).await?,
+        Command::Once => run_once(&cfg, &mut cache, &broadcaster, None).await?,
         Command::Scan => {
             let inflight = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Some(wss_url) = &cfg.wss_url {
@@ -273,7 +282,8 @@ async fn main() -> Result<()> {
                     "starting polling-based scanning"
                 );
                 loop {
-                    if let Err(e) = run_once(&cfg, &cache, &broadcaster, Some(&inflight)).await {
+                    if let Err(e) = run_once(&cfg, &mut cache, &broadcaster, Some(&inflight)).await
+                    {
                         warn!(error = %e, "scan iteration failed");
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms))
@@ -441,12 +451,17 @@ where
         .unwrap_or_else(std::time::Instant::now);
     let min_gap = std::time::Duration::from_millis(cfg.min_scan_interval_ms);
     loop {
+        enum Trig {
+            Sweep(u64),
+            SealedLog(alloy::rpc::types::eth::Log),
+            PendingLog(alloy::rpc::types::eth::Log),
+        }
         let trigger = tokio::select! {
             header = heads.next() => {
                 let Some(header) = header else { break };
                 let block = header.number;
                 if block >= last_scanned + sweep_every {
-                    Some(("sweep", block))
+                    Some(Trig::Sweep(block))
                 } else {
                     None
                 }
@@ -460,29 +475,11 @@ where
                         logs = futures::stream::pending().boxed();
                         None
                     }
-                    // Reorged-away events must not trigger a scan.
-                    Some(log) if log.removed => None,
-                    Some(log) => {
-                        // Fold the event into the local pool state first so
-                        // the triggered scan prices against fresh inventory.
-                        apply_pool_log(&mut *cache, &log);
-                        match log.block_number {
-                            // Multiple pool events within one block coalesce into
-                            // a single scan: reads are pinned to the sealed
-                            // latest block, so later events add nothing.
-                            Some(block) if block > last_scanned => Some(("pool event", block)),
-                            _ => None,
-                        }
-                    }
+                    Some(log) => Some(Trig::SealedLog(log)),
                 }
             }
             // Preconfirmed (Flashblock) pool logs: fire ~200ms after the
-            // event, well before the sealed block. These can reorg against
-            // the final block, so drop reorged entries and let the sealed
-            // stream + sweep interval act as the backstop. The trigger
-            // block is the current latest, since the preconfirmed log's
-            // block number is the in-progress block; the scan reads fresh
-            // state regardless.
+            // event, well before the sealed block.
             log = async {
                 match &mut pending_logs {
                     Some(s) => s.next().await,
@@ -491,28 +488,100 @@ where
             }, if pending_available => {
                 match log {
                     // Stream ended: disable this branch permanently and
-                    // degrade to sealed logs + sweeps. Keeping the branch
-                    // enabled would spin: `next()` resolves immediately with
-                    // None forever.
+                    // degrade to sealed logs + sweeps.
                     None => {
                         warn!("pendingLogs stream ended; falling back to sealed logs");
                         pending_available = false;
                         pending_logs = None;
                         None
                     }
-                    Some(log) if log.removed => None,
-                    Some(log) => {
-                        // Same as the sealed branch: apply into local state
-                        // before scanning, so the scan reads fresh inventory.
-                        apply_pool_log(&mut *cache, &log);
-                        // Use the latest sealed block as the watermark so
-                        // the sweep clock advances; the actual scan reads
-                        // pending state when USE_PENDING_STATE is on.
-                        let block = last_scanned;
-                        Some(("flashblock event", block))
-                    }
+                    Some(log) => Some(Trig::PendingLog(log)),
                 }
             }
+        };
+        let Some(trigger) = trigger else {
+            continue;
+        };
+        // Buffer ALL logs that have already arrived (same block, pending
+        // copies, the rest of the stream backlog) and apply them atomically
+        // BEFORE the scan runs — never scan against a partially-folded
+        // block. Log identity (tx_hash, log_index) dedupes the pending →
+        // sealed double-delivery: deltas are non-idempotent.
+        let mut block_logs: Vec<alloy::rpc::types::eth::Log> = Vec::new();
+        let mut pend_logs: Vec<alloy::rpc::types::eth::Log> = Vec::new();
+        let (reason, trig_block) = match trigger {
+            Trig::Sweep(b) => ("sweep", b),
+            Trig::SealedLog(l) => {
+                let b = l.block_number.unwrap_or(0);
+                block_logs.push(l);
+                ("pool event", b)
+            }
+            Trig::PendingLog(l) => {
+                pend_logs.push(l);
+                ("flashblock event", last_scanned)
+            }
+        };
+        while let Ok(l) = logs.next().now_or_never().flatten().ok_or(()) {
+            block_logs.push(l);
+        }
+        if let Some(s) = &mut pending_logs {
+            while let Ok(l) = s.next().now_or_never().flatten().ok_or(()) {
+                pend_logs.push(l);
+            }
+        }
+
+        // A sealed trigger supersedes all preconfirmations up to that
+        // block: drop the pending overlay so nothing is applied twice, and
+        // skip any pending copies of logs that arrived sealed in the same
+        // batch.
+        let mut pending_dirty = false;
+        if !block_logs.is_empty() {
+            cache.pending = StateStore::new();
+            let sealed_ids: std::collections::HashSet<(B256, Option<u64>)> = block_logs
+                .iter()
+                .filter(|l| !l.removed)
+                .map(|l| (l.transaction_hash.unwrap_or_default(), l.log_index))
+                .collect();
+            pend_logs.retain(|l| {
+                !sealed_ids.contains(&(l.transaction_hash.unwrap_or_default(), l.log_index))
+            });
+        }
+        // Reorg: a removed log invalidates the state built from it. Deltas
+        // cannot be undone in place, so drop the pool from the cache — the
+        // venue falls back to QuoterV2 until it re-bootstraps.
+        let mut any_removed = false;
+        for l in block_logs.iter().chain(pend_logs.iter()) {
+            if l.removed {
+                any_removed = true;
+                let pool = l.address();
+                cache.state.remove(&pool);
+                cache.pending.remove(&pool);
+                warn!(pool = %pool, "reorged pool log; dropping pool from local cache");
+            }
+        }
+        if any_removed {
+            continue; // state dropped; next sweep/log re-drives discovery
+        }
+        for l in &block_logs {
+            apply_pool_log(&mut cache.state, l);
+        }
+        // Pending overlay: clone the pool's sealed state on first touch,
+        // then fold preconfirmed events on top. Sealed scans never see it.
+        for l in &pend_logs {
+            let pool = l.address();
+            if cache.pending.get(&pool).is_none() {
+                if let Some(base) = cache.state.get(&pool) {
+                    cache.pending.insert(pool, base.clone());
+                }
+            }
+            apply_pool_log(&mut cache.pending, l);
+            pending_dirty = true;
+        }
+        let trigger = match (reason, trig_block) {
+            ("sweep", b) => Some((reason, b)),
+            ("pool event", b) if b > last_scanned => Some((reason, b)),
+            ("flashblock event", b) if pending_dirty => Some((reason, b)),
+            _ => None,
         };
         let Some((reason, block)) = trigger else {
             continue;
@@ -587,7 +656,7 @@ fn cl_burn_hash() -> alloy::primitives::B256 {
 /// Fold one pool log into the local state store. Only Sync/CL-Swap/
 /// Mint/Burn events change price; anything else is skipped silently.
 /// Malformed payloads are ignored — one bad log never crashes the loop.
-fn apply_pool_log(cache: &mut VenueCache, log: &alloy::rpc::types::eth::Log) {
+fn apply_pool_log(store: &mut StateStore, log: &alloy::rpc::types::eth::Log) {
     let pool = log.address();
     let topics = log.topics();
     let data = log.data();
@@ -602,20 +671,19 @@ fn apply_pool_log(cache: &mut VenueCache, log: &alloy::rpc::types::eth::Log) {
     if topic0 == v2_sync {
         if let Some(ev) = state::decode_v2_sync(data) {
             debug!(pool = %pool, kind = "sync", "applied pool log to state store");
-            cache.state.apply_v2_sync(pool, ev);
+            store.apply_v2_sync(pool, ev);
         }
     } else if topic0 == cl_swap {
         if let Some(ev) = state::decode_cl_swap(data) {
-            cache.state.apply_cl_swap(pool, ev);
+            store.apply_cl_swap(pool, ev);
         }
     } else if topic0 == cl_mint || topic0 == cl_burn {
         let is_burn = topic0 == cl_burn;
         if let Some(ev) = state::decode_cl_liquidity(data, topics, is_burn) {
-            cache.state.apply_cl_liquidity(pool, ev, is_burn);
+            store.apply_cl_liquidity(pool, ev, is_burn);
         }
     }
 }
-
 
 /// Subscribe to Base's non-standard `pendingLogs` subscription: emits the
 /// logs of transactions as they are pre-confirmed in Flashblocks (~200ms),
@@ -652,7 +720,7 @@ where
 /// which chain state has actually been covered.
 async fn run_once_with_provider<P, B>(
     cfg: &Config,
-    cache: &VenueCache,
+    cache: &mut VenueCache,
     provider: &P,
     broadcaster: &B,
     inflight: Option<&InflightFlag>,
@@ -697,6 +765,32 @@ where
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     // CL venues with a bootstrapped PoolState are priced locally and
     // excluded from this RPC batch; the rest still ride QuoterV2.
+    //
+    // Staleness control (event streams fold logs in continuously; polling
+    // mode re-bootstraps on a timer): a cached pool whose snapshot no
+    // longer matches the scan's pinned block is dropped from the local
+    // store and priced via QuoterV2 this scan — local math never prices
+    // off a block different from the RPC legs.
+    {
+        let pin = if want_pending { None } else { block.as_u64() };
+        let stale = cache.state.block.is_some() && cache.state.block != pin;
+        let aged = cache
+            .state
+            .last_event_at
+            .map(|t| t.elapsed().as_secs() >= cfg.state_refresh_secs)
+            .unwrap_or(true);
+        if stale || aged {
+            let removed = cache.v3_pairs.len();
+            for pool in cache.v3_pairs.clone() {
+                cache.state.remove(&pool);
+            }
+            cache.pending = StateStore::new();
+            debug!(
+                pools = removed,
+                stale, aged, "local CL state dropped (stale/aged); venues fall back to QuoterV2"
+            );
+        }
+    }
     let mut leg1_requests = Vec::new();
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
         if cached_cl(cache, cache.v3_pairs[j]).is_some() {
@@ -717,6 +811,39 @@ where
     }
     let snapshot = fetch_scan_snapshot(provider, &cache.v2_pairs, &leg1_requests, block).await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
+
+    // Refresh local CL state at the SAME block the RPC legs were priced
+    // at, at most once per STATE_REFRESH_SECS. Polling mode has no event
+    // stream; event-driven mode gets exact pinning too (overlay events
+    // after the pin still fold on top). A failed refresh drops the pool
+    // to the QuoterV2 fallback for this scan.
+    if cache.state.last_refresh_at.elapsed().as_secs() >= cfg.state_refresh_secs {
+        let pin = if want_pending {
+            provider.get_block_number().await.unwrap_or(0)
+        } else {
+            block.as_u64().unwrap_or(0)
+        };
+        if pin != 0 {
+            let mut refreshed = StateStore::new();
+            let mut n_ok = 0usize;
+            for pool in cache.v3_pairs.clone() {
+                match bootstrap_cl_at(provider, pool, pin).await {
+                    Ok(ps) => {
+                        refreshed.insert_at(pool, ps, pin);
+                        n_ok += 1;
+                    }
+                    Err(e) => {
+                        warn!(pool = %pool, error = %e, "CL state refresh failed; using QuoterV2")
+                    }
+                }
+            }
+            if n_ok > 0 {
+                cache.state = refreshed;
+                cache.pending = StateStore::new(); // pre-pin overlay is invalid
+                debug!(pools = n_ok, pin, "local CL state refreshed at scan block");
+            }
+        }
+    }
 
     // Assemble leg-1 outputs per venue; V3 quotes come straight from the
     // snapshot, V2 outputs are exact constant-product math on reserves.
@@ -747,6 +874,12 @@ where
     }
     let n_sizes = sizes.len();
     let mut next_unchecked = 0usize; // request index among uncached v3 venues
+                                     // Per-size QuoterV2 backfill: a cached pool that cannot price some
+                                     // sizes locally (unknown bitmap word, empty range, …) fetches ONLY
+                                     // those sizes on-chain instead of dropping the venue or silently
+                                     // losing the size. One small batch, same pinned block.
+    let mut leg1_backfill: Vec<(usize, usize, QuoteRequest)> = Vec::new(); // (v3 idx, size idx, req)
+    let mut backfill_sizes: Vec<(usize, Vec<Option<U256>>)> = Vec::new(); // (v3 idx, per-size local results)
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
         let pool = cache.v3_pairs[j];
         if let Some(ps) = cached_cl(cache, pool) {
@@ -758,14 +891,26 @@ where
                 .iter()
                 .map(|&s| cl_quote(s, lo, zero_for_one))
                 .collect();
-            if leg1.iter().all(|q| q.is_none()) {
-                warn!(venue = idx, pool = %pool, "cached CL pool unusable; skipping venue");
-                continue;
+            // Backfill any locally unpriceable size via QuoterV2 (partial
+            // cache failure must not silently drop sizes).
+            for (si, q) in leg1.iter().enumerate() {
+                if q.is_none() {
+                    let venue = &cfg.venues[idx];
+                    leg1_backfill.push((
+                        j,
+                        si,
+                        QuoteRequest {
+                            token_in: cfg.loan_token,
+                            token_out: cfg.quote_token,
+                            fee_tier: venue.fee_tier,
+                            amount_in: sizes[si],
+                            quoter: resolve_quoter(cfg, venue),
+                            slipstream: venue.kind == VenueKind::Slipstream,
+                        },
+                    ));
+                }
             }
-            legs.push(Leg1 {
-                quotes: VenueQuotes { venue: idx, leg1, leg2: Vec::new() },
-                v2_reserves: None,
-            });
+            backfill_sizes.push((j, leg1));
             continue;
         }
         let base = next_unchecked;
@@ -791,6 +936,43 @@ where
             },
             v2_reserves: None,
         });
+    }
+
+    // Run the per-size backfill for cached pools (same pinned block), then
+    // merge local + RPC results and push those legs.
+    if !backfill_sizes.is_empty() {
+        let backfill_reqs: Vec<QuoteRequest> =
+            leg1_backfill.iter().map(|(_, _, r)| r.clone()).collect();
+        let backfilled: Vec<Option<U256>> = if backfill_reqs.is_empty() {
+            Vec::new()
+        } else {
+            fetch_quotes(provider, &backfill_reqs, block)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "leg-1 backfill batch failed; dropping failed sizes");
+                    vec![None; backfill_reqs.len()]
+                })
+        };
+        for (j, mut leg1) in backfill_sizes {
+            for (k, (bj, si, _)) in leg1_backfill.iter().enumerate() {
+                if *bj == j {
+                    leg1[*si] = backfilled[k];
+                }
+            }
+            let idx = cache.v3_idx[j];
+            if leg1.iter().all(|q| q.is_none()) {
+                warn!(venue = idx, pool = %cache.v3_pairs[j], "CL pool unusable locally and via backfill; skipping venue");
+                continue;
+            }
+            legs.push(Leg1 {
+                quotes: VenueQuotes {
+                    venue: idx,
+                    leg1,
+                    leg2: Vec::new(),
+                },
+                v2_reserves: None,
+            });
+        }
     }
 
     // Phase 2: leg 2 (quote -> loan) for every distinct leg-1 output of the
@@ -824,21 +1006,47 @@ where
             cache.v3_pairs[v3_pos]
         };
         if let Some(reserves) = legs[s].v2_reserves {
-            legs[s].quotes.leg2 = v2_quotes(
-                venue_idx,
-                reserves,
-                venue.fee_bps,
-                &[],
-                &inputs,
-            )
-            .leg2;
+            legs[s].quotes.leg2 = v2_quotes(venue_idx, reserves, venue.fee_bps, &[], &inputs).leg2;
         } else if let Some(ps) = cached_cl(cache, pool) {
-            // Local CL path for leg 2 (quote -> loan).
+            // Local CL path for leg 2 (quote -> loan). Inputs that fail
+            // locally are backfilled via QuoterV2 below - a partial cache
+            // miss must not silently drop the (leg1, size) pair.
             let zero_for_one = cache.pair_tokens[venue_idx].token0 == cfg.quote_token;
-            legs[s].quotes.leg2 = inputs
+            let mut leg2: Vec<(U256, Option<U256>)> = inputs
                 .iter()
                 .map(|&q| (q, cl_quote(q, ps, zero_for_one)))
                 .collect();
+            let failed: Vec<U256> = leg2
+                .iter()
+                .filter(|(_, o)| o.is_none())
+                .map(|(i, _)| *i)
+                .collect();
+            if !failed.is_empty() {
+                let reqs: Vec<QuoteRequest> = failed
+                    .iter()
+                    .map(|&q| QuoteRequest {
+                        token_in: cfg.quote_token,
+                        token_out: cfg.loan_token,
+                        fee_tier: venue.fee_tier,
+                        amount_in: q,
+                        quoter: resolve_quoter(cfg, venue),
+                        slipstream: venue.kind == VenueKind::Slipstream,
+                    })
+                    .collect();
+                let backfilled = fetch_quotes(provider, &reqs, block)
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, "leg-2 backfill batch failed; dropping failed inputs");
+                        vec![None; reqs.len()]
+                    });
+                let mut it = backfilled.into_iter();
+                for (_, out) in leg2.iter_mut() {
+                    if out.is_none() {
+                        *out = it.next().flatten();
+                    }
+                }
+            }
+            legs[s].quotes.leg2 = leg2;
         } else {
             let slipstream = venue.kind == VenueKind::Slipstream;
             for q in inputs {
@@ -988,8 +1196,14 @@ where
         match match local_gas {
             Some(outcome) => outcome,
             None => {
-                executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional, sim_block)
-                    .await
+                executor::estimate_gas(
+                    provider,
+                    cfg.arb_contract,
+                    cache.owner,
+                    provisional,
+                    sim_block,
+                )
+                .await
             }
         } {
             Ok(gas_estimate) => {
@@ -1097,7 +1311,7 @@ where
 /// Run one scan iteration (convenience wrapper for polling mode).
 async fn run_once<B>(
     cfg: &Config,
-    cache: &VenueCache,
+    cache: &mut VenueCache,
     broadcaster: &B,
     inflight: Option<&InflightFlag>,
 ) -> Result<()>

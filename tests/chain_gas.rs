@@ -100,14 +100,8 @@ async fn local_gas_estimate_matches_node() {
         .block(alloy::eips::BlockId::number(block))
         .await;
     assert!(node_revert.is_err(), "node must revert on unknown selector");
-    let outcome = simulate_call(
-        provider,
-        factory,
-        depositor,
-        Bytes::from(bogus),
-        block_id,
-    )
-    .expect("local sim executes");
+    let outcome = simulate_call(provider, factory, depositor, Bytes::from(bogus), block_id)
+        .expect("local sim executes");
     match outcome {
         SimOutcome::Success { .. } => panic!("expected revert on unknown selector"),
         SimOutcome::Reverted(_) => {}

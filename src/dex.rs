@@ -282,8 +282,9 @@ pub async fn resolve_pool<P: Provider>(provider: &P, q: &PoolQuery) -> Result<Ad
                 .getPool(
                     token_a,
                     token_b,
-                    alloy::primitives::aliases::I24::try_from(fee_tier)
-                        .map_err(|_| eyre::eyre!("slipstream tickSpacing {fee_tier} out of i24 range"))?,
+                    alloy::primitives::aliases::I24::try_from(fee_tier).map_err(|_| {
+                        eyre::eyre!("slipstream tickSpacing {fee_tier} out of i24 range")
+                    })?,
                 )
                 .call()
                 .await?
@@ -410,6 +411,11 @@ pub struct ScanSnapshot {
     /// exceeds the pool's liquidity).
     pub v3_quotes: Vec<Option<U256>>,
     pub gas_price: U256,
+    /// The block the snapshot was pinned to, when it was read from a
+    /// numbered block (None for a pending-tag pin). Local pool-state
+    /// refreshes are pinned to the same block so every leg prices off the
+    /// exact same chain state.
+    pub pinned_block: Option<u64>,
 }
 
 /// Encode one quote request as an eth_call transaction against its quoter.
@@ -546,6 +552,7 @@ pub async fn fetch_scan_snapshot<P: Provider>(
         v2_raw,
         v3_quotes,
         gas_price,
+        pinned_block: block.as_u64(),
     })
 }
 

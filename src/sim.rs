@@ -30,7 +30,10 @@ const SIM_GAS_LIMIT: u64 = 10_000_000;
 /// Verdict of a local simulation.
 pub enum SimOutcome {
     /// Call executed successfully; carries gas used and the return data.
-    Success { gas_used: u64, output: alloy::primitives::Bytes },
+    Success {
+        gas_used: u64,
+        output: alloy::primitives::Bytes,
+    },
     /// Call reverted; carries the decoded revert reason / raw output.
     Reverted(String),
 }

@@ -16,7 +16,8 @@ pub const MAX_TICK: i32 = 887272;
 /// floor(sqrt(1.0001^-887272) · 2^96) — TickMath.MIN_SQRT_RATIO.
 pub const MIN_SQRT_RATIO: U256 = U256::from_limbs([4295128739, 0, 0, 0]);
 /// floor(sqrt(1.0001^887272) · 2^96) — TickMath.MAX_SQRT_RATIO.
-pub const MAX_SQRT_RATIO: U256 = U256::from_limbs([6743328256752651558, 17280870778742802505, 4294805859, 0]);
+pub const MAX_SQRT_RATIO: U256 =
+    U256::from_limbs([6743328256752651558, 17280870778742802505, 4294805859, 0]);
 const Q96: U256 = U256::from_limbs([0, 1 << 32, 0, 0]); // 2^96
 
 // ---------------------------------------------------------------------------
@@ -141,7 +142,11 @@ fn get_amount0_delta(sqrt_a: U256, sqrt_b: U256, liquidity: u128, round_up: bool
     if sqrt_a.is_zero() || sqrt_b.is_zero() || liquidity == 0 {
         return U256::ZERO;
     }
-    let (lo, hi) = if sqrt_a > sqrt_b { (sqrt_b, sqrt_a) } else { (sqrt_a, sqrt_b) };
+    let (lo, hi) = if sqrt_a > sqrt_b {
+        (sqrt_b, sqrt_a)
+    } else {
+        (sqrt_a, sqrt_b)
+    };
     let numerator1 = U256::from(liquidity) << 96;
     let numerator2 = hi - lo;
     if round_up {
@@ -160,7 +165,11 @@ fn get_amount1_delta(sqrt_a: U256, sqrt_b: U256, liquidity: u128, round_up: bool
     if sqrt_a.is_zero() || sqrt_b.is_zero() || liquidity == 0 {
         return U256::ZERO;
     }
-    let (lo, hi) = if sqrt_a > sqrt_b { (sqrt_b, sqrt_a) } else { (sqrt_a, sqrt_b) };
+    let (lo, hi) = if sqrt_a > sqrt_b {
+        (sqrt_b, sqrt_a)
+    } else {
+        (sqrt_a, sqrt_b)
+    };
     let l = U256::from(liquidity);
     let delta = hi - lo;
     if round_up {
@@ -184,7 +193,12 @@ fn div_rounding_up(x: U256, y: U256) -> U256 {
 }
 
 /// SqrtPriceMath.getNextSqrtPriceFromAmount0RoundingUp.
-fn get_next_sqrt_price_from_amount0(sqrt_p: U256, liquidity: u128, amount: U256, add: bool) -> Option<U256> {
+fn get_next_sqrt_price_from_amount0(
+    sqrt_p: U256,
+    liquidity: u128,
+    amount: U256,
+    add: bool,
+) -> Option<U256> {
     if amount.is_zero() {
         return Some(sqrt_p);
     }
@@ -208,7 +222,12 @@ fn get_next_sqrt_price_from_amount0(sqrt_p: U256, liquidity: u128, amount: U256,
 }
 
 /// SqrtPriceMath.getNextSqrtPriceFromAmount1RoundingDown.
-fn get_next_sqrt_price_from_amount1(sqrt_p: U256, liquidity: u128, amount: U256, add: bool) -> Option<U256> {
+fn get_next_sqrt_price_from_amount1(
+    sqrt_p: U256,
+    liquidity: u128,
+    amount: U256,
+    add: bool,
+) -> Option<U256> {
     if amount.is_zero() {
         return Some(sqrt_p);
     }
@@ -267,24 +286,27 @@ fn next_initialized_tick_within_one_word(
         compressed -= 1;
     }
     if lte {
-        let (word_pos, bit_pos) = (
-            (compressed >> 8) as i16,
-            (compressed & 0xff) as u32,
-        );
-        let word = bitmap.get(&word_pos).copied().unwrap_or(U256::ZERO);
-        let mask = (U256::from(1u8) << bit_pos).wrapping_sub(U256::from(1u8)) | (U256::from(1u8) << bit_pos);
+        let (word_pos, bit_pos) = ((compressed >> 8) as i16, (compressed & 0xff) as u32);
+        let Some(word) = bitmap.get(&word_pos).copied() else {
+            // Unknown word: never invent emptiness (see the swap loop).
+            return (tick, false);
+        };
+        let mask = (U256::from(1u8) << bit_pos).wrapping_sub(U256::from(1u8))
+            | (U256::from(1u8) << bit_pos);
         let masked = word & mask;
         let initialized = !masked.is_zero();
         let msb = most_significant_bit(masked).unwrap_or(0);
         let next = (compressed - (bit_pos as i32 - msb as i32)) * tick_spacing;
         (next, initialized)
     } else {
-        let (word_pos, bit_pos) = (
-            (compressed >> 8) as i16,
-            (compressed & 0xff) as u32,
-        );
-        let word = bitmap.get(&word_pos).copied().unwrap_or(U256::ZERO);
-        let mask = !((U256::from(1u8) << (bit_pos + 1u32)).wrapping_sub(U256::from(1u8)));
+        // Solidity: compressed = tick / tickSpacing + 1 — the search starts
+        // strictly ABOVE the current compressed tick.
+        let compressed = compressed + 1;
+        let (word_pos, bit_pos) = ((compressed >> 8) as i16, (compressed & 0xff) as u32);
+        let Some(word) = bitmap.get(&word_pos).copied() else {
+            return (tick, false);
+        };
+        let mask = !((U256::from(1u8) << bit_pos).wrapping_sub(U256::from(1u8)));
         let masked = word & mask;
         let initialized = !masked.is_zero();
         let lsb = least_significant_bit(masked).unwrap_or(0);
@@ -313,7 +335,10 @@ fn least_significant_bit(x: U256) -> Option<u32> {
     let limbs = x.as_limbs();
     for (i, &l) in limbs.iter().enumerate() {
         if l != 0 {
-            return u32::try_from(i).ok()?.checked_mul(64)?.checked_add(l.trailing_zeros());
+            return u32::try_from(i)
+                .ok()?
+                .checked_mul(64)?
+                .checked_add(l.trailing_zeros());
         }
     }
     None
@@ -338,7 +363,6 @@ fn compute_swap_step(
     fee_pips: u32, // e.g. 3000 = 0.3%
 ) -> Option<StepResult> {
     let zero_for_one = sqrt_ratio_current >= sqrt_ratio_target;
-    let fee_complement = U256::from(1_000_000u32 - fee_pips);
 
     // exactIn == true always here (the scanner quotes exact inputs).
     let amount_in = if zero_for_one {
@@ -346,91 +370,73 @@ fn compute_swap_step(
     } else {
         get_amount1_delta(sqrt_ratio_current, sqrt_ratio_target, liquidity, true)
     };
+
+    // amountRemainingLessFee = mulDiv(amountRemaining, 1e6 - fee, 1e6)
+    // (floor). Reachability is judged on the FEE-ADJUSTED remaining input —
+    // never on the gross remainder.
+    let remaining_less_fee = mul_div(
+        amount_remaining,
+        U256::from(1_000_000u32 - fee_pips),
+        U256::from(1_000_000u32),
+    )
+    .unwrap_or(U256::ZERO);
+
     let sqrt_price_next;
-    let mut amount_in_used = amount_in;
-    if amount_remaining >= amount_in {
+    let mut amount_in_used;
+    let amount_out;
+    if remaining_less_fee >= amount_in {
         sqrt_price_next = sqrt_ratio_target;
+        amount_in_used = amount_in;
     } else {
-        // amountRemainingLessFee = amountRemaining - mulDiv(remaining, fee, 1e6)
-        let remaining_less_fee = amount_remaining
-            - mul_div(amount_remaining, U256::from(fee_pips), U256::from(1_000_000u32))
-                .unwrap_or(U256::ZERO);
-        // amountIn = delta(current, next(remaining_less_fee))
-        let next = get_next_sqrt_price_from_input(
+        sqrt_price_next = get_next_sqrt_price_from_input(
             sqrt_ratio_current,
             liquidity,
             remaining_less_fee,
             zero_for_one,
         )?;
-        amount_in_used = if zero_for_one {
-            get_amount0_delta(next, sqrt_ratio_current, liquidity, true)
-        } else {
-            get_amount1_delta(sqrt_ratio_current, next, liquidity, true)
-        };
-        // max handling on-chain re-clamps to remaining; replicate.
-        if amount_in_used > amount_remaining {
-            sqrt_price_next = get_next_sqrt_price_from_input(
-                sqrt_ratio_current,
-                liquidity,
-                remaining_less_fee,
-                zero_for_one,
-            )?;
-        } else {
-            sqrt_price_next = next;
-        }
-    }
-
-    // fix over-consumption edge cases exactly like the contract:
-    let amount_out = if zero_for_one {
-        if sqrt_price_next == sqrt_ratio_target {
-            get_amount1_delta(sqrt_ratio_target, sqrt_price_next, liquidity, false)
-        } else {
-            get_amount1_delta(sqrt_ratio_current, sqrt_price_next, liquidity, false)
-        }
-    } else if sqrt_price_next == sqrt_ratio_target {
-        get_amount0_delta(sqrt_ratio_target, sqrt_price_next, liquidity, false)
-    } else {
-        get_amount0_delta(sqrt_ratio_current, sqrt_price_next, liquidity, false)
-    };
-
-    // If exact-in and the whole amount was consumed, recompute the amount in
-    // (mirror of the `else if (amountRemaining != amountIn)` branch).
-    if sqrt_price_next != sqrt_ratio_target && amount_in_used != amount_remaining {
+        let max = sqrt_price_next == sqrt_ratio_target;
         amount_in_used = if zero_for_one {
             get_amount0_delta(sqrt_ratio_current, sqrt_price_next, liquidity, true)
         } else {
             get_amount1_delta(sqrt_ratio_current, sqrt_price_next, liquidity, true)
         };
+        if max {
+            amount_in_used = amount_in;
+        }
     }
 
-    // Fee: (amountRemaining - amountIn) % — emulate mulDiv with the
-    // subtraction being exact (exact-in), so fee = amountIn · fee/1e6,
-    // rounded down the same way the contract does.
-    let fee_amount = if fee_complement.is_zero() {
-        U256::ZERO
+    // The output interval is ALWAYS from the current price to the resulting
+    // next price (sqrt_price_next == target for fully consumed ranges) —
+    // never between target and next.
+    amount_out = if zero_for_one {
+        get_amount1_delta(sqrt_ratio_current, sqrt_price_next, liquidity, false)
     } else {
-        // mulDiv(amountIn, feePips, 1e6 - feePips) — matches the contract's
-        // inversion: they subtract from amountRemaining for exact-in, and
-        // the invariant amountIn + fee ≤ amountRemaining must hold.
-        mul_div(
+        get_amount0_delta(sqrt_ratio_current, sqrt_price_next, liquidity, false)
+    };
+
+    // exact-in over-consumption clamp (contract: `if (sqrtPriceNext != ...)`):
+    if amount_in_used > amount_remaining {
+        amount_in_used = amount_remaining;
+    }
+
+    // Fee rounding per SwapMath: partial consumption charges the rest,
+    // target-reaching consumption uses mulDivRoundingUp(amountIn, fee, 1e6-fee).
+    let fee_amount = if fee_pips == 0 {
+        U256::ZERO
+    } else if sqrt_price_next != sqrt_ratio_target {
+        amount_remaining - amount_in_used
+    } else {
+        mul_div_rounding_up(
             amount_in_used,
             U256::from(fee_pips),
-            fee_complement,
+            U256::from(1_000_000u32 - fee_pips),
         )
         .unwrap_or(U256::ZERO)
     };
-    // exact-in: amountIn = amountRemaining - fee (contract recomputes)
-    let amount_in_final = amount_remaining.saturating_sub(fee_amount);
-    let amount_in_final = if amount_in_final > amount_in_used {
-        amount_in_used
-    } else {
-        amount_in_final
-    };
 
-    let _ = amount_out;
     Some(StepResult {
         sqrt_price_next,
-        amount_in: amount_in_final,
+        amount_in: amount_in_used,
         amount_out,
         fee_amount,
     })
@@ -485,18 +491,39 @@ pub fn cl_quote_exact_in(pool: &PoolState, zero_for_one: bool, amount_in: U256) 
         if amount_remaining.is_zero() {
             break;
         }
-        let (next_tick, initialized) = next_initialized_tick_within_one_word(
+        let word_known = {
+            let mut c = current_tick / tick_spacing;
+            if current_tick < 0 && current_tick % tick_spacing != 0 {
+                c -= 1;
+            }
+            if !zero_for_one {
+                c += 1; // match the +1 shift inside the search
+            }
+            tick_bitmap.contains_key(&((c >> 8) as i16))
+        };
+        if !word_known {
+            // The bootstrap only loads the current word ±1. A word outside
+            // that window is UNKNOWN, not empty: assuming empty would skip
+            // initialized ticks and misprice. Bail so the caller falls back
+            // to the on-chain quoter.
+            return None;
+        }
+        let (next_tick_raw, initialized) = next_initialized_tick_within_one_word(
             tick_bitmap,
             current_tick,
             *tick_spacing,
             zero_for_one,
         );
-        // Solidity clamps into the word; ensure we never leave tick bounds.
-        if next_tick < MIN_TICK {
-            // Toward MIN_TICK when zero_for_one.
-        } else if next_tick > MAX_TICK {
-            // Toward MAX_TICK.
-        }
+        // Clamp traversal to the protocol tick bounds (Solidity never
+        // exceeds them because the extreme ticks are always initialized in
+        // the bitmap; a sparse cache can overshoot them).
+        let next_tick = if next_tick_raw < MIN_TICK {
+            MIN_TICK
+        } else if next_tick_raw > MAX_TICK {
+            MAX_TICK
+        } else {
+            next_tick_raw
+        };
         let mut sqrt_ratio_target = get_sqrt_ratio_at_tick(next_tick)?;
         if (zero_for_one && sqrt_ratio_target < sqrt_price_limit)
             || (!zero_for_one && sqrt_ratio_target > sqrt_price_limit)
@@ -517,7 +544,10 @@ pub fn cl_quote_exact_in(pool: &PoolState, zero_for_one: bool, amount_in: U256) 
         if sqrt_price == sqrt_ratio_target_unchecked(next_tick)? {
             // Cross the initialized tick.
             if initialized {
-                let net = ticks.get(&next_tick).map(|t: &TickInfo| t.liquidity_net).unwrap_or(0);
+                let net = ticks
+                    .get(&next_tick)
+                    .map(|t: &TickInfo| t.liquidity_net)
+                    .unwrap_or(0);
                 if zero_for_one {
                     // liquidityNet applied subtractively when moving left.
                     current_liquidity = liquidity_sub_net(current_liquidity, net);
@@ -525,7 +555,11 @@ pub fn cl_quote_exact_in(pool: &PoolState, zero_for_one: bool, amount_in: U256) 
                     current_liquidity = liquidity_add_net(current_liquidity, net);
                 }
             }
-            current_tick = if zero_for_one { next_tick - 1 } else { next_tick };
+            current_tick = if zero_for_one {
+                next_tick - 1
+            } else {
+                next_tick
+            };
         } else {
             // Recompute the tick from the new sqrt price (the approximation
             // ERC uses TickMath.getTickAtSqrtRatio — a cheaper equivalent
@@ -622,10 +656,7 @@ mod tests {
         assert!(r < q96 && r > MIN_SQRT_RATIO);
         // Exact value checked against the on-chain TickMath for tick
         // -80623: 1406895803661524135602712576 (verified via eth_call).
-        assert_eq!(
-            r,
-            U256::from_limbs([0xe6ccb9e74030270e, 0x48bc112, 0, 0])
-        );
+        assert_eq!(r, U256::from_limbs([0xe6ccb9e74030270e, 0x48bc112, 0, 0]));
     }
 
     #[test]
@@ -642,13 +673,22 @@ mod tests {
     }
 
     fn cl_pool(tick: i32, liquidity: u128, spacing: i32, fee: u32) -> PoolState {
+        // Populate the bitmap words the traversal can touch: the word of the
+        // current compressed tick and both neighbors (as bootstrap does).
+        // Words that are KNOWN but empty are zero — distinct from UNKNOWN
+        // words, which must bail the quote.
+        let mut tick_bitmap = HashMap::new();
+        let word = ((tick / spacing) >> 8) as i16;
+        for w in [word - 1, word, word + 1] {
+            tick_bitmap.insert(w, U256::ZERO);
+        }
         PoolState::Cl {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
             tick,
             liquidity,
             tick_spacing: spacing,
             fee,
-            tick_bitmap: HashMap::new(),
+            tick_bitmap,
             ticks: HashMap::new(),
         }
     }
@@ -665,5 +705,87 @@ mod tests {
         // (Exact value depends on tick math; we assert determinism.)
         let out2 = cl_quote_exact_in(&pool, true, amount_in).unwrap();
         assert_eq!(out, out2);
+    }
+
+    #[test]
+    fn step_reaching_target_yields_nonzero_output() {
+        // Regression for the zero-output bug: when a step fully consumes the
+        // range up to sqrt_ratio_target, output must be the delta between
+        // CURRENT and TARGET prices — not between target and next (which are
+        // equal and yielded zero before the fix).
+        let sqrt_lo = get_sqrt_ratio_at_tick(0).unwrap();
+        let sqrt_hi = get_sqrt_ratio_at_tick(120).unwrap();
+        let liquidity = 1_000_000u128;
+        // Input = gross range amount_in scaled up by the fee so the step
+        // definitely reaches the target.
+        let gross = get_amount1_delta(sqrt_lo, sqrt_hi, liquidity, true);
+        // remaining_less_fee = remaining * 997000 / 1e6 (floor) must be
+        // >= gross, so scale up explicitly past the fee plus rounding.
+        let amount_remaining =
+            gross * U256::from(1_000_000u32) / U256::from(997_000u32) + U256::from(10u64);
+        let step = compute_swap_step(sqrt_lo, sqrt_hi, liquidity, amount_remaining, 3000)
+            .expect("step computes");
+        assert_eq!(step.sqrt_price_next, sqrt_hi);
+        assert!(step.amount_out > U256::ZERO, "target-reaching step output");
+        // Output tracks the floor-delta between current and target prices,
+        // within the TickMath ceil-ratio slack at the boundary tick (Solidity
+        // behaves identically: edge ratios are rounded up in getSqrtRatioAtTick).
+        let expected_floor = get_amount1_delta(sqrt_lo, sqrt_hi, liquidity, false);
+        let expected_ceil = get_amount1_delta(sqrt_lo, sqrt_hi, liquidity, true);
+        eprintln!(
+            "out={} floor={} ceil={}",
+            step.amount_out, expected_floor, expected_ceil
+        );
+        // Sanity: output within 1% of the analytical delta.
+        let diff = if step.amount_out > expected_floor {
+            step.amount_out - expected_floor
+        } else {
+            expected_floor - step.amount_out
+        };
+        assert!(diff <= expected_floor / U256::from(100u8));
+        // Fee: target reached => mulDivRoundingUp(amountIn, fee, 1e6-fee).
+        let fee = mul_div_rounding_up(step.amount_in, U256::from(3000u32), U256::from(997_000u32))
+            .unwrap();
+        assert_eq!(step.fee_amount, fee);
+    }
+
+    #[test]
+    fn one_for_zero_search_excludes_current_tick() {
+        // Regression for the forward bitmap search: with lte=false the
+        // search must start strictly ABOVE the current compressed tick, so
+        // an initialized bit at the current tick is NOT returned again.
+        let mut bitmap = HashMap::new();
+        let spacing = 60i32;
+        // Initialize compressed ticks 5 (current) and 9 in word 0.
+        let word = (U256::from(1u8) << 5u32) | (U256::from(1u8) << 9u32);
+        bitmap.insert(0i16, word);
+        let (next, initialized) =
+            next_initialized_tick_within_one_word(&bitmap, 5 * spacing, spacing, false);
+        assert!(initialized);
+        assert_eq!(
+            next,
+            9 * spacing,
+            "must find the NEXT tick, not the current"
+        );
+        // lte=true from the same spot must find the current one.
+        let (prev, initialized) =
+            next_initialized_tick_within_one_word(&bitmap, 5 * spacing, spacing, true);
+        assert!(initialized);
+        assert_eq!(prev, 5 * spacing);
+    }
+
+    #[test]
+    fn unknown_bitmap_word_bails_quote() {
+        // Regression for the empty-word assumption: a swap whose traversal
+        // reaches a word NOT in the cache must return None (fallback to
+        // QuoterV2), never treat it as empty.
+        let mut pool = cl_pool(0, 1_000_000, 60, 3000);
+        // Only the current word is known; traversal one word over is unknown.
+        if let PoolState::Cl { tick_bitmap, .. } = &mut pool {
+            *tick_bitmap = HashMap::from([(0i16, U256::ZERO)]);
+        }
+        // zero-for-one walks left: word -1 is unknown and must bail.
+        let out = cl_quote_exact_in(&pool, true, U256::from(10u64.pow(15)));
+        assert_eq!(out, None, "unknown word must bail, not assume empty");
     }
 }

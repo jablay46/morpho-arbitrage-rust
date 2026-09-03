@@ -58,6 +58,41 @@ pub enum PoolState {
 }
 
 impl PoolState {
+    /// Fold an overlay PoolState (the post-state after preconfirmed events)
+    /// into `self`: CL inventory fields are absolute post-values, and tick /
+    /// bitmap deltas were already applied to the overlay's own maps.
+    pub fn merge(&mut self, ov: &PoolState) {
+        if let (
+            PoolState::Cl {
+                sqrt_price_x96,
+                tick,
+                liquidity,
+                tick_bitmap,
+                ticks,
+                ..
+            },
+            PoolState::Cl {
+                sqrt_price_x96: o_sp,
+                tick: o_t,
+                liquidity: o_l,
+                tick_bitmap: o_bm,
+                ticks: o_tk,
+                ..
+            },
+        ) = (self, ov)
+        {
+            *sqrt_price_x96 = *o_sp;
+            *tick = *o_t;
+            *liquidity = *o_l;
+            for (w, v) in o_bm {
+                tick_bitmap.insert(*w, *v);
+            }
+            for (t, info) in o_tk {
+                ticks.insert(*t, info.clone());
+            }
+        }
+    }
+
     pub fn kind_label(&self) -> &'static str {
         match self {
             PoolState::V2 { .. } => "v2",
@@ -90,24 +125,73 @@ pub struct ClLiquidityEvent {
 }
 
 /// In-memory store of all tracked pool states.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StateStore {
     pools: HashMap<Address, PoolState>,
     /// Wall-clock of the last applied event, for staleness diagnostics.
     pub last_event_at: Option<std::time::Instant>,
+    /// Wall-clock of the last full re-bootstrap/refresh of this store.
+    pub last_refresh_at: std::time::Instant,
+    /// Chain block this snapshot reflects: set by bootstrap, advanced by
+    /// every applied event, cleared on reorg-drop. Scans refuse to price
+    /// from state pinned to a different block than the RPC legs.
+    pub block: Option<u64>,
 }
 
 impl StateStore {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            pools: HashMap::new(),
+            last_event_at: None,
+            last_refresh_at: std::time::Instant::now(),
+            block: None,
+        }
     }
 
     pub fn insert(&mut self, pool: Address, state: PoolState) {
         self.pools.insert(pool, state);
     }
 
+    pub fn insert_at(&mut self, pool: Address, state: PoolState, block: u64) {
+        self.pools.insert(pool, state);
+        self.block = Some(block);
+        self.last_refresh_at = std::time::Instant::now();
+    }
+
     pub fn get(&self, pool: &Address) -> Option<&PoolState> {
         self.pools.get(pool)
+    }
+
+    pub fn remove(&mut self, pool: &Address) {
+        self.pools.remove(pool);
+        self.block = None;
+    }
+
+    /// Record that an event advanced this store past its pinned block.
+    fn touch(&mut self) {
+        self.last_event_at = Some(std::time::Instant::now());
+        if let Some(b) = &mut self.block {
+            *b += 1;
+        }
+    }
+
+    /// Borrowed state when unmodified by `pending`, else the sealed state
+    /// with every pending overlay event folded in (cloned). Keeps the
+    /// pending overlay as deltas only — no full snapshot duplication.
+    pub fn resolved(
+        &self,
+        pool: &Address,
+        pending: &StateStore,
+    ) -> Option<std::borrow::Cow<'_, PoolState>> {
+        let base = self.pools.get(pool)?;
+        match pending.pools.get(pool) {
+            None => Some(std::borrow::Cow::Borrowed(base)),
+            Some(ov) => {
+                let mut st = base.clone();
+                st.merge(ov);
+                Some(std::borrow::Cow::Owned(st))
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -119,7 +203,7 @@ impl StateStore {
         if let Some(PoolState::V2 { reserve0, reserve1 }) = self.pools.get_mut(&pool) {
             *reserve0 = ev.reserve0;
             *reserve1 = ev.reserve1;
-            self.last_event_at = Some(std::time::Instant::now());
+            self.touch();
         }
     }
 
@@ -135,7 +219,7 @@ impl StateStore {
             *sqrt_price_x96 = ev.sqrt_price_x96;
             *tick = ev.tick;
             *liquidity = ev.liquidity;
-            self.last_event_at = Some(std::time::Instant::now());
+            self.touch();
         }
     }
 
@@ -186,7 +270,7 @@ impl StateStore {
                 liquidity.saturating_add(ev.liquidity)
             };
         }
-        self.last_event_at = Some(std::time::Instant::now());
+        self.touch();
     }
 }
 
@@ -243,22 +327,25 @@ pub fn decode_cl_swap(data: &[u8]) -> Option<ClSwapEvent> {
     })
 }
 
-/// CL Mint/Burn: tick bounds in topics 1-2; liquidity is the third data
-/// word on Mint (`(amount0, amount1, amount)`) and the first on Burn
-/// (`(amount, amount0, amount1)`), selected by the caller's `is_burn`.
+/// CL Mint/Burn canonical layout:
+///   Mint(address,address,int24,int24,uint128,uint256,uint256)
+///   Burn(address,int24,int24,uint128,uint256,uint256)
+/// topics: [sig, owner, tickLower, tickUpper]; data words: Mint carries
+/// `(amount0, amount1, amount)` so liquidity is word 2, Burn carries
+/// `(amount, amount0, amount1)` so liquidity is word 0.
 pub fn decode_cl_liquidity(
     data: &[u8],
     topics: &[B256],
     is_burn: bool,
 ) -> Option<ClLiquidityEvent> {
-    if data.len() < 96 || topics.len() < 3 {
+    if data.len() < 96 || topics.len() < 4 {
         return None;
     }
     let idx = if is_burn { 0 } else { 2 };
     let liquidity = U256::from_be_slice(&data[idx * 32..idx * 32 + 32]).to::<u128>();
     Some(ClLiquidityEvent {
-        tick_lower: decode_i24(topics[1].as_slice()),
-        tick_upper: decode_i24(topics[2].as_slice()),
+        tick_lower: decode_i24(topics[2].as_slice()),
+        tick_upper: decode_i24(topics[3].as_slice()),
         liquidity,
     })
 }
@@ -270,10 +357,26 @@ pub fn decode_cl_liquidity(
 // tests need no provider.
 // ---------------------------------------------------------------------------
 pub async fn bootstrap_cl<P: Provider>(provider: &P, pool: Address) -> Result<PoolState> {
+    // Pin every read to ONE numbered block: successive rounds of eth_call
+    // would otherwise observe different blocks when the chain advances
+    // mid-bootstrap, mixing slot0/liquidity/bitmap/tick snapshots.
+    let block = provider.get_block_number().await?;
+    bootstrap_cl_at(provider, pool, block).await
+}
+
+/// Bootstrap against an explicit pinned block — used by the scan's
+/// periodic state refresh so local CL state matches the exact block the
+/// RPC legs of the same scan were priced at.
+pub async fn bootstrap_cl_at<P: Provider>(
+    provider: &P,
+    pool: Address,
+    block: u64,
+) -> Result<PoolState> {
+    let block_id = alloy::eips::BlockId::number(block);
     let mk = |data: alloy::primitives::Bytes| {
         (
             TransactionRequest::default().to(pool).input(data.into()),
-            alloy::eips::BlockId::latest(),
+            block_id,
         )
     };
 
@@ -312,8 +415,7 @@ pub async fn bootstrap_cl<P: Provider>(provider: &P, pool: Address) -> Result<Po
     // Decode ABI-agnostically: Uniswap V3 and Slipstream slot0/ticks return
     // different arities, but the fields this module needs are always at the
     // same leading positions. slot0 word 0 = sqrtPriceX96, word 1 = tick.
-    if slot0_raw.len() < 64 || liq_raw.len() < 32 || fee_raw.len() < 32 || spacing_raw.len() < 32
-    {
+    if slot0_raw.len() < 64 || liq_raw.len() < 32 || fee_raw.len() < 32 || spacing_raw.len() < 32 {
         eyre::bail!("short slot0/liquidity/fee/spacing payload");
     }
     let sqrt_price_x96 = U256::from_be_slice(&slot0_raw[..32]);
@@ -335,13 +437,9 @@ pub async fn bootstrap_cl<P: Provider>(provider: &P, pool: Address) -> Result<Po
             batch2
                 .add_call::<_, alloy::primitives::Bytes>(
                     "eth_call",
-                    &mk(
-                        IClPoolState::tickBitmapCall {
-                            wordPosition: w,
-                        }
+                    &mk(IClPoolState::tickBitmapCall { wordPosition: w }
                         .abi_encode()
-                        .into(),
-                    ),
+                        .into()),
                 )
                 .map_err(eyre::Error::from)?,
         );
@@ -388,13 +486,12 @@ pub async fn bootstrap_cl<P: Provider>(provider: &P, pool: Address) -> Result<Po
             batch3
                 .add_call::<_, alloy::primitives::Bytes>(
                     "eth_call",
-                    &mk(
-                        IClPoolState::ticksCall {
-                            tick: alloy::primitives::aliases::I24::try_from(tick).map_err(|e| eyre::eyre!("{e}"))?,
-                        }
-                        .abi_encode()
-                        .into(),
-                    ),
+                    &mk(IClPoolState::ticksCall {
+                        tick: alloy::primitives::aliases::I24::try_from(tick)
+                            .map_err(|e| eyre::eyre!("{e}"))?,
+                    }
+                    .abi_encode()
+                    .into()),
                 )
                 .map_err(eyre::Error::from)?,
         );
@@ -476,7 +573,8 @@ mod tests {
     #[test]
     fn decode_cl_liquidity_mint_and_burn_words() {
         let topics = vec![
-            B256::ZERO,
+            B256::ZERO,              // sig
+            B256::repeat_byte(0xab), // owner (indexed) — must be ignored
             B256::from_slice(&signed_word(-100)),
             B256::from_slice(&signed_word(200)),
         ];
@@ -484,7 +582,10 @@ mod tests {
         mint.extend(word(2));
         mint.extend(word(777));
         let ev = decode_cl_liquidity(&mint, &topics, false).unwrap();
-        assert_eq!((ev.tick_lower, ev.tick_upper, ev.liquidity), (-100, 200, 777));
+        assert_eq!(
+            (ev.tick_lower, ev.tick_upper, ev.liquidity),
+            (-100, 200, 777)
+        );
 
         let mut burn = word(777);
         burn.extend(word(1));
@@ -525,7 +626,10 @@ mod tests {
             liquidity: 50,
         };
         store.apply_cl_liquidity(pool, ev, false);
-        let PoolState::Cl { liquidity, ticks, .. } = store.get(&pool).unwrap() else {
+        let PoolState::Cl {
+            liquidity, ticks, ..
+        } = store.get(&pool).unwrap()
+        else {
             panic!("wrong variant");
         };
         assert_eq!(*liquidity, 150);
@@ -541,11 +645,82 @@ mod tests {
             },
             true,
         );
-        let PoolState::Cl { liquidity, ticks, .. } = store.get(&pool).unwrap() else {
+        let PoolState::Cl {
+            liquidity, ticks, ..
+        } = store.get(&pool).unwrap()
+        else {
             panic!("wrong variant");
         };
         assert_eq!(*liquidity, 140);
         assert_eq!(ticks[&-60].liquidity_net, 40);
+    }
+
+    #[test]
+    fn resolved_merges_pending_overlay_without_touching_base() {
+        let pool = Address::ZERO;
+        let base_cl = PoolState::Cl {
+            sqrt_price_x96: U256::from(100u64),
+            tick: 1,
+            liquidity: 500,
+            tick_spacing: 60,
+            fee: 3000,
+            tick_bitmap: HashMap::new(),
+            ticks: HashMap::new(),
+        };
+        let mut store = StateStore::new();
+        store.insert(pool, base_cl.clone());
+
+        // No overlay: borrowed, identical to sealed state.
+        let pending = StateStore::new();
+        let r = store.resolved(&pool, &pending).unwrap();
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+
+        // With overlay: merged clone; sealed state untouched.
+        let mut ov = base_cl.clone();
+        if let PoolState::Cl {
+            sqrt_price_x96,
+            liquidity,
+            ticks,
+            ..
+        } = &mut ov
+        {
+            *sqrt_price_x96 = U256::from(999u64);
+            *liquidity = 777;
+            ticks.insert(
+                -60,
+                TickInfo {
+                    liquidity_gross: 10,
+                    liquidity_net: -10,
+                    initialized: true,
+                },
+            );
+        }
+        let mut pending = StateStore::new();
+        pending.insert(pool, ov);
+        let r = store.resolved(&pool, &pending).unwrap();
+        let PoolState::Cl {
+            sqrt_price_x96,
+            liquidity,
+            ticks,
+            ..
+        } = r.as_ref()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(*sqrt_price_x96, U256::from(999u64));
+        assert_eq!(*liquidity, 777);
+        assert_eq!(ticks[&-60].liquidity_net, -10);
+        // Base remains the sealed snapshot.
+        let PoolState::Cl {
+            sqrt_price_x96: bsp,
+            liquidity: bl,
+            ..
+        } = store.get(&pool).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(*bsp, U256::from(100u64));
+        assert_eq!(*bl, 500);
     }
 
     #[test]

@@ -85,6 +85,10 @@ pub struct Config {
     pub slippage_bps: u64,
     /// Poll interval between scans, milliseconds.
     pub poll_interval_ms: u64,
+    /// Re-bootstrap local pool state at most this often (seconds). Event
+    /// streams keep state fresh; in polling mode this is the only update
+    /// path, so scans pin state no older than one refresh interval.
+    pub state_refresh_secs: u64,
     /// Safety-net sweep interval in blocks for event-driven mode: even when
     /// no pool event fires, a full scan is forced at least every N blocks.
     pub sweep_interval_blocks: u64,
@@ -391,6 +395,15 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(500);
 
+        // Local pool-state snapshots age: event streams fold every pool
+        // event in, but polling mode has no stream, so without a periodic
+        // re-bootstrap the scan would price off startup state forever.
+        let state_refresh_secs = env::var("STATE_REFRESH_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(1);
+
         // A sweep interval of 0 would disable the safety net entirely;
         // clamp to 1 (sweep every block, i.e. pre-log-trigger behavior).
         let sweep_interval_blocks = env::var("SWEEP_INTERVAL_BLOCKS")
@@ -471,7 +484,12 @@ impl Config {
         let flashblocks = parse_bool("FLASHBLOCKS", true)?;
         let (use_pending_state, use_flashblock_sync, use_pending_logs, use_pending_sim) =
             if flashblocks {
-                (use_pending_state, use_flashblock_sync, use_pending_logs, use_pending_sim)
+                (
+                    use_pending_state,
+                    use_flashblock_sync,
+                    use_pending_logs,
+                    use_pending_sim,
+                )
             } else {
                 (false, false, false, false)
             };
@@ -491,6 +509,7 @@ impl Config {
             gas_price_wei,
             slippage_bps,
             poll_interval_ms,
+            state_refresh_secs,
             sweep_interval_blocks,
             min_scan_interval_ms,
             dry_run,

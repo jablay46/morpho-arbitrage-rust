@@ -28,25 +28,29 @@ alloy::sol! {
 #[tokio::test]
 #[ignore = "hits a live Base RPC; run explicitly with --ignored"]
 async fn local_cl_quote_matches_slipstream_quoter() {
-    let rpc = std::env::var("BASE_RPC_HTTP")
-        .unwrap_or_else(|_| "https://mainnet.base.org".to_string());
+    let rpc =
+        std::env::var("BASE_RPC_HTTP").unwrap_or_else(|_| "https://mainnet.base.org".to_string());
     let provider = ProviderBuilder::new().connect_http(rpc.parse().unwrap());
 
     // ts=100 WETH/USDC is an active Slipstream pool on Base.
     let weth = Address::from_str(WETH).unwrap();
     let virtual_ = Address::from_str(USDC).unwrap();
-    let factory = ISlipstreamFactory::new(
-        Address::from_str(SLIPSTREAM_FACTORY).unwrap(),
-        &provider,
-    );
+    let factory =
+        ISlipstreamFactory::new(Address::from_str(SLIPSTREAM_FACTORY).unwrap(), &provider);
     let pool = factory
-        .getPool(weth, virtual_, alloy::primitives::aliases::I24::try_from(100).unwrap())
+        .getPool(
+            weth,
+            virtual_,
+            alloy::primitives::aliases::I24::try_from(100).unwrap(),
+        )
         .call()
         .await
         .expect("factory call failed");
     assert_ne!(pool, Address::ZERO, "pool does not exist");
 
-    let state = bootstrap_cl(&provider, pool).await.expect("bootstrap failed");
+    let state = bootstrap_cl(&provider, pool)
+        .await
+        .expect("bootstrap failed");
     let PoolState::Cl {
         liquidity, ticks, ..
     } = &state
@@ -56,7 +60,9 @@ async fn local_cl_quote_matches_slipstream_quoter() {
     assert!(*liquidity > 0, "pool has no liquidity");
     assert!(!ticks.is_empty(), "bootstrap found no initialized ticks");
 
-    let tokens = fetch_cl_pair_tokens(&provider, pool).await.expect("token fetch");
+    let tokens = fetch_cl_pair_tokens(&provider, pool)
+        .await
+        .expect("token fetch");
     // Sell WETH -> USDC.
     let zero_for_one = tokens.token0 == weth;
     let amount_in = U256::from(10_000_000_000_000_000u64); // 0.01 WETH
@@ -77,7 +83,7 @@ async fn local_cl_quote_matches_slipstream_quoter() {
     )
     .await
     .expect("quoter batch failed")[0]
-    .expect("on-chain quoter reverted");
+        .expect("on-chain quoter reverted");
 
     assert_eq!(
         local, on_chain,
