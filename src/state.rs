@@ -11,7 +11,6 @@
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol_types::SolCall;
 use eyre::Result;
 use std::collections::HashMap;
@@ -136,6 +135,12 @@ pub struct StateStore {
     /// every applied event, cleared on reorg-drop. Scans refuse to price
     /// from state pinned to a different block than the RPC legs.
     pub block: Option<u64>,
+    /// Refresh rounds (in a row) that hit at least one pool failure;
+    /// drives the exponential retry backoff.
+    pub refresh_failures: u32,
+    /// Do not attempt the periodic refresh before this instant — set when
+    /// the provider is erroring (e.g. HTTP 429), cleared on a clean round.
+    pub refresh_backoff_until: Option<std::time::Instant>,
 }
 
 impl StateStore {
@@ -145,6 +150,8 @@ impl StateStore {
             last_event_at: None,
             last_refresh_at: std::time::Instant::now(),
             block: None,
+            refresh_failures: 0,
+            refresh_backoff_until: None,
         }
     }
 
@@ -371,53 +378,66 @@ pub async fn bootstrap_cl<P: Provider>(provider: &P, pool: Address) -> Result<Po
     bootstrap_cl_at(provider, pool, block).await
 }
 
+/// Bootstrap several CL pools pinned to ONE shared block: a single
+/// `eth_getBlockNumber` covers the whole set, and every pool's snapshot is
+/// comparable to the others (and to the scan that consumes them). Per-pool
+/// outcomes are returned separately so one failing pool falls back to
+/// QuoterV2 without disturbing the rest.
+pub async fn bootstrap_cl_all<P: Provider>(
+    provider: &P,
+    pools: &[Address],
+) -> Result<Vec<(Address, Result<PoolState>)>> {
+    let block = provider.get_block_number().await?;
+    let mut out = Vec::with_capacity(pools.len());
+    for &pool in pools {
+        out.push((pool, bootstrap_cl_at(provider, pool, block).await));
+    }
+    Ok(out)
+}
+
 /// Bootstrap against an explicit pinned block — used by the scan's
 /// periodic state refresh so local CL state matches the exact block the
 /// RPC legs of the same scan were priced at.
+///
+/// Every round rides Multicall3 (see [`crate::dex::run_eth_calls`]): a
+/// whole bootstrap costs ~3 RPC requests (one per round, plus chunks when
+/// hundreds of ticks are initialized) instead of 7 + N metered sub-calls —
+/// the difference between fitting under a free-tier per-second quota and
+/// being throttled (HTTP 429) on every refresh.
 pub async fn bootstrap_cl_at<P: Provider>(
     provider: &P,
     pool: Address,
     block: u64,
 ) -> Result<PoolState> {
     let block_id = alloy::eips::BlockId::number(block);
-    let mk = |data: alloy::primitives::Bytes| {
-        (
-            TransactionRequest::default().to(pool).input(data.into()),
-            block_id,
-        )
+    let must = |out: std::result::Result<alloy::primitives::Bytes, alloy::primitives::Bytes>,
+                what: &str|
+     -> Result<alloy::primitives::Bytes> {
+        out.map_err(|e| {
+            eyre::eyre!(
+                "{what} call failed at block {block}: 0x{}",
+                alloy::hex::encode(&e)
+            )
+        })
     };
 
     // ---- round 1 ----
-    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
-    let w1 = batch
-        .add_call::<_, alloy::primitives::Bytes>(
-            "eth_call",
-            &mk(IClPoolState::slot0Call {}.abi_encode().into()),
-        )
-        .map_err(eyre::Error::from)?;
-    let w2 = batch
-        .add_call::<_, alloy::primitives::Bytes>(
-            "eth_call",
-            &mk(IClPoolState::liquidityCall {}.abi_encode().into()),
-        )
-        .map_err(eyre::Error::from)?;
-    let w3 = batch
-        .add_call::<_, alloy::primitives::Bytes>(
-            "eth_call",
-            &mk(IClPoolState::feeCall {}.abi_encode().into()),
-        )
-        .map_err(eyre::Error::from)?;
-    let w4 = batch
-        .add_call::<_, alloy::primitives::Bytes>(
-            "eth_call",
-            &mk(IClPoolState::tickSpacingCall {}.abi_encode().into()),
-        )
-        .map_err(eyre::Error::from)?;
-    batch.send().await.map_err(eyre::Error::from)?;
-    let slot0_raw = w1.await.map_err(eyre::Error::from)?;
-    let liq_raw = w2.await.map_err(eyre::Error::from)?;
-    let fee_raw = w3.await.map_err(eyre::Error::from)?;
-    let spacing_raw = w4.await.map_err(eyre::Error::from)?;
+    let r1 = crate::dex::run_eth_calls(
+        provider,
+        &[
+            (pool, IClPoolState::slot0Call {}.abi_encode().into()),
+            (pool, IClPoolState::liquidityCall {}.abi_encode().into()),
+            (pool, IClPoolState::feeCall {}.abi_encode().into()),
+            (pool, IClPoolState::tickSpacingCall {}.abi_encode().into()),
+        ],
+        block_id,
+    )
+    .await?;
+    let mut r1 = r1.into_iter();
+    let slot0_raw = must(r1.next().unwrap_or(Err(Default::default())), "slot0")?;
+    let liq_raw = must(r1.next().unwrap_or(Err(Default::default())), "liquidity")?;
+    let fee_raw = must(r1.next().unwrap_or(Err(Default::default())), "fee")?;
+    let spacing_raw = must(r1.next().unwrap_or(Err(Default::default())), "tickSpacing")?;
 
     // Decode ABI-agnostically: Uniswap V3 and Slipstream slot0/ticks return
     // different arities, but the fields this module needs are always at the
@@ -437,26 +457,23 @@ pub async fn bootstrap_cl_at<P: Provider>(
     // ---- round 2: bitmap words [w0-1, w0, w0+1] ----
     let compressed = current_tick.div_euclid(tick_spacing);
     let w0 = compressed.div_euclid(256) as i16;
-    let mut batch2 = alloy::rpc::client::BatchRequest::new(provider.client());
-    let mut waiters2 = Vec::new();
-    for w in [w0 - 1, w0, w0 + 1] {
-        waiters2.push(
-            batch2
-                .add_call::<_, alloy::primitives::Bytes>(
-                    "eth_call",
-                    &mk(IClPoolState::tickBitmapCall { wordPosition: w }
-                        .abi_encode()
-                        .into()),
-                )
-                .map_err(eyre::Error::from)?,
-        );
-    }
-    batch2.send().await.map_err(eyre::Error::from)?;
+    let bitmap_calls: Vec<(Address, alloy::primitives::Bytes)> = [w0 - 1, w0, w0 + 1]
+        .into_iter()
+        .map(|w| {
+            (
+                pool,
+                IClPoolState::tickBitmapCall { wordPosition: w }
+                    .abi_encode()
+                    .into(),
+            )
+        })
+        .collect();
+    let r2 = crate::dex::run_eth_calls(provider, &bitmap_calls, block_id).await?;
 
     let mut tick_bitmap: HashMap<i16, U256> = HashMap::new();
     let mut set_bits: Vec<(i16, u32)> = Vec::new();
-    for (w, waiter) in [w0 - 1, w0, w0 + 1].into_iter().zip(waiters2.into_iter()) {
-        let raw = waiter.await.map_err(eyre::Error::from)?;
+    for (w, out) in [w0 - 1, w0, w0 + 1].into_iter().zip(r2) {
+        let raw = must(out, "tickBitmap")?;
         if raw.len() < 32 {
             eyre::bail!("short tickBitmap payload");
         }
@@ -485,30 +502,26 @@ pub async fn bootstrap_cl_at<P: Provider>(
     }
 
     // ---- round 3: ticks() per initialized bit ----
-    let mut batch3 = alloy::rpc::client::BatchRequest::new(provider.client());
-    let mut waiters3 = Vec::new();
+    let mut tick_calls: Vec<(Address, alloy::primitives::Bytes)> =
+        Vec::with_capacity(set_bits.len());
     for &(word, bit) in &set_bits {
         let tick = ((word as i32) * 256 + bit as i32) * tick_spacing;
-        waiters3.push(
-            batch3
-                .add_call::<_, alloy::primitives::Bytes>(
-                    "eth_call",
-                    &mk(IClPoolState::ticksCall {
-                        tick: alloy::primitives::aliases::I24::try_from(tick)
-                            .map_err(|e| eyre::eyre!("{e}"))?,
-                    }
-                    .abi_encode()
-                    .into()),
-                )
-                .map_err(eyre::Error::from)?,
-        );
+        tick_calls.push((
+            pool,
+            IClPoolState::ticksCall {
+                tick: alloy::primitives::aliases::I24::try_from(tick)
+                    .map_err(|e| eyre::eyre!("{e}"))?,
+            }
+            .abi_encode()
+            .into(),
+        ));
     }
-    batch3.send().await.map_err(eyre::Error::from)?;
+    let r3 = crate::dex::run_eth_calls(provider, &tick_calls, block_id).await?;
 
     let mut ticks: HashMap<i32, TickInfo> = HashMap::new();
-    for (&(word, bit), waiter) in set_bits.iter().zip(waiters3.into_iter()) {
+    for (&(word, bit), out) in set_bits.iter().zip(r3) {
         let tick = ((word as i32) * 256 + bit as i32) * tick_spacing;
-        let raw = waiter.await.map_err(eyre::Error::from)?;
+        let raw = must(out, "ticks")?;
         if raw.len() < 96 {
             eyre::bail!("short ticks() payload");
         }
