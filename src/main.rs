@@ -11,7 +11,7 @@ use morpho_arbitrage_bot::dex::{
 use morpho_arbitrage_bot::executor;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 
 #[derive(Parser)]
 #[command(
@@ -180,8 +180,15 @@ async fn probe_flashblocks_via_ws(cfg: &Config) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The default directive must be set via the builder: `add_directive` on a
+    // parsed filter replaces any same-specificity directive from RUST_LOG, so
+    // `RUST_LOG=debug` would be silently overwritten by the `info` fallback.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .init();
 
     let cli = Cli::parse();
