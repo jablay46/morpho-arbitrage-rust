@@ -11,7 +11,7 @@ use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol_types::SolCall;
-use morpho_arbitrage_bot::sim::{simulate_call, SimOutcome};
+use morpho_arbitrage_bot::sim::{fetch_sim_env, simulate_call, SimOutcome};
 use std::str::FromStr;
 
 const WETH: &str = "0x4200000000000000000000000000000000000006";
@@ -53,12 +53,16 @@ async fn local_gas_estimate_matches_node() {
         .await
         .expect("node eth_estimateGas succeeds");
 
+    let env = fetch_sim_env(&provider, block_id)
+        .await
+        .expect("sim block context resolves");
     let outcome = simulate_call(
         provider.clone(),
         weth,
         depositor,
         Bytes::from(calldata),
         block_id,
+        Some(env),
     )
     .expect("local sim executes");
     let local_gas = match outcome {
@@ -100,8 +104,18 @@ async fn local_gas_estimate_matches_node() {
         .block(alloy::eips::BlockId::number(block))
         .await;
     assert!(node_revert.is_err(), "node must revert on unknown selector");
-    let outcome = simulate_call(provider, factory, depositor, Bytes::from(bogus), block_id)
-        .expect("local sim executes");
+    let env = fetch_sim_env(&provider, block_id)
+        .await
+        .expect("sim block context resolves");
+    let outcome = simulate_call(
+        provider,
+        factory,
+        depositor,
+        Bytes::from(bogus),
+        block_id,
+        Some(env),
+    )
+    .expect("local sim executes");
     match outcome {
         SimOutcome::Success { .. } => panic!("expected revert on unknown selector"),
         SimOutcome::Reverted(_) => {}

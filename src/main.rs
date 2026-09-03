@@ -1179,7 +1179,9 @@ where
                 cache.owner,
                 provisional.clone(),
                 sim_block.unwrap_or(alloy::eips::BlockId::latest()),
-            ) {
+            )
+            .await
+            {
                 Ok(SimOutcome::Success { gas_used, .. }) => {
                     debug!(gas_units = gas_used, "local revm gas estimate");
                     Some(Ok(U256::from(gas_used)))

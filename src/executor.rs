@@ -129,15 +129,18 @@ pub async fn estimate_gas<P: Provider>(
 /// gas used, a revert is reported as [`SimOutcome::Reverted`] so the caller
 /// can skip the opportunity, and transport/DB problems surface as `Err` for
 /// RPC fallback.
-pub fn estimate_gas_local<P: Provider>(
+pub async fn estimate_gas_local<P: Provider>(
     provider: P,
     contract: Address,
     owner: Address,
     params: ArbParams,
     block: alloy::eips::BlockId,
 ) -> Result<crate::sim::SimOutcome> {
+    // Block/chain context from the same block the state reads pin to; a
+    // header fetch failure keeps the sim usable on the default context.
+    let env = crate::sim::fetch_sim_env(&provider, block).await.ok();
     let calldata = IFlashArbitrage::executeCall { params }.abi_encode().into();
-    crate::sim::simulate_call(provider, contract, owner, calldata, block)
+    crate::sim::simulate_call(provider, contract, owner, calldata, block, env)
 }
 
 /// Broadcast `execute` and return as soon as the node accepts the tx,

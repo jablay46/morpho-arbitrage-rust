@@ -11,7 +11,7 @@ use alloy::primitives::{Address, Bytes};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol_types::SolCall;
-use morpho_arbitrage_bot::sim::{simulate_call, SimOutcome};
+use morpho_arbitrage_bot::sim::{fetch_sim_env, simulate_call, SimOutcome};
 use std::str::FromStr;
 
 const SLIPSTREAM_FACTORY: &str = "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A";
@@ -47,12 +47,16 @@ async fn assert_local_matches_node<P: Provider + Clone>(
         .expect("eth_call succeeds")
         .to_vec();
 
+    let env = fetch_sim_env(&provider, revm::database::BlockId::number(block))
+        .await
+        .expect("sim block context resolves");
     let outcome = simulate_call(
         provider,
         to,
         Address::ZERO,
         Bytes::from(calldata),
         revm::database::BlockId::number(block),
+        Some(env),
     )
     .expect("local sim executes");
     match outcome {

@@ -16,9 +16,11 @@
 use alloy::primitives::{Address, Bytes, TxKind, U256};
 use alloy::providers::Provider;
 use eyre::{eyre, Result};
-use revm::context::TxEnv;
+use revm::context::{BlockEnv, TxEnv};
+use revm::context_interface::block::BlobExcessGasAndPrice;
 use revm::database::{AlloyDB, BlockId, CacheDB};
 use revm::database_interface::WrapDatabaseAsync;
+use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
 /// Gas ceiling handed to the EVM for the simulated call. Deliberately far
@@ -38,6 +40,43 @@ pub enum SimOutcome {
     Reverted(String),
 }
 
+/// Block + chain context for the simulation, fetched from the same block
+/// `AlloyDB` is pinned to. Without it the EVM would execute in a default
+/// context (wrong number/timestamp/basefee/coinbase/prevrandao/chain id)
+/// while reading historical state, and contracts inspecting block context
+/// would diverge from the node's own estimate.
+pub struct SimEnv {
+    pub block: BlockEnv,
+    pub chain_id: u64,
+}
+
+/// Fetch the header of `block` and the chain id, and build the matching
+/// revm block environment.
+pub async fn fetch_sim_env<P: Provider>(provider: &P, block: BlockId) -> Result<SimEnv> {
+    let header = provider
+        .get_block(block)
+        .await?
+        .ok_or_else(|| eyre!("block {block:?} not found for local sim"))?
+        .header;
+    let chain_id = provider.get_chain_id().await?;
+    Ok(SimEnv {
+        block: BlockEnv {
+            number: U256::from(header.number),
+            beneficiary: header.beneficiary,
+            timestamp: U256::from(header.timestamp),
+            gas_limit: header.gas_limit,
+            basefee: header.base_fee_per_gas.unwrap_or(0),
+            difficulty: U256::ZERO,
+            prevrandao: Some(header.mix_hash),
+            blob_excess_gas_and_price: header
+                .excess_blob_gas
+                .map(|e| BlobExcessGasAndPrice::new(e, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE)),
+            ..Default::default()
+        },
+        chain_id,
+    })
+}
+
 /// Execute `calldata` against `contract` from `owner` in a local revm
 /// instance, with chain state lazily fetched from `provider` at `block`.
 ///
@@ -50,6 +89,7 @@ pub fn simulate_call<P: Provider>(
     owner: Address,
     calldata: Bytes,
     block: BlockId,
+    env: Option<SimEnv>,
 ) -> Result<SimOutcome> {
     let alloy_db = AlloyDB::new(provider, block);
     let async_db = WrapDatabaseAsync::new(alloy_db)
@@ -59,7 +99,15 @@ pub fn simulate_call<P: Provider>(
     // this one execution.
     let db = CacheDB::new(async_db);
 
+    // Populate the block/chain context from the same block the DB reads
+    // are pinned to when the caller supplied it; otherwise fall back to
+    // revm's default context (legacy callers).
+    let (block_env, chain_id) = match &env {
+        Some(e) => (e.block.clone(), Some(e.chain_id)),
+        None => (BlockEnv::default(), None),
+    };
     let ctx = Context::mainnet()
+        .with_block(block_env)
         .modify_cfg_chained(|cfg| {
             // Simulation must mirror eth_estimateGas semantics: the call is
             // unsigned, the caller may not pay for gas, and the nonce is not
@@ -68,17 +116,29 @@ pub fn simulate_call<P: Provider>(
             cfg.disable_balance_check = true;
             cfg.disable_base_fee = true;
             cfg.disable_eip3607 = true;
+            if let Some(id) = chain_id {
+                cfg.chain_id = id;
+            }
         })
         .with_db(db);
     let mut evm = ctx.build_mainnet();
 
+    // Cap the tx gas like the node does: at the block gas limit when the
+    // header is known, else at the flat simulation ceiling.
+    let gas_cap = env
+        .as_ref()
+        .map(|e| e.block.gas_limit)
+        .unwrap_or(SIM_GAS_LIMIT)
+        .min(SIM_GAS_LIMIT);
     let tx = TxEnv::builder()
         .caller(owner)
         .kind(TxKind::Call(contract))
         .data(calldata)
         .value(U256::ZERO)
-        .gas_limit(SIM_GAS_LIMIT)
+        .gas_limit(gas_cap)
         .gas_price(0)
+        // Unsigned call: no tx chain id, like eth_estimateGas/eth_call.
+        .chain_id(None)
         .build()
         .map_err(|e| eyre!("invalid sim tx: {e}"))?;
 
