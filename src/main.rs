@@ -893,7 +893,11 @@ where
                     }
                 }
             }
-            cache.state.last_refresh_at = std::time::Instant::now();
+            // Only clean rounds reset the periodic timer. After a failed
+            // (or partially failed) round, eligibility is governed solely
+            // by refresh_backoff_until — otherwise the 60s age interval
+            // would swallow the 15s/30s retry backoffs, and insert_at
+            // would reset the timer anyway on partial success.
             if n_failed > 0 {
                 cache.state.refresh_failures = cache.state.refresh_failures.saturating_add(1);
                 let backoff_secs = rpc_backoff_secs(cache.state.refresh_failures);
@@ -904,6 +908,7 @@ where
                     backoff_secs, "CL refresh hit errors; backing off"
                 );
             } else {
+                cache.state.last_refresh_at = std::time::Instant::now();
                 cache.state.refresh_failures = 0;
                 cache.state.refresh_backoff_until = None;
             }

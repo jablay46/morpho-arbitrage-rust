@@ -228,10 +228,9 @@ const MULTICALL_CHUNK: usize = 256;
 /// Execute (target, calldata) reads pinned to `block` as a handful of RPC
 /// requests via Multicall3 `aggregate3`: each sub-call is allowed to fail
 /// independently, and per-call outcomes are returned in order (`Err`
-/// carries the revert data, or the per-call RPC error text when the
-/// fallback path was used). If the aggregate3 call itself cannot run (the
-/// chain lacks Multicall3, or the response does not decode), falls back to
-/// a plain JSON-RPC batch — same result shape, at batch per-call cost.
+/// carries the revert data). RPC-level failures are propagated to the
+/// caller; a plain JSON-RPC batch is used only when aggregate3 returns
+/// undecodable output, i.e. the chain has no Multicall3 deployment.
 pub async fn run_eth_calls<P: Provider>(
     provider: &P,
     calls: &[(Address, Bytes)],
@@ -253,14 +252,22 @@ pub async fn run_eth_calls<P: Provider>(
         let tx = TransactionRequest::default()
             .to(MULTICALL3_ADDRESS)
             .input(calldata.into());
-        let results = match provider.call(tx).block(block).await {
-            Ok(raw) => match IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
-                Ok(r) => r,
-                // No code at the address returns empty data successfully —
-                // treat undecodable output as "no Multicall3 here".
-                Err(_) => return batch_eth_calls(provider, calls, block).await,
-            },
-            Err(_) => return batch_eth_calls(provider, calls, block).await,
+        // RPC-level errors (429 throttling, timeouts, transport) are
+        // propagated: falling back to a per-call batch here would fire a
+        // much larger metered burst at exactly the moment the provider is
+        // failing, and callers' backoff logic would never see the error.
+        let raw = provider.call(tx).block(block).await?;
+        let results = match IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
+            Ok(r) => r,
+            // A successful call with undecodable output means the address
+            // holds no Multicall3 code on this chain. Batch-execute only the
+            // chunks not already done — earlier chunks succeeded and must
+            // not be re-executed.
+            Err(_) => {
+                let rest = batch_eth_calls(provider, &calls[out.len()..], block).await?;
+                out.extend(rest);
+                return Ok(out);
+            }
         };
         for r in results {
             out.push(if r.success {
@@ -273,8 +280,9 @@ pub async fn run_eth_calls<P: Provider>(
     Ok(out)
 }
 
-/// JSON-RPC batch fallback for [`run_eth_calls`]: one HTTP request but the
-/// provider still meters every sub-call individually.
+/// JSON-RPC batch path for chains without Multicall3 (see
+/// [`run_eth_calls`]): one HTTP request, but the provider still meters
+/// every sub-call individually.
 async fn batch_eth_calls<P: Provider>(
     provider: &P,
     calls: &[(Address, Bytes)],
@@ -295,10 +303,10 @@ async fn batch_eth_calls<P: Provider>(
     batch.send().await.map_err(eyre::Error::from)?;
     let mut out = Vec::with_capacity(waiters.len());
     for w in waiters {
-        out.push(match w.await {
-            Ok(raw) => Ok(raw),
-            Err(e) => Err(Bytes::from(e.to_string().into_bytes())),
-        });
+        // Propagate per-call RPC errors (429s surface here) instead of
+        // degrading them to per-call failures that look like reverts —
+        // the caller's backoff must see throttling to react to it.
+        out.push(Ok(w.await?));
     }
     Ok(out)
 }
