@@ -64,6 +64,7 @@ pub fn simulate_call<P: Provider>(
             cfg.disable_nonce_check = true;
             cfg.disable_balance_check = true;
             cfg.disable_base_fee = true;
+            cfg.disable_eip3607 = true;
         })
         .with_db(db);
     let mut evm = ctx.build_mainnet();
