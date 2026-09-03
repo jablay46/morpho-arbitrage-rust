@@ -564,6 +564,9 @@ where
         }
         for l in &block_logs {
             apply_pool_log(&mut cache.state, l);
+            if let Some(b) = l.block_number {
+                cache.state.advance_to(b);
+            }
         }
         // Pending overlay: clone the pool's sealed state on first touch,
         // then fold preconfirmed events on top. Sealed scans never see it.
@@ -620,12 +623,23 @@ type InflightFlag = Arc<std::sync::atomic::AtomicBool>;
 
 /// Look up a CL venue's bootstrapped state by real pool address; V2 pool
 /// lookups (Address::ZERO) yield None so the caller falls back to RPC.
-fn cached_cl(cache: &VenueCache, pool: Address) -> Option<&PoolState> {
+fn cached_cl<'c>(
+    cache: &'c VenueCache,
+    pool: Address,
+    want_pending: bool,
+) -> Option<std::borrow::Cow<'c, PoolState>> {
     if pool == Address::ZERO {
         return None;
     }
-    match cache.state.get(&pool) {
-        Some(PoolState::Cl { .. }) => cache.state.get(&pool),
+    // Sealed scans read sealed state only; pending-triggered scans read
+    // the sealed state with the preconfirmed overlay folded in.
+    let resolved = if want_pending {
+        cache.state.resolved(&pool, &cache.pending)
+    } else {
+        cache.state.get(&pool).map(std::borrow::Cow::Borrowed)
+    }?;
+    match resolved.as_ref() {
+        PoolState::Cl { .. } => Some(resolved),
         _ => None,
     }
 }
@@ -791,9 +805,42 @@ where
             );
         }
     }
+    // Refresh local CL state at the SAME block the RPC legs will be
+    // priced at, at most once per STATE_REFRESH_SECS — BEFORE selecting
+    // RPC requests, so request selection and quote assembly see the same
+    // cache. A pool whose refresh fails is dropped here and priced via
+    // QuoterV2 this scan; it never reappears as a phantom RPC result.
+    if cache.state.last_refresh_at.elapsed().as_secs() >= cfg.state_refresh_secs {
+        let pin = if want_pending {
+            provider.get_block_number().await.unwrap_or(0)
+        } else {
+            block.as_u64().unwrap_or(0)
+        };
+        if pin != 0 {
+            let mut n_ok = 0usize;
+            for pool in cache.v3_pairs.clone() {
+                match bootstrap_cl_at(provider, pool, pin).await {
+                    Ok(ps) => {
+                        cache.state.insert_at(pool, ps, pin);
+                        n_ok += 1;
+                    }
+                    Err(e) => {
+                        cache.state.remove(&pool);
+                        cache.pending.remove(&pool);
+                        warn!(pool = %pool, error = %e, "CL state refresh failed; using QuoterV2")
+                    }
+                }
+            }
+            cache.state.last_refresh_at = std::time::Instant::now();
+            if n_ok > 0 {
+                cache.pending = StateStore::new(); // pre-pin overlay is invalid
+                debug!(pools = n_ok, pin, "local CL state refreshed at scan block");
+            }
+        }
+    }
     let mut leg1_requests = Vec::new();
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
-        if cached_cl(cache, cache.v3_pairs[j]).is_some() {
+        if cached_cl(cache, cache.v3_pairs[j], want_pending).is_some() {
             continue;
         }
         let venue = &cfg.venues[idx];
@@ -811,39 +858,6 @@ where
     }
     let snapshot = fetch_scan_snapshot(provider, &cache.v2_pairs, &leg1_requests, block).await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
-
-    // Refresh local CL state at the SAME block the RPC legs were priced
-    // at, at most once per STATE_REFRESH_SECS. Polling mode has no event
-    // stream; event-driven mode gets exact pinning too (overlay events
-    // after the pin still fold on top). A failed refresh drops the pool
-    // to the QuoterV2 fallback for this scan.
-    if cache.state.last_refresh_at.elapsed().as_secs() >= cfg.state_refresh_secs {
-        let pin = if want_pending {
-            provider.get_block_number().await.unwrap_or(0)
-        } else {
-            block.as_u64().unwrap_or(0)
-        };
-        if pin != 0 {
-            let mut refreshed = StateStore::new();
-            let mut n_ok = 0usize;
-            for pool in cache.v3_pairs.clone() {
-                match bootstrap_cl_at(provider, pool, pin).await {
-                    Ok(ps) => {
-                        refreshed.insert_at(pool, ps, pin);
-                        n_ok += 1;
-                    }
-                    Err(e) => {
-                        warn!(pool = %pool, error = %e, "CL state refresh failed; using QuoterV2")
-                    }
-                }
-            }
-            if n_ok > 0 {
-                cache.state = refreshed;
-                cache.pending = StateStore::new(); // pre-pin overlay is invalid
-                debug!(pools = n_ok, pin, "local CL state refreshed at scan block");
-            }
-        }
-    }
 
     // Assemble leg-1 outputs per venue; V3 quotes come straight from the
     // snapshot, V2 outputs are exact constant-product math on reserves.
@@ -882,11 +896,11 @@ where
     let mut backfill_sizes: Vec<(usize, Vec<Option<U256>>)> = Vec::new(); // (v3 idx, per-size local results)
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
         let pool = cache.v3_pairs[j];
-        if let Some(ps) = cached_cl(cache, pool) {
+        if let Some(ps) = cached_cl(cache, pool, want_pending) {
             // Local CL quote path — identical math to the venue's quoter,
             // validated against on-chain Quoter in tests/chain_cl.rs.
             let zero_for_one = cache.pair_tokens[idx].token0 == cfg.loan_token;
-            let lo = ps;
+            let lo = ps.as_ref();
             let leg1: Vec<Option<U256>> = sizes
                 .iter()
                 .map(|&s| cl_quote(s, lo, zero_for_one))
@@ -1007,14 +1021,14 @@ where
         };
         if let Some(reserves) = legs[s].v2_reserves {
             legs[s].quotes.leg2 = v2_quotes(venue_idx, reserves, venue.fee_bps, &[], &inputs).leg2;
-        } else if let Some(ps) = cached_cl(cache, pool) {
+        } else if let Some(ps) = cached_cl(cache, pool, want_pending) {
             // Local CL path for leg 2 (quote -> loan). Inputs that fail
             // locally are backfilled via QuoterV2 below - a partial cache
             // miss must not silently drop the (leg1, size) pair.
             let zero_for_one = cache.pair_tokens[venue_idx].token0 == cfg.quote_token;
             let mut leg2: Vec<(U256, Option<U256>)> = inputs
                 .iter()
-                .map(|&q| (q, cl_quote(q, ps, zero_for_one)))
+                .map(|&q| (q, cl_quote(q, ps.as_ref(), zero_for_one)))
                 .collect();
             let failed: Vec<U256> = leg2
                 .iter()

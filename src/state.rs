@@ -167,12 +167,15 @@ impl StateStore {
         self.block = None;
     }
 
-    /// Record that an event advanced this store past its pinned block.
     fn touch(&mut self) {
         self.last_event_at = Some(std::time::Instant::now());
-        if let Some(b) = &mut self.block {
-            *b += 1;
-        }
+    }
+
+    /// Record the actual block of an applied event. Several logs in one
+    /// block keep the same pin; a later block raises it — never fabricated.
+    pub fn advance_to(&mut self, block: u64) {
+        self.last_event_at = Some(std::time::Instant::now());
+        self.block = Some(self.block.map_or(block, |b| b.max(block)));
     }
 
     /// Borrowed state when unmodified by `pending`, else the sealed state
