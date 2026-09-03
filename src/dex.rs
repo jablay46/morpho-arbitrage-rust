@@ -105,6 +105,18 @@ sol! {
         function token1() external view returns (address);
     }
 
+    // CL pool state reads (V3 + Slipstream share this layout; needed to
+    // bootstrap the local PoolState in state.rs/cl_math.rs).
+    #[sol(rpc)]
+    interface IClPoolState {
+        function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
+        function liquidity() external view returns (uint128);
+        function fee() external view returns (uint24);
+        function tickSpacing() external view returns (int24);
+        function tickBitmap(int16 wordPosition) external view returns (uint256);
+        function ticks(int24 tick) external view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 tickCumulativeOutside1, uint160 secondsPerLiquidityOutsideX128_2, uint32 tickCumulativeOutside2, bool initialized);
+    }
+
     struct QuoteExactInputSingleParams {
         address tokenIn;
         address tokenOut;
@@ -270,8 +282,9 @@ pub async fn resolve_pool<P: Provider>(provider: &P, q: &PoolQuery) -> Result<Ad
                 .getPool(
                     token_a,
                     token_b,
-                    alloy::primitives::aliases::I24::try_from(fee_tier)
-                        .map_err(|_| eyre::eyre!("slipstream tickSpacing {fee_tier} out of i24 range"))?,
+                    alloy::primitives::aliases::I24::try_from(fee_tier).map_err(|_| {
+                        eyre::eyre!("slipstream tickSpacing {fee_tier} out of i24 range")
+                    })?,
                 )
                 .call()
                 .await?
@@ -398,6 +411,11 @@ pub struct ScanSnapshot {
     /// exceeds the pool's liquidity).
     pub v3_quotes: Vec<Option<U256>>,
     pub gas_price: U256,
+    /// The block the snapshot was pinned to, when it was read from a
+    /// numbered block (None for a pending-tag pin). Local pool-state
+    /// refreshes are pinned to the same block so every leg prices off the
+    /// exact same chain state.
+    pub pinned_block: Option<u64>,
 }
 
 /// Encode one quote request as an eth_call transaction against its quoter.
@@ -534,6 +552,7 @@ pub async fn fetch_scan_snapshot<P: Provider>(
         v2_raw,
         v3_quotes,
         gas_price,
+        pinned_block: block.as_u64(),
     })
 }
 

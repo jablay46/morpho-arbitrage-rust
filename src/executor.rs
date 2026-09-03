@@ -123,6 +123,28 @@ pub async fn estimate_gas<P: Provider>(
     Ok(U256::from(gas))
 }
 
+/// Estimate gas for `execute` locally via revm instead of eth_estimateGas.
+/// The call is simulated against chain state at `block` fetched lazily
+/// through `provider`; the outcome mirrors eth_estimateGas: success carries
+/// gas used, a revert is reported as [`SimOutcome::Reverted`] so the caller
+/// can skip the opportunity, and transport/DB problems surface as `Err` for
+/// RPC fallback.
+pub async fn estimate_gas_local<P: Provider>(
+    provider: P,
+    contract: Address,
+    owner: Address,
+    params: ArbParams,
+    block: alloy::eips::BlockId,
+) -> Result<crate::sim::SimOutcome> {
+    // Block/chain context from the same block the state reads pin to. A
+    // failed fetch is an Err so the caller falls back to eth_estimateGas —
+    // executing with a default context against pinned state can diverge
+    // from the node's verdict.
+    let env = crate::sim::fetch_sim_env(&provider, block).await?;
+    let calldata = IFlashArbitrage::executeCall { params }.abi_encode().into();
+    crate::sim::simulate_call(provider, contract, owner, calldata, block, Some(env))
+}
+
 /// Broadcast `execute` and return as soon as the node accepts the tx,
 /// without waiting for inclusion. Waiting for the receipt would block the
 /// scan loop for at least one block per trade, blinding the bot to the
@@ -197,11 +219,12 @@ where
 {
     use alloy::network::TransactionBuilder;
 
-    let tx = TransactionRequest::default()
-        .with_to(contract)
-        .with_input(alloy::primitives::Bytes::from(
-            IFlashArbitrage::executeCall { params }.abi_encode(),
-        ));
+    let tx =
+        TransactionRequest::default()
+            .with_to(contract)
+            .with_input(alloy::primitives::Bytes::from(
+                IFlashArbitrage::executeCall { params }.abi_encode(),
+            ));
     let pending = provider.send_transaction(tx).await?;
     let tx_hash = *pending.tx_hash();
     tracing::debug!(tx = %tx_hash, "execute_sync: broadcast, awaiting flash receipt");
@@ -384,6 +407,7 @@ mod tests {
             gas_price_wei: None,
             slippage_bps: 50,
             poll_interval_ms: 0,
+            state_refresh_secs: 60,
             sweep_interval_blocks: 10,
             min_scan_interval_ms: 0,
             dry_run: true,
@@ -393,6 +417,7 @@ mod tests {
             use_flashblock_sync: false,
             use_pending_logs: false,
             use_pending_sim: false,
+            use_local_sim: false,
         };
         let opp = Opportunity {
             first: 0,
@@ -433,6 +458,9 @@ mod tests {
         let encoded = venue.abi_encode();
         let decoded = SwapLeg::abi_decode(&encoded).expect("leg decodes");
         assert_eq!(decoded.kind, 4);
-        assert_eq!(decoded.feeTier, alloy::primitives::Uint::<24, 1>::from(100u32));
+        assert_eq!(
+            decoded.feeTier,
+            alloy::primitives::Uint::<24, 1>::from(100u32)
+        );
     }
 }

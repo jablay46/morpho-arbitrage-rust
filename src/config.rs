@@ -85,6 +85,10 @@ pub struct Config {
     pub slippage_bps: u64,
     /// Poll interval between scans, milliseconds.
     pub poll_interval_ms: u64,
+    /// Re-bootstrap local pool state at most this often (seconds). Event
+    /// streams keep state fresh; in polling mode this is the only update
+    /// path, so scans pin state no older than one refresh interval.
+    pub state_refresh_secs: u64,
     /// Safety-net sweep interval in blocks for event-driven mode: even when
     /// no pool event fires, a full scan is forced at least every N blocks.
     pub sweep_interval_blocks: u64,
@@ -124,6 +128,14 @@ pub struct Config {
     /// reverts-on-inclusion. Requires `use_pending_state` semantics; falls
     /// back to `latest` on error.
     pub use_pending_sim: bool,
+    /// Estimate gas for `execute` locally with revm instead of
+    /// `eth_estimateGas`. The simulation runs in-process against chain state
+    /// fetched lazily at the scan's pinned block; any DB/transport error
+    /// falls back to the node's `eth_estimateGas`, so enabling this is
+    /// strictly additive. Trades one node round-trip for ~tens of lazy
+    /// `eth_getStorageAt`/`eth_getCode` fetches on the first simulation of a
+    /// block — keep it off on RPS-limited plans.
+    pub use_local_sim: bool,
 }
 
 impl Config {
@@ -383,6 +395,15 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(500);
 
+        // Local pool-state snapshots age: event streams fold every pool
+        // event in, but polling mode has no stream, so without a periodic
+        // re-bootstrap the scan would price off startup state forever.
+        let state_refresh_secs = env::var("STATE_REFRESH_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(1);
+
         // A sweep interval of 0 would disable the safety net entirely;
         // clamp to 1 (sweep every block, i.e. pre-log-trigger behavior).
         let sweep_interval_blocks = env::var("SWEEP_INTERVAL_BLOCKS")
@@ -392,16 +413,18 @@ impl Config {
             .max(1);
 
         // Minimum wall-clock gap between event-driven scans. Active pairs
-        // emit pool events nearly every block, and each scan costs several
-        // JSON-RPC requests; without a floor the bot bursts past the RPC
-        // plan's RPS limit. Events arriving during the cooldown are not
-        // lost: the next scan reads the latest block, which already
-        // includes their state changes.
+        // emit pool events nearly every block (every ~200ms flashblock with
+        // USE_PENDING_LOGS), and each scan costs several JSON-RPC requests;
+        // without a floor the bot bursts past the RPC plan's RPS limit.
+        // Events arriving during the cooldown are not lost: the next scan
+        // reads the latest block, which already includes their state
+        // changes. Defaults to 2000ms (~0.5 scan/s), which keeps even a
+        // 25 RPS plan comfortable; set explicitly to 0 to disable the cap.
         let min_scan_interval_ms = match env::var("MIN_SCAN_INTERVAL_MS") {
             Ok(raw) => raw
                 .parse::<u64>()
                 .map_err(|e| eyre!("invalid MIN_SCAN_INTERVAL_MS '{raw}': {e}"))?,
-            Err(_) => 0,
+            Err(_) => 2000,
         };
 
         // Uniswap QuoterV2 on Base. This address is Base-specific; other
@@ -455,12 +478,18 @@ impl Config {
         // an eth_call per opportunity); default it off so it must be opted
         // into explicitly to avoid extra RPC cost on RPS-limited plans.
         let use_pending_sim = parse_bool("USE_PENDING_SIM", false)?;
+        let use_local_sim = parse_bool("USE_LOCAL_SIM", false)?;
         // Convenience master switch: FLASHBLOCKS=false disables all four at
         // once without touching the individual flags. Keeps .env minimal.
         let flashblocks = parse_bool("FLASHBLOCKS", true)?;
         let (use_pending_state, use_flashblock_sync, use_pending_logs, use_pending_sim) =
             if flashblocks {
-                (use_pending_state, use_flashblock_sync, use_pending_logs, use_pending_sim)
+                (
+                    use_pending_state,
+                    use_flashblock_sync,
+                    use_pending_logs,
+                    use_pending_sim,
+                )
             } else {
                 (false, false, false, false)
             };
@@ -480,6 +509,7 @@ impl Config {
             gas_price_wei,
             slippage_bps,
             poll_interval_ms,
+            state_refresh_secs,
             sweep_interval_blocks,
             min_scan_interval_ms,
             dry_run,
@@ -489,6 +519,7 @@ impl Config {
             use_flashblock_sync,
             use_pending_logs,
             use_pending_sim,
+            use_local_sim,
         })
     }
 }
