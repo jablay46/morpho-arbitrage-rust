@@ -180,8 +180,14 @@ async fn probe_flashblocks_via_ws(cfg: &Config) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Respect RUST_LOG if set; otherwise default to "info". Using
+    // `try_from_default_env` avoids adding an "info" directive on top of the
+    // user's RUST_LOG, which would silently cap it back to info and hide
+    // debug/trace output.
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_env_filter(env_filter)
         .init();
 
     let cli = Cli::parse();
