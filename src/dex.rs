@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
@@ -195,6 +196,111 @@ sol! {
     interface IAerodromeRouter {
         function defaultFactory() external view returns (address);
     }
+
+    // Multicall3 (canonical deployment, same address on Base and most EVM
+    // chains): runs many eth_calls inside ONE RPC request. Providers bill
+    // JSON-RPC batches per sub-call, but an aggregate3 eth_call is a single
+    // request no matter how many sub-calls it carries.
+    #[sol(rpc)]
+    interface IMulticall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+        struct Result {
+            bool success;
+            bytes returnData;
+        }
+        function aggregate3(Call3[] memory calls) external payable returns (Result[] memory returnData);
+    }
+}
+
+/// Canonical Multicall3 deployment address (Base mainnet and most chains).
+pub const MULTICALL3_ADDRESS: Address =
+    alloy::primitives::address!("cA11bde05977b3631167028862bE2a173976CA11");
+
+/// Sub-calls per aggregate3 request: bounds the eth_call gas and response
+/// size so a large call set (e.g. hundreds of `ticks()` reads) neither hits
+/// the provider's eth_call gas cap nor its response-size limit.
+const MULTICALL_CHUNK: usize = 256;
+
+/// Execute (target, calldata) reads pinned to `block` as a handful of RPC
+/// requests via Multicall3 `aggregate3`: each sub-call is allowed to fail
+/// independently, and per-call outcomes are returned in order (`Err`
+/// carries the revert data, or the per-call RPC error text when the
+/// fallback path was used). If the aggregate3 call itself cannot run (the
+/// chain lacks Multicall3, or the response does not decode), falls back to
+/// a plain JSON-RPC batch — same result shape, at batch per-call cost.
+pub async fn run_eth_calls<P: Provider>(
+    provider: &P,
+    calls: &[(Address, Bytes)],
+    block: alloy::eips::BlockId,
+) -> Result<Vec<std::result::Result<Bytes, Bytes>>> {
+    let mut out: Vec<std::result::Result<Bytes, Bytes>> = Vec::with_capacity(calls.len());
+    for chunk in calls.chunks(MULTICALL_CHUNK) {
+        let call3s: Vec<IMulticall3::Call3> = chunk
+            .iter()
+            .map(|(target, data)| IMulticall3::Call3 {
+                target: *target,
+                allowFailure: true,
+                callData: data.clone(),
+            })
+            .collect();
+        let calldata: Bytes = IMulticall3::aggregate3Call { calls: call3s }
+            .abi_encode()
+            .into();
+        let tx = TransactionRequest::default()
+            .to(MULTICALL3_ADDRESS)
+            .input(calldata.into());
+        let results = match provider.call(tx).block(block).await {
+            Ok(raw) => match IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
+                Ok(r) => r,
+                // No code at the address returns empty data successfully —
+                // treat undecodable output as "no Multicall3 here".
+                Err(_) => return batch_eth_calls(provider, calls, block).await,
+            },
+            Err(_) => return batch_eth_calls(provider, calls, block).await,
+        };
+        for r in results {
+            out.push(if r.success {
+                Ok(r.returnData)
+            } else {
+                Err(r.returnData)
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// JSON-RPC batch fallback for [`run_eth_calls`]: one HTTP request but the
+/// provider still meters every sub-call individually.
+async fn batch_eth_calls<P: Provider>(
+    provider: &P,
+    calls: &[(Address, Bytes)],
+    block: alloy::eips::BlockId,
+) -> Result<Vec<std::result::Result<Bytes, Bytes>>> {
+    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
+    let mut waiters = Vec::with_capacity(calls.len());
+    for (target, data) in calls {
+        let tx = TransactionRequest::default()
+            .to(*target)
+            .input(data.clone().into());
+        waiters.push(
+            batch
+                .add_call::<_, Bytes>("eth_call", &(tx, block))
+                .map_err(eyre::Error::from)?,
+        );
+    }
+    batch.send().await.map_err(eyre::Error::from)?;
+    let mut out = Vec::with_capacity(waiters.len());
+    for w in waiters {
+        out.push(match w.await {
+            Ok(raw) => Ok(raw),
+            Err(e) => Err(Bytes::from(e.to_string().into_bytes())),
+        });
+    }
+    Ok(out)
 }
 
 /// Reserves of a V2-style pool, normalized so `reserve_in` always corresponds
@@ -419,9 +525,9 @@ pub struct ScanSnapshot {
 }
 
 /// Encode one quote request as an eth_call transaction against its quoter.
-fn quote_tx(req: &QuoteRequest) -> alloy::rpc::types::eth::TransactionRequest {
-    use alloy::rpc::types::eth::TransactionRequest;
-    let input: Bytes = if req.slipstream {
+/// Calldata for a QuoterV2/Slipstream `quoteExactInputSingle` eth_call.
+fn quote_calldata(req: &QuoteRequest) -> Bytes {
+    if req.slipstream {
         IQuoterSlipstream::quoteExactInputSingleCall {
             params: QuoteExactInputSingleClParams {
                 tokenIn: req.token_in,
@@ -448,10 +554,7 @@ fn quote_tx(req: &QuoteRequest) -> alloy::rpc::types::eth::TransactionRequest {
         }
         .abi_encode()
         .into()
-    };
-    TransactionRequest::default()
-        .to(req.quoter)
-        .input(input.into())
+    }
 }
 
 fn decode_quote(raw: &Bytes) -> Option<U256> {
@@ -476,51 +579,43 @@ pub async fn fetch_scan_snapshot<P: Provider>(
     quotes: &[QuoteRequest],
     block: alloy::eips::BlockId,
 ) -> Result<ScanSnapshot> {
-    use alloy::rpc::types::eth::TransactionRequest;
-
-    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
-    let mut waiters = Vec::with_capacity(v2_venues.len() + quotes.len() + 1);
-
+    // Reserves + leg quotes ride one Multicall3 aggregate3 (a single RPC
+    // request regardless of venue/size count); eth_gasPrice is not an
+    // eth_call and goes alongside as its own request.
+    let mut calls: Vec<(Address, Bytes)> = Vec::with_capacity(v2_venues.len() + quotes.len());
     for pair in v2_venues {
-        let tx = TransactionRequest::default()
-            .to(*pair)
-            .input(IUniswapV2Pair::getReservesCall {}.abi_encode().into());
-        waiters.push(
-            batch
-                .add_call::<_, Bytes>("eth_call", &(tx, block))
-                .map_err(eyre::Error::from)?,
-        );
+        calls.push((
+            *pair,
+            IUniswapV2Pair::getReservesCall {}.abi_encode().into(),
+        ));
     }
-    let mut quote_waiters = Vec::with_capacity(quotes.len());
     for req in quotes {
-        quote_waiters.push(
-            batch
-                .add_call::<_, Bytes>("eth_call", &(quote_tx(req), block))
-                .map_err(eyre::Error::from)?,
-        );
+        calls.push((req.quoter, quote_calldata(req)));
     }
-    let gas_price_waiter = batch
-        .add_call::<_, U256>("eth_gasPrice", &())
-        .map_err(eyre::Error::from)?;
-
-    batch.send().await.map_err(eyre::Error::from)?;
+    let (results, gas_price) = futures::join!(
+        run_eth_calls(provider, &calls, block),
+        provider.get_gas_price()
+    );
+    let results = results?;
+    let gas_price = U256::from(gas_price.map_err(eyre::Error::from)?);
 
     // Per-venue error handling: a single reverted call (dead/misconfigured
     // pool) yields None for that venue instead of failing the whole scan.
     let mut v2_raw = Vec::with_capacity(v2_venues.len());
-    for waiter in waiters {
-        let entry = match waiter.await {
-            Ok(raw) => IUniswapV2Pair::getReservesCall::abi_decode_returns(&raw)
+    let mut v3_quotes = Vec::with_capacity(quotes.len());
+    let mut outcomes = results.into_iter();
+    for _ in v2_venues {
+        let entry = match outcomes.next() {
+            Some(Ok(raw)) => IUniswapV2Pair::getReservesCall::abi_decode_returns(&raw)
                 .ok()
                 .map(|r| (U256::from(r.reserve0), U256::from(r.reserve1))),
-            Err(_) => None,
+            _ => None,
         };
         v2_raw.push(entry);
     }
-    let mut v3_quotes = Vec::with_capacity(quotes.len());
-    for (waiter, req) in quote_waiters.into_iter().zip(quotes.iter()) {
-        v3_quotes.push(match waiter.await {
-            Ok(raw) => match decode_quote(&raw) {
+    for req in quotes {
+        v3_quotes.push(match outcomes.next() {
+            Some(Ok(raw)) => match decode_quote(&raw) {
                 Some(q) => Some(q),
                 None => {
                     debug!(
@@ -533,20 +628,20 @@ pub async fn fetch_scan_snapshot<P: Provider>(
                     None
                 }
             },
-            Err(e) => {
+            Some(Err(e)) => {
                 debug!(
                     token_in = %req.token_in,
                     token_out = %req.token_out,
                     fee_tier = req.fee_tier,
                     amount_in = %req.amount_in,
-                    error = %e,
+                    error = %alloy::hex::encode(&e),
                     "V3 quote reverted"
                 );
                 None
             }
+            None => None,
         });
     }
-    let gas_price = gas_price_waiter.await.map_err(eyre::Error::from)?;
 
     Ok(ScanSnapshot {
         v2_raw,
@@ -564,20 +659,14 @@ pub async fn fetch_quotes<P: Provider>(
     requests: &[QuoteRequest],
     block: alloy::eips::BlockId,
 ) -> Result<Vec<Option<U256>>> {
-    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
-    let mut waiters = Vec::with_capacity(requests.len());
-    for req in requests {
-        waiters.push(
-            batch
-                .add_call::<_, Bytes>("eth_call", &(quote_tx(req), block))
-                .map_err(eyre::Error::from)?,
-        );
-    }
-    batch.send().await.map_err(eyre::Error::from)?;
-
+    let calls: Vec<(Address, Bytes)> = requests
+        .iter()
+        .map(|r| (r.quoter, quote_calldata(r)))
+        .collect();
+    let results = run_eth_calls(provider, &calls, block).await?;
     let mut out = Vec::with_capacity(requests.len());
-    for waiter in waiters {
-        out.push(match waiter.await {
+    for res in results {
+        out.push(match res {
             Ok(raw) => decode_quote(&raw),
             Err(_) => None,
         });

@@ -13,7 +13,7 @@ use morpho_arbitrage_bot::dex::{
 };
 use morpho_arbitrage_bot::executor;
 use morpho_arbitrage_bot::sim::SimOutcome;
-use morpho_arbitrage_bot::state::{self, bootstrap_cl, bootstrap_cl_at, PoolState, StateStore};
+use morpho_arbitrage_bot::state::{self, bootstrap_cl_at, PoolState, StateStore};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
@@ -140,18 +140,20 @@ impl VenueCache {
         } else {
             false
         };
-        // Bootstrap every resolved CL pool into the local state store; a
-        // failed bootstrap just keeps that venue on the QuoterV2 fallback.
+        // Bootstrap every resolved CL pool into the local state store,
+        // pinned to ONE shared block (a single eth_getBlockNumber for the
+        // whole set); a failed bootstrap just keeps that venue on the
+        // QuoterV2 fallback.
         let mut state = StateStore::new();
-        for pool in v3_pairs.iter() {
-            match bootstrap_cl(provider, *pool).await {
+        for (pool, outcome) in state::bootstrap_cl_all(provider, &v3_pairs).await? {
+            match outcome {
                 Ok(ps) => {
                     let n_ticks = match &ps {
                         PoolState::Cl { ticks, .. } => ticks.len(),
                         PoolState::V2 { .. } => 0,
                     };
                     info!(pool = %pool, ticks = n_ticks, "CL pool bootstrapped into local state");
-                    state.insert(*pool, ps);
+                    state.insert(pool, ps);
                 }
                 Err(e) => {
                     warn!(pool = %pool, error = %e, "CL bootstrap failed; using QuoterV2 fallback")
@@ -457,6 +459,11 @@ where
         .checked_sub(std::time::Duration::from_secs(60))
         .unwrap_or_else(std::time::Instant::now);
     let min_gap = std::time::Duration::from_millis(cfg.min_scan_interval_ms);
+    // Consecutive scan failures (usually provider 429s) trigger an
+    // exponential cooldown: triggers arriving during the window are
+    // dropped, not queued, so a throttled endpoint gets breathing room.
+    let mut scan_failures = 0u32;
+    let mut scan_cooldown_until = std::time::Instant::now();
     loop {
         enum Trig {
             Sweep(u64),
@@ -602,7 +609,7 @@ where
         // Rate-limit scans: drop triggers arriving inside the cooldown
         // window instead of queueing them — by the next scan, `latest`
         // already includes their state changes.
-        if last_scan_at.elapsed() < min_gap {
+        if last_scan_at.elapsed() < min_gap || std::time::Instant::now() < scan_cooldown_until {
             continue;
         }
         last_scan_at = std::time::Instant::now();
@@ -611,8 +618,22 @@ where
             // Advance by the block the scan actually read (latest at scan
             // time), not the trigger block, so buffered events for blocks
             // already covered by that read don't fire redundant scans.
-            Ok(scanned) => last_scanned = last_scanned.max(scanned),
-            Err(e) => warn!(error = %e, "event-driven scan failed"),
+            Ok(scanned) => {
+                last_scanned = last_scanned.max(scanned);
+                scan_failures = 0;
+            }
+            Err(e) => {
+                scan_failures = scan_failures.saturating_add(1);
+                let backoff_secs = rpc_backoff_secs(scan_failures);
+                scan_cooldown_until =
+                    std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs);
+                warn!(
+                    error = %e,
+                    failures = scan_failures,
+                    backoff_secs,
+                    "event-driven scan failed; cooling down"
+                );
+            }
         }
     }
     warn!("block subscription ended; falling back to polling");
@@ -630,6 +651,17 @@ where
 /// competing duplicate that burns gas on revert. The flag is cleared by the
 /// background receipt watcher once the tx is included.
 type InflightFlag = Arc<std::sync::atomic::AtomicBool>;
+
+/// Exponential backoff after consecutive RPC failures (429s and friends):
+/// 15s, 30s, 60s, 120s, capped at 300s. A saturated provider needs quiet
+/// time to accept requests again; hammering it every scan only extends
+/// the throttling.
+fn rpc_backoff_secs(failures: u32) -> u64 {
+    15u64
+        .checked_shl(failures.saturating_sub(1))
+        .unwrap_or(300)
+        .min(300)
+}
 
 /// Look up a CL venue's bootstrapped state by real pool address; V2 pool
 /// lookups (Address::ZERO) yield None so the caller falls back to RPC.
@@ -772,10 +804,16 @@ where
     } else {
         0
     };
-    // Track the sealed block for sweep bookkeeping; in pending mode the
-    // preconfirmed state maps to the in-progress sealed block, so
-    // get_block_number (latest) is the correct watermark.
-    let block_number = provider.get_block_number().await?;
+    // Track the sealed block for sweep bookkeeping. In sealed mode the
+    // pinned `block` IS the sealed number — read_block_id already fetched
+    // it, so a second get_block_number would be a duplicate metered call.
+    // In pending mode the preconfirmed state maps to the in-progress
+    // sealed block, so get_block_number (latest) is the correct watermark.
+    let block_number = if want_pending {
+        provider.get_block_number().await?
+    } else {
+        block.as_u64().unwrap_or(0)
+    };
     debug!(
         block = ?block,
         block_number,
@@ -825,14 +863,22 @@ where
     // RPC requests, so request selection and quote assembly see the same
     // cache. A pool whose refresh fails is dropped here and priced via
     // QuoterV2 this scan; it never reappears as a phantom RPC result.
-    if !want_pending && cache.state.last_refresh_at.elapsed().as_secs() >= cfg.state_refresh_secs {
-        let pin = if want_pending {
-            provider.get_block_number().await.unwrap_or(0)
-        } else {
-            block.as_u64().unwrap_or(0)
-        };
+    // Refresh failures (typically provider 429s) back off exponentially so
+    // a saturated endpoint is not hammered by a full re-bootstrap every
+    // scan while it is throttling us.
+    let refresh_backed_off = cache
+        .state
+        .refresh_backoff_until
+        .is_some_and(|t| t > std::time::Instant::now());
+    if !want_pending
+        && !refresh_backed_off
+        && cache.state.last_refresh_at.elapsed().as_secs() >= cfg.state_refresh_secs
+    {
+        // want_pending is false here, so `block` is the sealed numbered pin.
+        let pin = block.as_u64().unwrap_or(0);
         if pin != 0 {
             let mut n_ok = 0usize;
+            let mut n_failed = 0usize;
             for pool in cache.v3_pairs.clone() {
                 match bootstrap_cl_at(provider, pool, pin).await {
                     Ok(ps) => {
@@ -842,11 +888,25 @@ where
                     Err(e) => {
                         cache.state.remove(&pool);
                         cache.pending.remove(&pool);
+                        n_failed += 1;
                         warn!(pool = %pool, error = %e, "CL state refresh failed; using QuoterV2")
                     }
                 }
             }
             cache.state.last_refresh_at = std::time::Instant::now();
+            if n_failed > 0 {
+                cache.state.refresh_failures = cache.state.refresh_failures.saturating_add(1);
+                let backoff_secs = rpc_backoff_secs(cache.state.refresh_failures);
+                cache.state.refresh_backoff_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs));
+                warn!(
+                    failures = cache.state.refresh_failures,
+                    backoff_secs, "CL refresh hit errors; backing off"
+                );
+            } else {
+                cache.state.refresh_failures = 0;
+                cache.state.refresh_backoff_until = None;
+            }
             if n_ok > 0 {
                 cache.pending = StateStore::new(); // pre-pin overlay is invalid
                 debug!(pools = n_ok, pin, "local CL state refreshed at scan block");
