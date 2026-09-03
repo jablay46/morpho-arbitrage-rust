@@ -123,6 +123,23 @@ pub async fn estimate_gas<P: Provider>(
     Ok(U256::from(gas))
 }
 
+/// Estimate gas for `execute` locally via revm instead of eth_estimateGas.
+/// The call is simulated against chain state at `block` fetched lazily
+/// through `provider`; the outcome mirrors eth_estimateGas: success carries
+/// gas used, a revert is reported as [`SimOutcome::Reverted`] so the caller
+/// can skip the opportunity, and transport/DB problems surface as `Err` for
+/// RPC fallback.
+pub fn estimate_gas_local<P: Provider>(
+    provider: P,
+    contract: Address,
+    owner: Address,
+    params: ArbParams,
+    block: alloy::eips::BlockId,
+) -> Result<crate::sim::SimOutcome> {
+    let calldata = IFlashArbitrage::executeCall { params }.abi_encode().into();
+    crate::sim::simulate_call(provider, contract, owner, calldata, block)
+}
+
 /// Broadcast `execute` and return as soon as the node accepts the tx,
 /// without waiting for inclusion. Waiting for the receipt would block the
 /// scan loop for at least one block per trade, blinding the bot to the
@@ -393,6 +410,7 @@ mod tests {
             use_flashblock_sync: false,
             use_pending_logs: false,
             use_pending_sim: false,
+            use_local_sim: false,
         };
         let opp = Opportunity {
             first: 0,

@@ -124,6 +124,14 @@ pub struct Config {
     /// reverts-on-inclusion. Requires `use_pending_state` semantics; falls
     /// back to `latest` on error.
     pub use_pending_sim: bool,
+    /// Estimate gas for `execute` locally with revm instead of
+    /// `eth_estimateGas`. The simulation runs in-process against chain state
+    /// fetched lazily at the scan's pinned block; any DB/transport error
+    /// falls back to the node's `eth_estimateGas`, so enabling this is
+    /// strictly additive. Trades one node round-trip for ~tens of lazy
+    /// `eth_getStorageAt`/`eth_getCode` fetches on the first simulation of a
+    /// block — keep it off on RPS-limited plans.
+    pub use_local_sim: bool,
 }
 
 impl Config {
@@ -457,6 +465,7 @@ impl Config {
         // an eth_call per opportunity); default it off so it must be opted
         // into explicitly to avoid extra RPC cost on RPS-limited plans.
         let use_pending_sim = parse_bool("USE_PENDING_SIM", false)?;
+        let use_local_sim = parse_bool("USE_LOCAL_SIM", false)?;
         // Convenience master switch: FLASHBLOCKS=false disables all four at
         // once without touching the individual flags. Keeps .env minimal.
         let flashblocks = parse_bool("FLASHBLOCKS", true)?;
@@ -491,6 +500,7 @@ impl Config {
             use_flashblock_sync,
             use_pending_logs,
             use_pending_sim,
+            use_local_sim,
         })
     }
 }

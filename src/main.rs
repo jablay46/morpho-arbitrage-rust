@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, U256};
 use clap::{Parser, Subcommand};
-use eyre::Result;
+use eyre::{eyre, Result};
 use morpho_arbitrage_bot::arbitrage::{find_opportunity, v2_quotes, VenueQuotes};
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
@@ -10,6 +10,7 @@ use morpho_arbitrage_bot::dex::{
 };
 use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::executor;
+use morpho_arbitrage_bot::sim::SimOutcome;
 use morpho_arbitrage_bot::state::{self, bootstrap_cl, PoolState, StateStore};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -657,7 +658,7 @@ async fn run_once_with_provider<P, B>(
     inflight: Option<&InflightFlag>,
 ) -> Result<u64>
 where
-    P: alloy::providers::Provider,
+    P: alloy::providers::Provider + Clone,
     B: alloy::providers::Provider + Clone + 'static,
 {
     let sizes = &cfg.loan_amounts;
@@ -959,9 +960,38 @@ where
         } else {
             None
         };
-        match executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional, sim_block)
-            .await
-        {
+        // When USE_LOCAL_SIM is on, try the in-process revm simulation
+        // first. A revert is a per-opportunity verdict (same as an
+        // eth_estimateGas revert); a DB/transport error falls back to the
+        // node's estimate so local sim can never strand a tradeable block.
+        let local_gas = if cfg.use_local_sim {
+            match executor::estimate_gas_local(
+                provider.clone(),
+                cfg.arb_contract,
+                cache.owner,
+                provisional.clone(),
+                sim_block.unwrap_or(alloy::eips::BlockId::latest()),
+            ) {
+                Ok(SimOutcome::Success { gas_used, .. }) => {
+                    debug!(gas_units = gas_used, "local revm gas estimate");
+                    Some(Ok(U256::from(gas_used)))
+                }
+                Ok(SimOutcome::Reverted(reason)) => Some(Err(eyre!(reason))),
+                Err(e) => {
+                    warn!(error = %e, "local sim unavailable; falling back to eth_estimateGas");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        match match local_gas {
+            Some(outcome) => outcome,
+            None => {
+                executor::estimate_gas(provider, cfg.arb_contract, cache.owner, provisional, sim_block)
+                    .await
+            }
+        } {
             Ok(gas_estimate) => {
                 let gas_cost = gas_estimate * gas_price;
                 debug!(
