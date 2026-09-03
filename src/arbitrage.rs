@@ -1,5 +1,6 @@
 use crate::dex::get_amount_out;
 use alloy::primitives::U256;
+use tracing::debug;
 
 /// A simulated arbitrage outcome for one loan size.
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +42,10 @@ pub fn find_opportunity(
     min_profit: U256,
 ) -> Option<Opportunity> {
     let mut best: Option<Opportunity> = None;
+    // Track the best gross profit seen across all pairs/sizes, even when it
+    // fails min_profit — logged so a "no opportunity" run still shows how
+    // close the closest pair came (diagnose spread vs. fee+gas+threshold).
+    let mut best_seen: Option<U256> = None;
     for first in venues {
         for (i, &loan_amount) in loan_amounts.iter().enumerate() {
             let Some(quote_out) = first.leg1.get(i).copied().flatten() else {
@@ -61,6 +66,9 @@ pub fn find_opportunity(
                 let Some(profit) = amount_out.checked_sub(loan_amount) else {
                     continue;
                 };
+                if !profit.is_zero() {
+                    best_seen = Some(best_seen.map_or(profit, |b| b.max(profit)));
+                }
                 if profit.is_zero() || profit < min_profit {
                     continue;
                 }
@@ -78,6 +86,12 @@ pub fn find_opportunity(
             }
         }
     }
+    debug!(
+        best_gross_profit = ?best_seen.unwrap_or(U256::ZERO),
+        min_profit = ?min_profit,
+        found = best.is_some(),
+        "find_opportunity scan complete"
+    );
     best
 }
 
