@@ -441,6 +441,13 @@ where
         }
     };
 
+    // Startup bootstrap predates these subscriptions, so pool activity in
+    // between is invisible to the cache. Force the first scan to refresh
+    // local CL state at its pinned block, closing the gap atomically.
+    cache.state.last_refresh_at = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(cfg.state_refresh_secs + 1))
+        .unwrap_or_else(std::time::Instant::now);
+
     // Block number of the last scan; any scan (event- or sweep-triggered)
     // resets the sweep clock because both run the same full scan.
     let mut last_scanned = 0u64;
@@ -549,20 +556,20 @@ where
         // Reorg: a removed log invalidates the state built from it. Deltas
         // cannot be undone in place, so drop the pool from the cache — the
         // venue falls back to QuoterV2 until it re-bootstraps.
-        let mut any_removed = false;
         for l in block_logs.iter().chain(pend_logs.iter()) {
             if l.removed {
-                any_removed = true;
                 let pool = l.address();
                 cache.state.remove(&pool);
                 cache.pending.remove(&pool);
                 warn!(pool = %pool, "reorged pool log; dropping pool from local cache");
             }
         }
-        if any_removed {
-            continue; // state dropped; next sweep/log re-drives discovery
-        }
+        // Canonical logs in the same batch still apply — only reorged
+        // pools were evicted above.
         for l in &block_logs {
+            if l.removed {
+                continue;
+            }
             apply_pool_log(&mut cache.state, l);
             if let Some(b) = l.block_number {
                 cache.state.advance_to(b);
@@ -571,6 +578,9 @@ where
         // Pending overlay: clone the pool's sealed state on first touch,
         // then fold preconfirmed events on top. Sealed scans never see it.
         for l in &pend_logs {
+            if l.removed {
+                continue;
+            }
             let pool = l.address();
             if cache.pending.get(&pool).is_none() {
                 if let Some(base) = cache.state.get(&pool) {
@@ -787,12 +797,14 @@ where
     // off a block different from the RPC legs.
     {
         let pin = if want_pending { None } else { block.as_u64() };
-        let stale = cache.state.block.is_some() && cache.state.block != pin;
+        let stale = !want_pending && cache.state.block.is_some() && cache.state.block != pin;
         let aged = cache
             .state
             .last_event_at
-            .map(|t| t.elapsed().as_secs() >= cfg.state_refresh_secs)
-            .unwrap_or(true);
+            .unwrap_or(cache.state.last_refresh_at)
+            .elapsed()
+            .as_secs()
+            >= cfg.state_refresh_secs;
         if stale || aged {
             let removed = cache.v3_pairs.len();
             for pool in cache.v3_pairs.clone() {
@@ -810,7 +822,7 @@ where
     // RPC requests, so request selection and quote assembly see the same
     // cache. A pool whose refresh fails is dropped here and priced via
     // QuoterV2 this scan; it never reappears as a phantom RPC result.
-    if cache.state.last_refresh_at.elapsed().as_secs() >= cfg.state_refresh_secs {
+    if !want_pending && cache.state.last_refresh_at.elapsed().as_secs() >= cfg.state_refresh_secs {
         let pin = if want_pending {
             provider.get_block_number().await.unwrap_or(0)
         } else {
@@ -1192,7 +1204,7 @@ where
                 cfg.arb_contract,
                 cache.owner,
                 provisional.clone(),
-                sim_block.unwrap_or(alloy::eips::BlockId::latest()),
+                sim_block.unwrap_or(block),
             )
             .await
             {

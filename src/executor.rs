@@ -136,11 +136,13 @@ pub async fn estimate_gas_local<P: Provider>(
     params: ArbParams,
     block: alloy::eips::BlockId,
 ) -> Result<crate::sim::SimOutcome> {
-    // Block/chain context from the same block the state reads pin to; a
-    // header fetch failure keeps the sim usable on the default context.
-    let env = crate::sim::fetch_sim_env(&provider, block).await.ok();
+    // Block/chain context from the same block the state reads pin to. A
+    // failed fetch is an Err so the caller falls back to eth_estimateGas —
+    // executing with a default context against pinned state can diverge
+    // from the node's verdict.
+    let env = crate::sim::fetch_sim_env(&provider, block).await?;
     let calldata = IFlashArbitrage::executeCall { params }.abi_encode().into();
-    crate::sim::simulate_call(provider, contract, owner, calldata, block, env)
+    crate::sim::simulate_call(provider, contract, owner, calldata, block, Some(env))
 }
 
 /// Broadcast `execute` and return as soon as the node accepts the tx,
