@@ -427,6 +427,8 @@ mod tests {
             quote_out: U256::from(20_000u64),
             amount_out: U256::from(10_100u64),
             profit: U256::from(100u64),
+            leg1_local: false,
+            leg2_local: false,
         };
 
         let params = build_params(&cfg, &opp, cfg.min_profit);
