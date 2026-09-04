@@ -26,7 +26,7 @@ pub struct Opportunity {
 pub struct VenueQuotes {
     pub venue: usize,
     /// Leg 1 (loan -> quote) output per configured loan size, aligned with
-    /// the `loan_amounts` slice passed to `find_opportunity`.
+    /// the `loan_amounts` slice passed to `ranked_opportunities`.
     pub leg1: Vec<Option<U256>>,
     /// Leg 2 (quote -> loan) outputs: `(quote_in, loan_out)` for every
     /// distinct leg-1 output produced by the OTHER venues this scan.
@@ -34,13 +34,16 @@ pub struct VenueQuotes {
 }
 
 /// Simulate the cycle over every ordered venue pair (i, j) and every loan
-/// size, returning the most profitable one clearing `min_profit`, if any.
-pub fn find_opportunity(
+/// size, returning all profitable candidates sorted by gross profit
+/// descending. Ties are not considered: equal-profit candidates have
+/// identical net margins, so any order among them is fine (sort is on the
+/// profit key only).
+pub fn ranked_opportunities(
     loan_amounts: &[U256],
     venues: &[VenueQuotes],
     min_profit: U256,
-) -> Option<Opportunity> {
-    let mut best: Option<Opportunity> = None;
+) -> Vec<Opportunity> {
+    let mut out = Vec::new();
     for first in venues {
         for (i, &loan_amount) in loan_amounts.iter().enumerate() {
             let Some(quote_out) = first.leg1.get(i).copied().flatten() else {
@@ -64,21 +67,61 @@ pub fn find_opportunity(
                 if profit.is_zero() || profit < min_profit {
                     continue;
                 }
-                let opp = Opportunity {
+                out.push(Opportunity {
                     first: first.venue,
                     second: second.venue,
                     loan_amount,
                     quote_out,
                     amount_out,
                     profit,
-                };
-                if best.is_none_or(|b| opp.profit > b.profit) {
-                    best = Some(opp);
-                }
+                });
             }
         }
     }
+    out.sort_by_key(|o| std::cmp::Reverse(o.profit));
+    out
+}
+
+/// Outcome of one candidate's gas evaluation, fed to `pick_best_net`.
+pub enum GasOutcome {
+    /// Gas simulation succeeded; cost in loan-token units.
+    Priced(U256),
+    /// Gas simulation reverted or the candidate is otherwise unexecutable.
+    Rejected,
+}
+
+/// Pick the highest net-profit (gross − gas) candidate clearing `min_profit`
+/// from pre-evaluated results. Pure and testable: the async gas simulations
+/// live in the caller; this only compares numbers. `results` are expected in
+/// gross-descending order (as produced by `ranked_opportunities`), though the
+/// function is correct for any order.
+pub fn pick_best_net(
+    results: impl IntoIterator<Item = (Opportunity, GasOutcome)>,
+    min_profit: U256,
+) -> Option<(Opportunity, U256)> {
+    let mut best: Option<(Opportunity, U256)> = None;
+    for (opp, outcome) in results {
+        let GasOutcome::Priced(gas) = outcome else {
+            continue;
+        };
+        let net = opp.profit.saturating_sub(gas);
+        if net < min_profit {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(incumbent, incumbent_gas)| {
+            net > incumbent.profit.saturating_sub(*incumbent_gas)
+        }) {
+            best = Some((opp, gas));
+        }
+    }
     best
+}
+
+/// True when `candidate_gross` can still beat the incumbent's net even at
+/// zero gas; used with gross-sorted candidates to stop simulating once no
+/// later candidate can win.
+pub fn can_still_win(candidate_gross: U256, incumbent: &(Opportunity, U256)) -> bool {
+    candidate_gross > incumbent.0.profit.saturating_sub(incumbent.1)
 }
 
 /// The best two-venue round trip of a scan, ignoring `min_profit`. Unlike
@@ -285,14 +328,18 @@ mod tests {
     #[test]
     fn balanced_pools_have_no_opportunity() {
         let venues = pool_set(&[(1_000_000, 1_000_000), (1_000_000, 1_000_000)], &[10_000]);
-        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO);
+        let opp = ranked_opportunities(&sizes(&[10_000]), &venues, U256::ZERO)
+            .into_iter()
+            .next();
         assert!(opp.is_none(), "identical pools must not be profitable");
     }
 
     #[test]
     fn price_dislocation_yields_profit_in_one_direction() {
         let venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &[10_000]);
-        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO)
+        let opp = ranked_opportunities(&sizes(&[10_000]), &venues, U256::ZERO)
+            .into_iter()
+            .next()
             .expect("dislocated pools should yield an opportunity");
         assert_eq!(opp.first, 0);
         assert_eq!(opp.second, 1);
@@ -303,7 +350,9 @@ mod tests {
     #[test]
     fn mirror_direction_is_found_when_pools_are_swapped() {
         let venues = pool_set(&[(1_100_000, 900_000), (1_000_000, 1_000_000)], &[10_000]);
-        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO)
+        let opp = ranked_opportunities(&sizes(&[10_000]), &venues, U256::ZERO)
+            .into_iter()
+            .next()
             .expect("swapped pools should still yield an opportunity");
         assert_eq!(opp.first, 1);
         assert_eq!(opp.second, 0);
@@ -322,7 +371,9 @@ mod tests {
             ],
             &[10_000],
         );
-        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO)
+        let opp = ranked_opportunities(&sizes(&[10_000]), &venues, U256::ZERO)
+            .into_iter()
+            .next()
             .expect("four venues should still find a pair");
         assert!(opp.profit > U256::ZERO);
         assert!(opp.first == 1 || opp.second == 1);
@@ -342,7 +393,9 @@ mod tests {
         );
         venues[1].leg1 = vec![None];
         venues[1].leg2 = venues[1].leg2.iter().map(|&(q, _)| (q, None)).collect();
-        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO)
+        let opp = ranked_opportunities(&sizes(&[10_000]), &venues, U256::ZERO)
+            .into_iter()
+            .next()
             .expect("one dead venue must not abort the search");
         assert!(opp.profit > U256::ZERO);
         assert!(opp.first != 1 && opp.second != 1);
@@ -351,18 +404,70 @@ mod tests {
     #[test]
     fn min_profit_threshold_filters_small_gains() {
         let venues = pool_set(&[(1_000_000, 1_000_000), (1_001_000, 999_000)], &[10_000]);
-        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::from(1_000_000u64));
+        let opp = ranked_opportunities(&sizes(&[10_000]), &venues, U256::from(1_000_000u64))
+            .into_iter()
+            .next();
         assert!(
             opp.is_none(),
             "tiny dislocation must fail a large min_profit"
         );
     }
 
+    fn opp(first: usize, second: usize, gross: u64) -> Opportunity {
+        Opportunity {
+            first,
+            second,
+            loan_amount: U256::from(1_000u64),
+            quote_out: U256::ZERO,
+            amount_out: U256::from(1_000u64 + gross),
+            profit: U256::from(gross),
+        }
+    }
+
+    #[test]
+    fn pick_best_net_prefers_lower_gross_lower_gas_when_net_wins() {
+        // A: gross 0.020, gas 0.018 → net 0.002. B: gross 0.019, gas 0.002 →
+        // net 0.017. Ranking by gross alone picks A (the old behavior); net
+        // must pick B.
+        let results = vec![
+            (opp(0, 1, 20), GasOutcome::Priced(U256::from(18u64))),
+            (opp(1, 0, 19), GasOutcome::Priced(U256::from(2u64))),
+        ];
+        let (chosen, gas) = pick_best_net(results, U256::ZERO).unwrap();
+        assert_eq!((chosen.first, chosen.second), (1, 0));
+        assert_eq!(gas, U256::from(2u64));
+    }
+
+    #[test]
+    fn pick_best_net_skips_rejected_and_filters_min_profit() {
+        // Top-gross candidate reverts in simulation; the next one must win.
+        let results = vec![
+            (opp(0, 1, 20), GasOutcome::Rejected),
+            (opp(1, 0, 19), GasOutcome::Priced(U256::from(2u64))),
+        ];
+        let (chosen, _) = pick_best_net(results, U256::ZERO).unwrap();
+        assert_eq!((chosen.first, chosen.second), (1, 0));
+
+        // And min_profit filters after gas, not before it.
+        let results = vec![(opp(0, 1, 20), GasOutcome::Priced(U256::from(18u64)))];
+        assert!(pick_best_net(results, U256::from(3u64)).is_none());
+    }
+
+    #[test]
+    fn can_still_win_stops_when_gross_cannot_beat_incumbent_net() {
+        let incumbent = (opp(0, 1, 20), U256::from(18u64)); // net 2
+        assert!(can_still_win(U256::from(3u64), &incumbent));
+        assert!(!can_still_win(U256::from(2u64), &incumbent));
+        assert!(!can_still_win(U256::from(1u64), &incumbent));
+    }
+
     #[test]
     fn best_of_multiple_sizes_is_selected() {
         let sizes_in = [1_000u128, 10_000, 100_000];
         let venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &sizes_in);
-        let best = find_opportunity(&sizes(&sizes_in), &venues, U256::ZERO)
+        let best = ranked_opportunities(&sizes(&sizes_in), &venues, U256::ZERO)
+            .into_iter()
+            .next()
             .expect("some size should be profitable");
         assert!(best.profit > U256::ZERO);
         // The optimum is not necessarily the largest size: price impact
@@ -371,9 +476,32 @@ mod tests {
         // outputs are aligned with the sizes they were quoted for).
         for &s in &sizes_in {
             let single = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &[s]);
-            let only = find_opportunity(&sizes(&[s]), &single, U256::ZERO).unwrap();
+            let only = ranked_opportunities(&sizes(&[s]), &single, U256::ZERO)
+                .into_iter()
+                .next()
+                .unwrap();
             assert!(best.profit >= only.profit);
         }
+    }
+
+    #[test]
+    fn ranked_opportunities_returns_all_candidates_sorted_by_gross() {
+        // Two dislocated pools, two sizes: both directions profitable at
+        // some sizes. The list must contain every profitable route, sorted
+        // by gross profit descending, so the caller can walk down it after
+        // gas instead of being locked into the top-gross candidate.
+        let venues = pool_set(
+            &[(1_000_000, 1_000_000), (1_100_000, 900_000)],
+            &[1_000, 10_000],
+        );
+        let ranked = ranked_opportunities(&sizes(&[1_000, 10_000]), &venues, U256::ZERO);
+        assert!(ranked.len() > 1, "several routes are profitable here");
+        assert!(ranked.windows(2).all(|w| w[0].profit >= w[1].profit));
+        // min_profit filters the tail, not just the top.
+        let threshold = ranked[0].profit;
+        let filtered = ranked_opportunities(&sizes(&[1_000, 10_000]), &venues, threshold);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].profit, threshold);
     }
 
     #[test]
@@ -393,8 +521,11 @@ mod tests {
         let venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &[10_000]);
         let c = best_candidate(&sizes(&[10_000]), &venues).expect("a candidate exists");
         assert!(c.amount_out > c.loan_amount);
-        // It must match what find_opportunity would pick with no threshold.
-        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO).unwrap();
+        // It must match what ranked_opportunities would pick with no threshold.
+        let opp = ranked_opportunities(&sizes(&[10_000]), &venues, U256::ZERO)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!((c.first, c.second), (opp.first, opp.second));
         assert_eq!(c.amount_out, opp.amount_out);
     }
@@ -404,7 +535,7 @@ mod tests {
         // Identical pools: every round trip loses to the fee. The best
         // candidate is the smallest loss, not None.
         let venues = pool_set(&[(1_000_000, 1_000_000), (1_000_000, 1_000_000)], &[10_000]);
-        assert!(find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO).is_none());
+        assert!(ranked_opportunities(&sizes(&[10_000]), &venues, U256::ZERO).is_empty());
         let c = best_candidate(&sizes(&[10_000]), &venues).expect("a losing candidate exists");
         assert!(c.amount_out < c.loan_amount, "fees guarantee a loss");
         // ~2.5% round trip: two 0.3% fees plus price impact of a 1%-of-reserves swap.

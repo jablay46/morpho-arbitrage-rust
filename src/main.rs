@@ -3,7 +3,10 @@ use alloy::primitives::{Address, U256};
 use clap::{Parser, Subcommand};
 use eyre::{eyre, Result};
 use futures::FutureExt;
-use morpho_arbitrage_bot::arbitrage::{best_candidate, find_opportunity, v2_quotes, VenueQuotes};
+use morpho_arbitrage_bot::arbitrage::{
+    best_candidate, can_still_win, pick_best_net, ranked_opportunities, v2_quotes, GasOutcome,
+    Opportunity, VenueQuotes,
+};
 use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
@@ -690,6 +693,12 @@ fn rpc_backoff_secs(failures: u32) -> u64 {
         .min(300)
 }
 
+/// Allowed divergence between a locally-priced CL leg and the venue's Quoter
+/// at the same block, in basis points. Local math replays exact-input swaps
+/// over bootstrapped tick state; small differences from rounding direction
+/// are normal, but anything past this signals stale/corrupt local state.
+const CL_AUTH_QUOTE_TOLERANCE_BPS: u64 = 25;
+
 /// Look up a CL venue's bootstrapped state by real pool address; V2 pool
 /// lookups (Address::ZERO) yield None so the caller falls back to RPC.
 fn cached_cl<'c>(
@@ -1234,7 +1243,8 @@ where
         }
     }
 
-    let Some(opp) = find_opportunity(sizes, &quotes, cfg.min_profit) else {
+    let candidates = ranked_opportunities(sizes, &quotes, cfg.min_profit);
+    if candidates.is_empty() {
         // Surface how far the best route was from profitability: without
         // this, "every quote succeeded but spread was thin" and "half the
         // pools were empty" produce the same opaque log line.
@@ -1256,7 +1266,7 @@ where
             info!("no profitable opportunity; no venue pair could be priced end-to-end");
         }
         return Ok(block_number);
-    };
+    }
 
     // Pre-broadcast state-advancement guard (second check). Even after the
     // phase-1→phase-2 check above, a Flashblock may land between then and the
@@ -1274,121 +1284,158 @@ where
         }
     }
 
-    // Estimate gas cost and subtract from profit. Gas is paid in ETH;
-    // config enforces loan_token == wrapped_native, so the wei estimate
-    // is directly comparable to profit in loan-token units.
-    //
-    // In dry-run, apply a constant gas-units estimate instead of skipping
-    // the cost entirely: with gas=0 the MIN_PROFIT filter runs against
-    // gross profit, so dry-run reports "opportunities" that live mode
-    // (which subtracts the real estimate_gas result) always rejects. The
-    // constant intentionally needs no RPC call and errs high for the
-    // Morpho flashloan + two router swaps path.
-    let gas_cost_loan = if cfg.dry_run {
-        const DRY_RUN_GAS_UNITS: u64 = 400_000;
-        U256::from(DRY_RUN_GAS_UNITS) * gas_price
-    } else {
-        // Two-stage build: estimate gas with a provisional params
-        // (minProfit barely affects calldata size/gas), then rebuild below
-        // with the on-chain backstop raised to min_profit + gas so the
-        // contract itself reverts net-unprofitable trades.
-        //
-        // estimate_gas executes the real swaps in simulation, so it
-        // reverts whenever minOut is unattainable (e.g. the spread is
-        // thinner than the per-leg slippage tolerance on a volatile
-        // pair). That is not a scan failure — it is a per-opportunity
-        // rejection, same as the net-profit filter; skip and keep
-        // scanning instead of failing the whole scan.
-        let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
-        // Gate the gas estimate against the preconfirmed `pending` state only
-        // when both USE_PENDING_SIM is requested AND the endpoint actually
-        // streams Flashblocks (cached capability). Otherwise the scan's block
-        // id is a sealed `latest` number and "pending sim" would silently run
-        // against sealed state — pointless and misleading. Falls back to the
-        // node default (latest) state when not pending.
-        let sim_block = if cfg.use_pending_sim && want_pending {
-            Some(block)
-        } else {
-            None
-        };
-        // When USE_LOCAL_SIM is on, try the in-process revm simulation
-        // first. A revert is a per-opportunity verdict (same as an
-        // eth_estimateGas revert); a DB/transport error falls back to the
-        // node's estimate so local sim can never strand a tradeable block.
-        // Local sim defaults to the scan's block id, but on a pending scan
-        // with USE_PENDING_SIM disabled that id is the mutable pending tag.
-        // Honor the opt-out by simulating against the sealed block number
-        // snapshotted at scan start instead.
-        let local_sim_block = match sim_block {
-            Some(b) => b,
-            None if want_pending => alloy::eips::BlockId::number(scan_block_number),
-            None => block,
-        };
-        let local_gas = if cfg.use_local_sim {
-            match executor::estimate_gas_local(
-                provider.clone(),
-                cfg.arb_contract,
-                cache.owner,
-                provisional.clone(),
-                local_sim_block,
-            )
-            .await
-            {
-                Ok(SimOutcome::Success { gas_used, .. }) => {
-                    debug!(gas_units = gas_used, "local revm gas estimate");
-                    Some(Ok(U256::from(gas_used)))
-                }
-                Ok(SimOutcome::Reverted(reason)) => Some(Err(eyre!(reason))),
-                Err(e) => {
-                    warn!(error = %e, "local sim unavailable; falling back to eth_estimateGas");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        match match local_gas {
-            Some(outcome) => outcome,
-            None => {
-                executor::estimate_gas(
-                    provider,
-                    cfg.arb_contract,
-                    cache.owner,
-                    provisional,
-                    sim_block,
-                )
-                .await
-            }
-        } {
-            Ok(gas_estimate) => {
-                let gas_cost = gas_estimate * gas_price;
-                debug!(
-                    gas_units = ?gas_estimate,
-                    gas_price = %gas_price,
-                    gas_cost = %gas_cost,
-                    sim_block = ?sim_block,
-                    "gas estimate for opportunity"
-                );
-                gas_cost
-            }
-            Err(e) => {
-                info!(error = %e, "opportunity rejected: simulated execution reverted");
-                return Ok(block_number);
+    // Evaluate candidates top-down by gross, estimating gas for each, then
+    // pick the best NET outcome instead of committing to the top-gross one.
+    // The old flow locked onto the single max-gross candidate and dropped the
+    // whole scan when its gas killed the margin; a lower-gross route with
+    // cheaper legs can be strictly better. Gas estimation is a live
+    // simulation per candidate, so stop once a later candidate's gross can
+    // no longer beat the incumbent's net even at zero gas, and cap attempts.
+    const MAX_CANDIDATE_ATTEMPTS: usize = 4;
+    let mut evaluated: Vec<(Opportunity, GasOutcome)> = Vec::new();
+    let mut running_best: Option<(Opportunity, U256)> = None;
+    for (attempt, opp) in candidates.into_iter().enumerate() {
+        if attempt >= MAX_CANDIDATE_ATTEMPTS {
+            debug!(
+                attempts = attempt,
+                "candidate evaluation budget exhausted; using best net so far"
+            );
+            break;
+        }
+        if let Some(incumbent) = &running_best {
+            if !can_still_win(opp.profit, incumbent) {
+                break;
             }
         }
-    };
+        // Estimate gas cost and subtract from profit. Gas is paid in ETH;
+        // config enforces loan_token == wrapped_native, so the wei estimate
+        // is directly comparable to profit in loan-token units.
+        //
+        // In dry-run, apply a constant gas-units estimate instead of skipping
+        // the cost entirely: with gas=0 the MIN_PROFIT filter runs against
+        // gross profit, so dry-run reports "opportunities" that live mode
+        // (which subtracts the real estimate_gas result) always rejects. The
+        // constant intentionally needs no RPC call and errs high for the
+        // Morpho flashloan + two router swaps path.
+        let outcome = if cfg.dry_run {
+            const DRY_RUN_GAS_UNITS: u64 = 400_000;
+            GasOutcome::Priced(U256::from(DRY_RUN_GAS_UNITS) * gas_price)
+        } else {
+            // Two-stage build: estimate gas with a provisional params
+            // (minProfit barely affects calldata size/gas), then rebuild below
+            // with the on-chain backstop raised to min_profit + gas so the
+            // contract itself reverts net-unprofitable trades.
+            //
+            // estimate_gas executes the real swaps in simulation, so it
+            // reverts whenever minOut is unattainable (e.g. the spread is
+            // thinner than the per-leg slippage tolerance on a volatile
+            // pair). That is not a scan failure — it is a per-candidate
+            // rejection; skip to the next candidate instead of failing the
+            // whole scan.
+            let provisional = executor::build_params(cfg, &opp, cfg.min_profit);
+            // Gate the gas estimate against the preconfirmed `pending` state
+            // only when both USE_PENDING_SIM is requested AND the endpoint
+            // actually streams Flashblocks (cached capability). Otherwise the
+            // scan's block id is a sealed `latest` number and "pending sim"
+            // would silently run against sealed state — pointless and
+            // misleading. Falls back to the node default (latest) state when
+            // not pending.
+            let sim_block = if cfg.use_pending_sim && want_pending {
+                Some(block)
+            } else {
+                None
+            };
+            // When USE_LOCAL_SIM is on, try the in-process revm simulation
+            // first. A revert is a per-candidate verdict (same as an
+            // eth_estimateGas revert); a DB/transport error falls back to the
+            // node's estimate so local sim can never strand a tradeable block.
+            // Local sim defaults to the scan's block id, but on a pending scan
+            // with USE_PENDING_SIM disabled that id is the mutable pending tag.
+            // Honor the opt-out by simulating against the sealed block number
+            // snapshotted at scan start instead.
+            let local_sim_block = match sim_block {
+                Some(b) => b,
+                None if want_pending => alloy::eips::BlockId::number(scan_block_number),
+                None => block,
+            };
+            let local_gas = if cfg.use_local_sim {
+                match executor::estimate_gas_local(
+                    provider.clone(),
+                    cfg.arb_contract,
+                    cache.owner,
+                    provisional.clone(),
+                    local_sim_block,
+                )
+                .await
+                {
+                    Ok(SimOutcome::Success { gas_used, .. }) => {
+                        debug!(gas_units = gas_used, "local revm gas estimate");
+                        Some(Ok(U256::from(gas_used)))
+                    }
+                    Ok(SimOutcome::Reverted(reason)) => Some(Err(eyre!(reason))),
+                    Err(e) => {
+                        warn!(error = %e, "local sim unavailable; falling back to eth_estimateGas");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            match match local_gas {
+                Some(outcome) => outcome,
+                None => {
+                    executor::estimate_gas(
+                        provider,
+                        cfg.arb_contract,
+                        cache.owner,
+                        provisional,
+                        sim_block,
+                    )
+                    .await
+                }
+            } {
+                Ok(gas_estimate) => {
+                    let gas_cost = gas_estimate * gas_price;
+                    debug!(
+                        gas_units = ?gas_estimate,
+                        gas_price = %gas_price,
+                        gas_cost = %gas_cost,
+                        sim_block = ?sim_block,
+                        "gas estimate for candidate"
+                    );
+                    GasOutcome::Priced(gas_cost)
+                }
+                Err(e) => {
+                    info!(
+                        first = opp.first,
+                        second = opp.second,
+                        loan = %opp.loan_amount,
+                        error = %e,
+                        "candidate rejected: simulated execution reverted"
+                    );
+                    GasOutcome::Rejected
+                }
+            }
+        };
+        if let GasOutcome::Priced(gas) = outcome {
+            let net = opp.profit.saturating_sub(gas);
+            if net >= cfg.min_profit
+                && running_best
+                    .as_ref()
+                    .is_none_or(|(inc, inc_gas)| net > inc.profit.saturating_sub(*inc_gas))
+            {
+                running_best = Some((opp, gas));
+            }
+        }
+        evaluated.push((opp, outcome));
+    }
 
+    let Some((opp, gas_cost_loan)) = pick_best_net(evaluated, cfg.min_profit) else {
+        info!("no candidate survived gas estimation");
+        return Ok(block_number);
+    };
     let net_profit = opp.profit.saturating_sub(gas_cost_loan);
     let onchain_min_profit = cfg.min_profit + gas_cost_loan;
-    if net_profit < cfg.min_profit {
-        info!(
-            gross = %opp.profit,
-            gas = %gas_cost_loan,
-            net = %net_profit,
-            "opportunity filtered out by gas cost"
-        );
-        return Ok(block_number);
-    }
 
     info!(
         first = opp.first,
@@ -1406,6 +1453,105 @@ where
         // a mode whose only purpose is to observe the scanner's verdicts.
         info!("dry-run enabled; skipping broadcast");
         return Ok(block_number);
+    }
+
+    // Authoritative re-quote for every CL leg priced from local state
+    // (finding #3): a locally cached pool can hold a WRONG-but-priceable
+    // value (e.g. a misfolded Mint/Burn), and the scan-side fallback only
+    // triggers on None — a wrong number sails through. Before broadcasting,
+    // re-quote any locally-priced CL leg via the venue's Quoter at the scan
+    // block and require the outputs to agree within CL_AUTH_QUOTE_TOLERANCE_BPS.
+    // A V2/Aero leg is derived from fresh on-chain reserves each scan, so it
+    // carries no persistent state that could drift.
+    let mut auth_requests: Vec<QuoteRequest> = Vec::new();
+    let mut auth_legs: Vec<(Address, U256)> = Vec::new(); // (pool, local output)
+    let v3_idx_of = |venue_idx: usize| -> Option<(usize, Address)> {
+        cache
+            .v3_idx
+            .iter()
+            .position(|&v| v == venue_idx)
+            .map(|p| (p, cache.v3_pairs[p]))
+    };
+    if let Some((_, pool)) = v3_idx_of(opp.first) {
+        if cached_cl(cache, pool, want_pending).is_some() {
+            let venue = &cfg.venues[opp.first];
+            auth_requests.push(QuoteRequest {
+                token_in: cfg.loan_token,
+                token_out: cfg.quote_token,
+                fee_tier: venue.fee_tier,
+                amount_in: opp.loan_amount,
+                quoter: resolve_quoter(cfg, venue),
+                slipstream: venue.kind == VenueKind::Slipstream,
+            });
+            auth_legs.push((pool, opp.quote_out));
+        }
+    }
+    if let Some((_, pool)) = v3_idx_of(opp.second) {
+        if cached_cl(cache, pool, want_pending).is_some() {
+            let venue = &cfg.venues[opp.second];
+            auth_requests.push(QuoteRequest {
+                token_in: cfg.quote_token,
+                token_out: cfg.loan_token,
+                fee_tier: venue.fee_tier,
+                amount_in: opp.quote_out,
+                quoter: resolve_quoter(cfg, venue),
+                slipstream: venue.kind == VenueKind::Slipstream,
+            });
+            auth_legs.push((pool, opp.amount_out));
+        }
+    }
+    if !auth_requests.is_empty() {
+        let n = auth_requests.len();
+        match fetch_quotes(provider, &auth_requests, block).await {
+            Ok(results) if results.len() == n => {
+                for ((pool, local_out), auth_out) in auth_legs.iter().zip(results.iter()) {
+                    match auth_out {
+                        Some(auth) => {
+                            let diff = auth.abs_diff(*local_out);
+                            let tolerance = *local_out * U256::from(CL_AUTH_QUOTE_TOLERANCE_BPS)
+                                / U256::from(10_000u64);
+                            if diff > tolerance {
+                                warn!(
+                                    pool = %pool,
+                                    local = %local_out,
+                                    authoritative = %auth,
+                                    diff_bps = %(diff * U256::from(10_000u64) / *local_out),
+                                    "local CL quote diverged from Quoter; dropping state and rescanning"
+                                );
+                                cache.state.remove(pool);
+                                cache.pending.remove(pool);
+                                return Ok(block_number);
+                            }
+                        }
+                        None => {
+                            // Cannot validate: drop the suspect local state so
+                            // the next scan prices this pool via Quoter, and
+                            // skip the trade rather than trust an unverifiable
+                            // cached quote.
+                            warn!(
+                                pool = %pool,
+                                "authoritative Quoter call failed; dropping local CL state and skipping trade"
+                            );
+                            cache.state.remove(pool);
+                            cache.pending.remove(pool);
+                            return Ok(block_number);
+                        }
+                    }
+                }
+                debug!(
+                    legs = auth_legs.len(),
+                    "authoritative CL quote check passed"
+                );
+            }
+            _ => {
+                // Batch-level transport error: the scan-side path would fall
+                // back to Quoter for unpriceable input, but here the trade
+                // hinges on unverified local state. Skip this scan; the next
+                // one re-quotes anyway.
+                warn!("authoritative CL quote batch failed; skipping trade this scan");
+                return Ok(block_number);
+            }
+        }
     }
 
     let params = executor::build_params(cfg, &opp, onchain_min_profit);
