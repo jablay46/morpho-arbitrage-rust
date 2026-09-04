@@ -309,7 +309,9 @@ fn next_initialized_tick_within_one_word(
         let mask = !((U256::from(1u8) << bit_pos).wrapping_sub(U256::from(1u8)));
         let masked = word & mask;
         let initialized = !masked.is_zero();
-        let lsb = least_significant_bit(masked).unwrap_or(0);
+        // Solidity: no set bit above -> rightmost tick of the word
+        // ((compressed - bitPos) + 255) * spacing, not bit 0.
+        let lsb = least_significant_bit(masked).unwrap_or(255);
         let next = (compressed + (lsb as i32 - bit_pos as i32)) * tick_spacing;
         (next, initialized)
     }
