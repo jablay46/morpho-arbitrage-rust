@@ -717,7 +717,7 @@ async fn pending_state_advanced<P: alloy::providers::Provider>(
         .get_block_by_number(alloy::eips::BlockNumberOrTag::Pending)
         .await?
         .map(|b| b.header.hash);
-    Ok(current != Some(snapshot))
+    Ok(matches!(current, Some(hash) if hash != snapshot))
 }
 
 /// Look up a CL venue's bootstrapped state by real pool address; V2 pool
