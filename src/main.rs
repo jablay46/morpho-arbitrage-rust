@@ -699,6 +699,27 @@ fn rpc_backoff_secs(failures: u32) -> u64 {
 /// are normal, but anything past this signals stale/corrupt local state.
 const CL_AUTH_QUOTE_TOLERANCE_BPS: u64 = 25;
 
+/// True when the preconfirmed `pending` state advanced since the scan
+/// snapshotted it. Compares the pending block's HASH (not the sealed block
+/// number): on Base the sealed number stays constant while successive
+/// Flashblocks keep building the same block, but each Flashblock arrival
+/// changes the pending block's hash — so only the hash catches intra-block
+/// updates. Returns false when `pending` is unavailable (nothing stable to
+/// compare against).
+async fn pending_state_advanced<P: alloy::providers::Provider>(
+    provider: &P,
+    snapshot: Option<B256>,
+) -> Result<bool> {
+    let Some(snapshot) = snapshot else {
+        return Ok(false);
+    };
+    let current = provider
+        .get_block_by_number(alloy::eips::BlockNumberOrTag::Pending)
+        .await?
+        .map(|b| b.header.hash);
+    Ok(current != Some(snapshot))
+}
+
 /// Look up a CL venue's bootstrapped state by real pool address; V2 pool
 /// lookups (Address::ZERO) yield None so the caller falls back to RPC.
 fn cached_cl<'c>(
@@ -832,9 +853,24 @@ where
     let want_pending = cfg.use_pending_state && cache.flashblocks_available;
     let block = read_block_id(provider, want_pending, Some(cache.flashblocks_available)).await?;
     // The `pending` tag is mutable — Base advances it ~every 200ms as new
-    // Flashblocks land. Snapshot its current sealed block number now so we can
-    // detect, before broadcasting, that a fresh Flashblock rewrote the state
-    // the scan read (mixed-state legs would revert and waste gas).
+    // Flashblocks land. Snapshot a stable identifier of the preconfirmed
+    // partial block (its hash) now so we can detect, before broadcasting,
+    // that a fresh Flashblock rewrote the state the scan read (mixed-state
+    // legs would revert and waste gas). The sealed block NUMBER alone is not
+    // enough: it stays constant while multiple Flashblocks build the same
+    // block, but each arrival changes the pending block's hash. When
+    // `pending` is unavailable the hash is None and the guards no-op.
+    let scan_pending_hash: Option<B256> = if want_pending {
+        provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Pending)
+            .await?
+            .map(|b| b.header.hash)
+    } else {
+        None
+    };
+    // Keep the sealed block number as the sweep-bookkeeping watermark and
+    // the basis for the local-sim fallback block (a Flashblock's partial
+    // state can't be re-derived from a sealed number).
     let scan_block_number = if want_pending {
         provider.get_block_number().await?
     } else {
@@ -1241,19 +1277,13 @@ where
     // a new Flashblock landed between the phase-1 batch (reserves/leg-1
     // quotes) and the phase-2 batch, leg-1 and leg-2 are priced against two
     // different states, so the computed spread is invalid and any trade built
-    // on it would likely revert. Detect the advancement by re-checking the
-    // sealed block number; if it moved, discard the whole scan and let the
+    // on it would likely revert. Detect the advancement by comparing the
+    // pending block's hash (catches intra-block Flashblock updates the sealed
+    // number is blind to); if it changed, discard the whole scan and let the
     // caller rescan rather than act on mixed-state legs.
-    if want_pending {
-        let now = provider.get_block_number().await?;
-        if now != scan_block_number {
-            info!(
-                scan_block = scan_block_number,
-                now_block = now,
-                "pending state advanced between phase 1 and phase 2; discarding mixed-state scan"
-            );
-            return Ok(block_number);
-        }
+    if want_pending && pending_state_advanced(provider, scan_pending_hash).await? {
+        info!("pending state advanced between phase 1 and phase 2; discarding mixed-state scan");
+        return Ok(block_number);
     }
 
     let candidates = ranked_opportunities(sizes, &quotes, cfg.min_profit);
@@ -1284,17 +1314,11 @@ where
     // Pre-broadcast state-advancement guard (second check). Even after the
     // phase-1→phase-2 check above, a Flashblock may land between then and the
     // broadcast, so the priced state no longer matches what we'd submit
-    // against. Re-check; if it advanced, discard and rescan.
-    if want_pending {
-        let now = provider.get_block_number().await?;
-        if now != scan_block_number {
-            info!(
-                scan_block = scan_block_number,
-                now_block = now,
-                "pending state advanced during scan; discarding to avoid mixed-state legs"
-            );
-            return Ok(block_number);
-        }
+    // against. Re-check via the pending block hash; if it advanced, discard
+    // and rescan.
+    if want_pending && pending_state_advanced(provider, scan_pending_hash).await? {
+        info!("pending state advanced during scan; discarding to avoid mixed-state legs");
+        return Ok(block_number);
     }
 
     // Evaluate candidates top-down by gross, estimating gas for each, then
@@ -1587,20 +1611,14 @@ where
     // The candidate-evaluation and authoritative-validation steps above add
     // several more awaited RPCs after the phase-1→2 guard, during which a
     // new Flashblock can land and make the selected opportunity (and its
-    // validated quotes) stale. Re-check the sealed block number one last
-    // time immediately before building/sending; if it moved, discard the
+    // validated quotes) stale. Re-check the pending block hash one last
+    // time immediately before building/sending; if it changed, discard the
     // scan rather than broadcast against a state the quotes no longer
-    // reflect. Same watermark comparison as the phase-1→2 guard.
-    if want_pending {
-        let now = provider.get_block_number().await?;
-        if now != scan_block_number {
-            info!(
-                scan_block = scan_block_number,
-                now_block = now,
-                "pending state advanced before broadcast; discarding stale opportunity"
-            );
-            return Ok(block_number);
-        }
+    // reflect. Hash comparison catches intra-block Flashblock updates the
+    // sealed block number is blind to.
+    if want_pending && pending_state_advanced(provider, scan_pending_hash).await? {
+        info!("pending state advanced before broadcast; discarding stale opportunity");
+        return Ok(block_number);
     }
 
     // Claim the in-flight slot before broadcasting so subsequent scans
