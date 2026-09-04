@@ -15,7 +15,19 @@ pub struct Opportunity {
     pub amount_out: U256,
     /// `amount_out - loan_amount` (Morpho Blue flash loans are fee-free).
     pub profit: U256,
+    /// True when leg 1 was priced by local CL math (vs Quoter). Only then
+    /// does the execution path re-validate against the on-chain Quoter — a
+    /// Quoter-sourced output needs no validation against itself.
+    pub leg1_local: bool,
+    /// True when leg 2 was priced by local CL math. Same rationale.
+    pub leg2_local: bool,
 }
+
+/// A leg output together with its provenance: `true` = priced by local CL
+/// math (so the execution path re-validates against the on-chain Quoter),
+/// `false` = Quoter/RPC-sourced or V2 reserves math (no persistent local
+/// state to validate).
+pub type LegOutput = (Option<U256>, bool);
 
 /// Precomputed swap quotes for one venue over one scan. Both legs carry
 /// *real* executable outputs: exact constant-product math for V2/Aero
@@ -27,10 +39,10 @@ pub struct VenueQuotes {
     pub venue: usize,
     /// Leg 1 (loan -> quote) output per configured loan size, aligned with
     /// the `loan_amounts` slice passed to `ranked_opportunities`.
-    pub leg1: Vec<Option<U256>>,
-    /// Leg 2 (quote -> loan) outputs: `(quote_in, loan_out)` for every
-    /// distinct leg-1 output produced by the OTHER venues this scan.
-    pub leg2: Vec<(U256, Option<U256>)>,
+    pub leg1: Vec<LegOutput>,
+    /// Leg 2 (quote -> loan) outputs: `(quote_in, (loan_out, is_local))` for
+    /// every distinct leg-1 output produced by the OTHER venues this scan.
+    pub leg2: Vec<(U256, LegOutput)>,
 }
 
 /// Simulate the cycle over every ordered venue pair (i, j) and every loan
@@ -46,19 +58,23 @@ pub fn ranked_opportunities(
     let mut out = Vec::new();
     for first in venues {
         for (i, &loan_amount) in loan_amounts.iter().enumerate() {
-            let Some(quote_out) = first.leg1.get(i).copied().flatten() else {
+            let Some((quote_out, leg1_local)) = first.leg1.get(i).copied() else {
                 continue;
             };
+            let Some(quote_out) = quote_out else { continue };
             for second in venues {
                 if first.venue == second.venue {
                     continue;
                 };
-                let Some(amount_out) = second
+                let Some((amount_out, leg2_local)) = second
                     .leg2
                     .iter()
                     .find(|(q, _)| *q == quote_out)
-                    .and_then(|(_, out)| *out)
+                    .map(|(_, out)| *out)
                 else {
+                    continue;
+                };
+                let Some(amount_out) = amount_out else {
                     continue;
                 };
                 let Some(profit) = amount_out.checked_sub(loan_amount) else {
@@ -74,6 +90,8 @@ pub fn ranked_opportunities(
                     quote_out,
                     amount_out,
                     profit,
+                    leg1_local,
+                    leg2_local,
                 });
             }
         }
@@ -142,7 +160,7 @@ pub fn best_candidate(loan_amounts: &[U256], venues: &[VenueQuotes]) -> Option<C
     let mut best: Option<Candidate> = None;
     for first in venues {
         for (i, &loan_amount) in loan_amounts.iter().enumerate() {
-            let Some(quote_out) = first.leg1.get(i).copied().flatten() else {
+            let Some(quote_out) = first.leg1.get(i).copied().and_then(|(q, _)| q) else {
                 continue;
             };
             for second in venues {
@@ -153,7 +171,7 @@ pub fn best_candidate(loan_amounts: &[U256], venues: &[VenueQuotes]) -> Option<C
                     .leg2
                     .iter()
                     .find(|(q, _)| *q == quote_out)
-                    .and_then(|(_, out)| *out)
+                    .and_then(|(_, (out, _))| *out)
                 else {
                     continue;
                 };
@@ -193,16 +211,27 @@ pub fn v2_quotes(
     loan_amounts: &[U256],
     leg2_inputs: &[U256],
 ) -> VenueQuotes {
+    // V2/Aero quotes come from constant-product math over reserves fetched
+    // fresh on-chain each scan, so there is no persistent local state to
+    // validate — provenance is false (not local CL).
     let leg1 = loan_amounts
         .iter()
-        .map(|&size| get_amount_out(size, reserves.reserve_in, reserves.reserve_out, fee_bps))
+        .map(|&size| {
+            (
+                get_amount_out(size, reserves.reserve_in, reserves.reserve_out, fee_bps),
+                false,
+            )
+        })
         .collect();
     let leg2 = leg2_inputs
         .iter()
         .map(|&q| {
             (
                 q,
-                get_amount_out(q, reserves.reserve_out, reserves.reserve_in, fee_bps),
+                (
+                    get_amount_out(q, reserves.reserve_out, reserves.reserve_in, fee_bps),
+                    false,
+                ),
             )
         })
         .collect();
@@ -391,8 +420,12 @@ mod tests {
             ],
             &[10_000],
         );
-        venues[1].leg1 = vec![None];
-        venues[1].leg2 = venues[1].leg2.iter().map(|&(q, _)| (q, None)).collect();
+        venues[1].leg1 = vec![(None, false)];
+        venues[1].leg2 = venues[1]
+            .leg2
+            .iter()
+            .map(|&(q, _)| (q, (None, false)))
+            .collect();
         let opp = ranked_opportunities(&sizes(&[10_000]), &venues, U256::ZERO)
             .into_iter()
             .next()
@@ -421,6 +454,8 @@ mod tests {
             quote_out: U256::ZERO,
             amount_out: U256::from(1_000u64 + gross),
             profit: U256::from(gross),
+            leg1_local: false,
+            leg2_local: false,
         }
     }
 
@@ -459,6 +494,32 @@ mod tests {
         assert!(can_still_win(U256::from(3u64), &incumbent));
         assert!(!can_still_win(U256::from(2u64), &incumbent));
         assert!(!can_still_win(U256::from(1u64), &incumbent));
+    }
+
+    #[test]
+    fn provenance_flows_from_legs_into_opportunity() {
+        // Two venues; venue 1's leg2 is local-CL (true), venue 0's leg1 is
+        // Quoter/backfill (false). The opportunity must carry leg1_local =
+        // false (venue 0 sold the loan) and leg2_local = true (venue 1
+        // bought the quote back).
+        let sizes_in = [10_000u128];
+        let mut venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &sizes_in);
+        // Overwrite provenance: venue 0 leg1 Quoter-sourced, venue 1 leg2
+        // local-CL-sourced.
+        venues[0].leg1 = venues[0].leg1.iter().map(|&(q, _)| (q, false)).collect();
+        venues[1].leg2 = venues[1]
+            .leg2
+            .iter()
+            .map(|&(q, (o, _))| (q, (o, true)))
+            .collect();
+        let best = ranked_opportunities(&sizes(&sizes_in), &venues, U256::ZERO)
+            .into_iter()
+            .next()
+            .expect("a profitable route must exist");
+        // The profitable direction is first=0 (cheap loan sale) then
+        // second=1 (buy back). Confirm provenance attached accordingly.
+        assert!(!best.leg1_local, "venue 0 leg1 was Quoter-sourced");
+        assert!(best.leg2_local, "venue 1 leg2 was local-CL-sourced");
     }
 
     #[test]
@@ -508,10 +569,10 @@ mod tests {
     fn v2_quotes_wire_both_legs() {
         let q = v2_venue(0, 1_000_000, 1_000_000, &[1_000], &[500], 30);
         assert_eq!(q.leg1.len(), 1);
-        assert!(q.leg1[0].is_some());
+        assert!(q.leg1[0].0.is_some());
         assert_eq!(q.leg2.len(), 1);
         assert_eq!(q.leg2[0].0, U256::from(500u64));
-        assert!(q.leg2[0].1.is_some());
+        assert!(q.leg2[0].1 .0.is_some());
     }
 
     #[test]
@@ -566,7 +627,7 @@ mod tests {
         let venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &[10_000])
             .into_iter()
             .map(|mut v| {
-                v.leg2 = v.leg2.iter().map(|&(q, _)| (q, None)).collect();
+                v.leg2 = v.leg2.iter().map(|&(q, _)| (q, (None, false))).collect();
                 v
             })
             .collect::<Vec<_>>();

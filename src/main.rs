@@ -5,7 +5,7 @@ use eyre::{eyre, Result};
 use futures::FutureExt;
 use morpho_arbitrage_bot::arbitrage::{
     best_candidate, can_still_win, pick_best_net, ranked_opportunities, v2_quotes, GasOutcome,
-    Opportunity, VenueQuotes,
+    LegOutput, Opportunity, VenueQuotes,
 };
 use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::config::{Config, VenueKind};
@@ -1009,22 +1009,25 @@ where
                                      // those sizes on-chain instead of dropping the venue or silently
                                      // losing the size. One small batch, same pinned block.
     let mut leg1_backfill: Vec<(usize, usize, QuoteRequest)> = Vec::new(); // (v3 idx, size idx, req)
-    let mut backfill_sizes: Vec<(usize, Vec<Option<U256>>)> = Vec::new(); // (v3 idx, per-size local results)
+    let mut backfill_sizes: Vec<(usize, Vec<LegOutput>)> = Vec::new(); // (v3 idx, per-size local results)
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
         let pool = cache.v3_pairs[j];
         if let Some(ps) = cached_cl(cache, pool, want_pending) {
             // Local CL quote path — identical math to the venue's quoter,
-            // validated against on-chain Quoter in tests/chain_cl.rs.
+            // validated against on-chain Quoter in tests/chain_cl.rs. Each
+            // entry records provenance: true = local CL math, false =
+            // backfilled from Quoter (see below).
             let zero_for_one = cache.pair_tokens[idx].token0 == cfg.loan_token;
             let lo = ps.as_ref();
-            let leg1: Vec<Option<U256>> = sizes
+            let leg1: Vec<LegOutput> = sizes
                 .iter()
-                .map(|&s| cl_quote(s, lo, zero_for_one))
+                .map(|&s| (cl_quote(s, lo, zero_for_one), true))
                 .collect();
             // Backfill any locally unpriceable size via QuoterV2 (partial
-            // cache failure must not silently drop sizes).
+            // cache failure must not silently drop sizes). Backfilled sizes
+            // are Quoter-sourced, so their provenance flips to false.
             for (si, q) in leg1.iter().enumerate() {
-                if q.is_none() {
+                if q.0.is_none() {
                     let venue = &cfg.venues[idx];
                     leg1_backfill.push((
                         j,
@@ -1045,8 +1048,13 @@ where
         }
         let base = next_unchecked;
         next_unchecked += n_sizes;
-        let leg1: Vec<Option<U256>> = snapshot.v3_quotes[base..base + n_sizes].to_vec();
-        if leg1.iter().all(|q| q.is_none()) {
+        // Uncached V3 venues are priced entirely via QuoterV2 — provenance
+        // false throughout.
+        let leg1: Vec<LegOutput> = snapshot.v3_quotes[base..base + n_sizes]
+            .iter()
+            .map(|&q| (q, false))
+            .collect();
+        if leg1.iter().all(|q| q.0.is_none()) {
             let label = if cfg.venues[idx].kind == VenueKind::Slipstream {
                 "Slipstream"
             } else {
@@ -1086,11 +1094,12 @@ where
         for (j, mut leg1) in backfill_sizes {
             for (k, (bj, si, _)) in leg1_backfill.iter().enumerate() {
                 if *bj == j {
-                    leg1[*si] = backfilled[k];
+                    // Backfilled from Quoter: provenance flips to false.
+                    leg1[*si] = (backfilled[k], false);
                 }
             }
             let idx = cache.v3_idx[j];
-            if leg1.iter().all(|q| q.is_none()) {
+            if leg1.iter().all(|q| q.0.is_none()) {
                 warn!(venue = idx, pool = %cache.v3_pairs[j], "CL pool unusable locally and via backfill; skipping venue");
                 continue;
             }
@@ -1115,9 +1124,11 @@ where
             if f == s {
                 continue;
             }
-            for q in other.quotes.leg1.iter().flatten() {
-                if !inputs.contains(q) {
-                    inputs.push(*q);
+            for (q, _) in other.quotes.leg1.iter() {
+                if let Some(q) = q {
+                    if !inputs.contains(q) {
+                        inputs.push(*q);
+                    }
                 }
             }
         }
@@ -1138,17 +1149,17 @@ where
         if let Some(reserves) = legs[s].v2_reserves {
             legs[s].quotes.leg2 = v2_quotes(venue_idx, reserves, venue.fee_bps, &[], &inputs).leg2;
         } else if let Some(ps) = cached_cl(cache, pool, want_pending) {
-            // Local CL path for leg 2 (quote -> loan). Inputs that fail
-            // locally are backfilled via QuoterV2 below - a partial cache
-            // miss must not silently drop the (leg1, size) pair.
+            // Local CL path for leg 2 (quote -> loan); provenance true.
+            // Inputs that fail locally are backfilled via QuoterV2 below —
+            // those flip to provenance false.
             let zero_for_one = cache.pair_tokens[venue_idx].token0 == cfg.quote_token;
-            let mut leg2: Vec<(U256, Option<U256>)> = inputs
+            let mut leg2: Vec<(U256, LegOutput)> = inputs
                 .iter()
-                .map(|&q| (q, cl_quote(q, ps.as_ref(), zero_for_one)))
+                .map(|&q| (q, (cl_quote(q, ps.as_ref(), zero_for_one), true)))
                 .collect();
             let failed: Vec<U256> = leg2
                 .iter()
-                .filter(|(_, o)| o.is_none())
+                .filter(|(_, (o, _))| o.is_none())
                 .map(|(i, _)| *i)
                 .collect();
             if !failed.is_empty() {
@@ -1171,8 +1182,9 @@ where
                     });
                 let mut it = backfilled.into_iter();
                 for (_, out) in leg2.iter_mut() {
-                    if out.is_none() {
-                        *out = it.next().flatten();
+                    if out.0.is_none() {
+                        // Backfilled from Quoter: provenance flips to false.
+                        *out = (it.next().flatten(), false);
                     }
                 }
             }
@@ -1197,10 +1209,11 @@ where
     if !phase2.is_empty() {
         let requests: Vec<QuoteRequest> = phase2.iter().map(|(_, r)| *r).collect();
         let results = fetch_quotes(provider, &requests, block).await?;
-        let mut grouped: Vec<Vec<(U256, Option<U256>)>> =
+        let mut grouped: Vec<Vec<(U256, LegOutput)>> =
             (0..legs.len()).map(|_| Vec::new()).collect();
         for ((s, req), out) in phase2.iter().zip(results) {
-            grouped[*s].push((req.amount_in, out));
+            // Phase-2 RPC quotes: provenance false throughout.
+            grouped[*s].push((req.amount_in, (out, false)));
         }
         for (s, leg2) in grouped.into_iter().enumerate() {
             if !leg2.is_empty() {
@@ -1455,25 +1468,28 @@ where
         return Ok(block_number);
     }
 
-    // Authoritative re-quote for every CL leg priced from local state
+    // Authoritative re-quote for every CL leg priced from LOCAL state
     // (finding #3): a locally cached pool can hold a WRONG-but-priceable
     // value (e.g. a misfolded Mint/Burn), and the scan-side fallback only
     // triggers on None — a wrong number sails through. Before broadcasting,
     // re-quote any locally-priced CL leg via the venue's Quoter at the scan
-    // block and require the outputs to agree within CL_AUTH_QUOTE_TOLERANCE_BPS.
-    // A V2/Aero leg is derived from fresh on-chain reserves each scan, so it
-    // carries no persistent state that could drift.
+    // block and require agreement within CL_AUTH_QUOTE_TOLERANCE_BPS.
+    // Provenance is carried per leg by the scanner: only legs it actually
+    // priced via local CL math (opp.legN_local) are validated — a
+    // Quoter-backfilled or uncached-Quoter output needs no check against
+    // its own source, and a V2/Aero leg derives from fresh on-chain
+    // reserves each scan with no persistent local state to drift.
     let mut auth_requests: Vec<QuoteRequest> = Vec::new();
     let mut auth_legs: Vec<(Address, U256)> = Vec::new(); // (pool, local output)
-    let v3_idx_of = |venue_idx: usize| -> Option<(usize, Address)> {
+    let v3_pool_of = |venue_idx: usize| -> Option<Address> {
         cache
             .v3_idx
             .iter()
             .position(|&v| v == venue_idx)
-            .map(|p| (p, cache.v3_pairs[p]))
+            .map(|p| cache.v3_pairs[p])
     };
-    if let Some((_, pool)) = v3_idx_of(opp.first) {
-        if cached_cl(cache, pool, want_pending).is_some() {
+    if opp.leg1_local {
+        if let Some(pool) = v3_pool_of(opp.first) {
             let venue = &cfg.venues[opp.first];
             auth_requests.push(QuoteRequest {
                 token_in: cfg.loan_token,
@@ -1486,8 +1502,8 @@ where
             auth_legs.push((pool, opp.quote_out));
         }
     }
-    if let Some((_, pool)) = v3_idx_of(opp.second) {
-        if cached_cl(cache, pool, want_pending).is_some() {
+    if opp.leg2_local {
+        if let Some(pool) = v3_pool_of(opp.second) {
             let venue = &cfg.venues[opp.second];
             auth_requests.push(QuoteRequest {
                 token_in: cfg.quote_token,
@@ -1544,17 +1560,48 @@ where
                 );
             }
             _ => {
-                // Batch-level transport error: the scan-side path would fall
-                // back to Quoter for unpriceable input, but here the trade
-                // hinges on unverified local state. Skip this scan; the next
-                // one re-quotes anyway.
-                warn!("authoritative CL quote batch failed; skipping trade this scan");
+                // Batch-level transport error: every leg that needed
+                // validation is left unverified. Evict those pools (sealed
+                // and pending, deduplicated) so the next scan prices them
+                // via Quoter instead of reusing the same unverified local
+                // state, then skip the trade.
+                warn!(
+                    legs = auth_legs.len(),
+                    "authoritative CL quote batch failed; dropping validated local CL state and skipping trade"
+                );
+                let pools: std::collections::HashSet<Address> =
+                    auth_legs.iter().map(|(p, _)| *p).collect();
+                for pool in pools {
+                    cache.state.remove(&pool);
+                    cache.pending.remove(&pool);
+                }
                 return Ok(block_number);
             }
         }
     }
 
     let params = executor::build_params(cfg, &opp, onchain_min_profit);
+
+    // Final pre-broadcast staleness guard. When scanning preconfirmed
+    // `pending` state, the tag is mutable — Base advances it ~every 200ms.
+    // The candidate-evaluation and authoritative-validation steps above add
+    // several more awaited RPCs after the phase-1→2 guard, during which a
+    // new Flashblock can land and make the selected opportunity (and its
+    // validated quotes) stale. Re-check the sealed block number one last
+    // time immediately before building/sending; if it moved, discard the
+    // scan rather than broadcast against a state the quotes no longer
+    // reflect. Same watermark comparison as the phase-1→2 guard.
+    if want_pending {
+        let now = provider.get_block_number().await?;
+        if now != scan_block_number {
+            info!(
+                scan_block = scan_block_number,
+                now_block = now,
+                "pending state advanced before broadcast; discarding stale opportunity"
+            );
+            return Ok(block_number);
+        }
+    }
 
     // Claim the in-flight slot before broadcasting so subsequent scans
     // skip trading while this tx is pending inclusion. Without this the
