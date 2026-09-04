@@ -356,8 +356,11 @@ pub fn decode_cl_liquidity(
     topics: &[B256],
     is_burn: bool,
 ) -> Option<ClLiquidityEvent> {
-    let idx = if is_burn { 0 } else { 1 };
-    if data.len() < (idx + 1) * 32 || topics.len() < 4 {
+    // Require the complete canonical payload: 4 words for Mint, 3 for Burn.
+    // A truncated log is ABI-invalid; decoding its prefix would feed garbage
+    // into the CL state store.
+    let (idx, words) = if is_burn { (0, 3) } else { (1, 4) };
+    if data.len() < words * 32 || topics.len() < 4 {
         return None;
     }
     let liquidity = U256::from_be_slice(&data[idx * 32..idx * 32 + 32]).to::<u128>();
@@ -625,6 +628,45 @@ mod tests {
         burn.extend(word(2));
         let ev = decode_cl_liquidity(&burn, &topics, true).unwrap();
         assert_eq!(ev.liquidity, 777);
+    }
+
+    #[test]
+    fn decode_cl_liquidity_rejects_truncated_payloads() {
+        let topics = vec![
+            B256::ZERO,
+            B256::repeat_byte(0xab),
+            B256::from_slice(&signed_word(-100)),
+            B256::from_slice(&signed_word(200)),
+        ];
+        // Mint needs all 4 words; a payload cut after the liquidity word
+        // (2 words) used to decode successfully — it must now be rejected.
+        for words in 0..4 {
+            let mut data = Vec::new();
+            for n in 0..words {
+                data.extend(word(777 + n));
+            }
+            assert!(
+                decode_cl_liquidity(&data, &topics, false).is_none(),
+                "mint with {words} words must be rejected"
+            );
+        }
+        // Burn needs all 3 words.
+        for words in 0..3 {
+            let mut data = Vec::new();
+            for n in 0..words {
+                data.extend(word(777 + n));
+            }
+            assert!(
+                decode_cl_liquidity(&data, &topics, true).is_none(),
+                "burn with {words} words must be rejected"
+            );
+        }
+        // And too few topics is rejected regardless of payload size.
+        let mut full_mint = word(0xdead);
+        full_mint.extend(word(777));
+        full_mint.extend(word(1));
+        full_mint.extend(word(2));
+        assert!(decode_cl_liquidity(&full_mint, &topics[..3], false).is_none());
     }
 
     #[test]
