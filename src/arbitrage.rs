@@ -81,6 +81,61 @@ pub fn find_opportunity(
     best
 }
 
+/// The best two-venue round trip of a scan, ignoring `min_profit`. Unlike
+/// `Opportunity`, the margin may be negative (a loss) — this is a diagnostic
+/// so operators can tell "spread was -0.02 WETH" apart from "spread was -5
+/// WETH" when tuning `min_profit`/`loan_amounts`.
+pub struct Candidate {
+    pub first: usize,
+    pub second: usize,
+    pub loan_amount: U256,
+    pub amount_out: U256,
+}
+
+/// Scan every ordered venue pair and loan size and return the outcome with
+/// the largest signed margin (`amount_out - loan_amount`), regardless of
+/// profitability. Returns None when no pair could be priced end-to-end.
+pub fn best_candidate(loan_amounts: &[U256], venues: &[VenueQuotes]) -> Option<Candidate> {
+    let mut best: Option<Candidate> = None;
+    for first in venues {
+        for (i, &loan_amount) in loan_amounts.iter().enumerate() {
+            let Some(quote_out) = first.leg1.get(i).copied().flatten() else {
+                continue;
+            };
+            for second in venues {
+                if first.venue == second.venue {
+                    continue;
+                };
+                let Some(amount_out) = second
+                    .leg2
+                    .iter()
+                    .find(|(q, _)| *q == quote_out)
+                    .and_then(|(_, out)| *out)
+                else {
+                    continue;
+                };
+                // Signed-margin comparison without signed ints: a profit
+                // (even 0) always beats any loss; within the same sign the
+                // larger magnitude wins.
+                let margin = (amount_out >= loan_amount, amount_out.abs_diff(loan_amount));
+                let better = match &best {
+                    None => true,
+                    Some(b) => margin > (b.amount_out >= b.loan_amount, b.amount_out.abs_diff(b.loan_amount)),
+                };
+                if better {
+                    best = Some(Candidate {
+                        first: first.venue,
+                        second: second.venue,
+                        loan_amount,
+                        amount_out,
+                    });
+                }
+            }
+        }
+    }
+    best
+}
+
 /// Build the `VenueQuotes` for a V2/Aero venue: exact constant-product math
 /// for both legs, given the pool reserves oriented loan-token first and the
 /// distinct leg-1 outputs of the other venues.
@@ -325,5 +380,43 @@ mod tests {
         assert_eq!(q.leg2.len(), 1);
         assert_eq!(q.leg2[0].0, U256::from(500u64));
         assert!(q.leg2[0].1.is_some());
+    }
+
+    #[test]
+    fn best_candidate_picks_max_margin_across_pairs() {
+        // Two dislocated pools: route 0→1 and 1→0 have different margins;
+        // best_candidate must return the larger one, ignoring min_profit.
+        let venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &[10_000]);
+        let c = best_candidate(&sizes(&[10_000]), &venues).expect("a candidate exists");
+        assert!(c.amount_out > c.loan_amount);
+        // It must match what find_opportunity would pick with no threshold.
+        let opp = find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO).unwrap();
+        assert_eq!((c.first, c.second), (opp.first, opp.second));
+        assert_eq!(c.amount_out, opp.amount_out);
+    }
+
+    #[test]
+    fn best_candidate_reports_loss_when_no_route_is_profitable() {
+        // Identical pools: every round trip loses to the fee. The best
+        // candidate is the smallest loss, not None.
+        let venues = pool_set(&[(1_000_000, 1_000_000), (1_000_000, 1_000_000)], &[10_000]);
+        assert!(find_opportunity(&sizes(&[10_000]), &venues, U256::ZERO).is_none());
+        let c = best_candidate(&sizes(&[10_000]), &venues).expect("a losing candidate exists");
+        assert!(c.amount_out < c.loan_amount, "fees guarantee a loss");
+        // ~2.5% round trip: two 0.3% fees plus price impact of a 1%-of-reserves swap.
+        let loss = c.loan_amount - c.amount_out;
+        assert!(loss > U256::from(200u64) && loss < U256::from(300u64));
+    }
+
+    #[test]
+    fn best_candidate_none_when_no_pair_is_pricable() {
+        let venues = pool_set(&[(1_000_000, 1_000_000), (1_100_000, 900_000)], &[10_000])
+            .into_iter()
+            .map(|mut v| {
+                v.leg2 = v.leg2.iter().map(|&(q, _)| (q, None)).collect();
+                v
+            })
+            .collect::<Vec<_>>();
+        assert!(best_candidate(&sizes(&[10_000]), &venues).is_none());
     }
 }

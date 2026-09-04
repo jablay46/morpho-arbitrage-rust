@@ -3,7 +3,7 @@ use alloy::primitives::{Address, U256};
 use clap::{Parser, Subcommand};
 use eyre::{eyre, Result};
 use futures::FutureExt;
-use morpho_arbitrage_bot::arbitrage::{find_opportunity, v2_quotes, VenueQuotes};
+use morpho_arbitrage_bot::arbitrage::{best_candidate, find_opportunity, v2_quotes, VenueQuotes};
 use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
@@ -1202,9 +1202,12 @@ where
 
     let quotes: Vec<VenueQuotes> = legs.into_iter().map(|l| l.quotes).collect();
 
-    for (i, q) in quotes.iter().enumerate() {
+    // Log with the DEX_VENUES config index (q.venue), not the legs assembly
+    // order (V2/Aero first, V3 last) — otherwise log lines cannot be mapped
+    // back to the config without knowing the internal ordering.
+    for q in &quotes {
         debug!(
-            venue = i,
+            venue = q.venue,
             leg1 = ?q.leg1,
             leg2 = ?q.leg2,
             "venue quotes"
@@ -1232,7 +1235,26 @@ where
     }
 
     let Some(opp) = find_opportunity(sizes, &quotes, cfg.min_profit) else {
-        info!("no profitable opportunity");
+        // Surface how far the best route was from profitability: without
+        // this, "every quote succeeded but spread was thin" and "half the
+        // pools were empty" produce the same opaque log line.
+        if let Some(c) = best_candidate(sizes, &quotes) {
+            let margin = if c.amount_out >= c.loan_amount {
+                format!("+{}", c.amount_out - c.loan_amount)
+            } else {
+                format!("-{}", c.loan_amount - c.amount_out)
+            };
+            info!(
+                first = c.first,
+                second = c.second,
+                loan_amount = %c.loan_amount,
+                amount_out = %c.amount_out,
+                margin_loan_units = %margin,
+                "no profitable opportunity; best candidate"
+            );
+        } else {
+            info!("no profitable opportunity; no venue pair could be priced end-to-end");
+        }
         return Ok(block_number);
     };
 
