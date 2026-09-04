@@ -115,12 +115,16 @@ pub fn best_candidate(loan_amounts: &[U256], venues: &[VenueQuotes]) -> Option<C
                     continue;
                 };
                 // Signed-margin comparison without signed ints: a profit
-                // (even 0) always beats any loss; within the same sign the
-                // larger magnitude wins.
-                let margin = (amount_out >= loan_amount, amount_out.abs_diff(loan_amount));
+                // (even 0) always beats any loss; among profits the larger
+                // wins; among losses the SMALLER magnitude wins.
                 let better = match &best {
                     None => true,
-                    Some(b) => margin > (b.amount_out >= b.loan_amount, b.amount_out.abs_diff(b.loan_amount)),
+                    Some(b) => match (amount_out >= loan_amount, b.amount_out >= b.loan_amount) {
+                        (true, false) => true,
+                        (false, true) => false,
+                        (true, true) => amount_out - loan_amount > b.amount_out - b.loan_amount,
+                        (false, false) => loan_amount - amount_out < b.loan_amount - b.amount_out,
+                    },
                 };
                 if better {
                     best = Some(Candidate {
@@ -406,6 +410,24 @@ mod tests {
         // ~2.5% round trip: two 0.3% fees plus price impact of a 1%-of-reserves swap.
         let loss = c.loan_amount - c.amount_out;
         assert!(loss > U256::from(200u64) && loss < U256::from(300u64));
+    }
+
+    #[test]
+    fn best_candidate_prefers_smallest_loss_across_sizes() {
+        // Identical pools, two sizes: the bigger swap has worse price impact,
+        // so it loses more. best_candidate must rank the smaller loss above
+        // the larger one (regression test for the absolute-magnitude bug).
+        let venues = pool_set(
+            &[(1_000_000, 1_000_000), (1_000_000, 1_000_000)],
+            &[10_000, 100_000],
+        );
+        let c = best_candidate(&sizes(&[10_000, 100_000]), &venues).expect("a candidate exists");
+        assert!(c.amount_out < c.loan_amount);
+        assert_eq!(
+            c.loan_amount,
+            U256::from(10_000u64),
+            "the least-negative margin is the smaller size, not the larger loss"
+        );
     }
 
     #[test]
