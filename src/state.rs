@@ -341,21 +341,25 @@ pub fn decode_cl_swap(data: &[u8]) -> Option<ClSwapEvent> {
     })
 }
 
-/// CL Mint/Burn canonical layout:
-///   Mint(address,address,int24,int24,uint128,uint256,uint256)
-///   Burn(address,int24,int24,uint128,uint256,uint256)
-/// topics: [sig, owner, tickLower, tickUpper]; data words: Mint carries
-/// `(amount0, amount1, amount)` so liquidity is word 2, Burn carries
+/// CL Mint/Burn canonical layout (Uniswap V3 and Slipstream):
+///   Mint(address sender, address indexed owner, int24 indexed tickLower,
+///        int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)
+///   Burn(address indexed owner, int24 indexed tickLower,
+///        int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)
+/// topics: [sig, owner, tickLower, tickUpper] for both.
+/// Data words: Mint carries `(sender, amount, amount0, amount1)` — the
+/// non-indexed `sender` occupies word 0, so liquidity is word 1; Burn carries
 /// `(amount, amount0, amount1)` so liquidity is word 0.
+/// (Verified against mainnet pool logs, e.g. Base block 50850365.)
 pub fn decode_cl_liquidity(
     data: &[u8],
     topics: &[B256],
     is_burn: bool,
 ) -> Option<ClLiquidityEvent> {
-    if data.len() < 96 || topics.len() < 4 {
+    let idx = if is_burn { 0 } else { 1 };
+    if data.len() < (idx + 1) * 32 || topics.len() < 4 {
         return None;
     }
-    let idx = if is_burn { 0 } else { 2 };
     let liquidity = U256::from_be_slice(&data[idx * 32..idx * 32 + 32]).to::<u128>();
     Some(ClLiquidityEvent {
         tick_lower: decode_i24(topics[2].as_slice()),
@@ -555,9 +559,14 @@ pub async fn bootstrap_cl_at<P: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     fn word(n: u64) -> Vec<u8> {
         U256::from(n).to_be_bytes::<32>().to_vec()
+    }
+
+    fn u256_word(v: U256) -> Vec<u8> {
+        v.to_be_bytes::<32>().to_vec()
     }
 
     fn signed_word(v: i32) -> Vec<u8> {
@@ -594,24 +603,54 @@ mod tests {
     fn decode_cl_liquidity_mint_and_burn_words() {
         let topics = vec![
             B256::ZERO,              // sig
-            B256::repeat_byte(0xab), // owner (indexed) — must be ignored
+            B256::repeat_byte(0xab), // owner (indexed) — value ignored
             B256::from_slice(&signed_word(-100)),
             B256::from_slice(&signed_word(200)),
         ];
-        let mut mint = word(1);
-        mint.extend(word(2));
+        // Mint data = (sender, amount, amount0, amount1): the non-indexed
+        // sender takes word 0, so liquidity lives in word 1.
+        let mut mint = word(0xdead);
         mint.extend(word(777));
+        mint.extend(word(1));
+        mint.extend(word(2));
         let ev = decode_cl_liquidity(&mint, &topics, false).unwrap();
         assert_eq!(
             (ev.tick_lower, ev.tick_upper, ev.liquidity),
             (-100, 200, 777)
         );
 
+        // Burn data = (amount, amount0, amount1): liquidity is word 0.
         let mut burn = word(777);
         burn.extend(word(1));
         burn.extend(word(2));
         let ev = decode_cl_liquidity(&burn, &topics, true).unwrap();
         assert_eq!(ev.liquidity, 777);
+    }
+
+    #[test]
+    fn decode_cl_liquidity_matches_real_mainnet_mint() {
+        // Real Mint log, UniV3 cbETH/WETH fee=500 pool on Base, block
+        // 50850365: a 10-tick-wide position adding 2.9 WETH.
+        let owner = Address::from_str("0x7a773846ffca2fd50a1796fd3b7dcc0123f7b003").unwrap();
+        let topics = vec![
+            B256::ZERO, // sig (not checked by the decoder)
+            owner.into_word(),
+            B256::from_slice(&signed_word(1270)),
+            B256::from_slice(&signed_word(1280)),
+        ];
+        let mut data = Vec::new();
+        // sender, amount (liquidity), amount0, amount1
+        data.extend(u256_word(
+            U256::from_str("699155565166914382192341895296991312181670162435").unwrap(),
+        ));
+        data.extend(u256_word(U256::from(5445657651465410868971u128)));
+        data.extend(word(0));
+        data.extend(u256_word(U256::from_str("2901907195763690922").unwrap()));
+        let ev = decode_cl_liquidity(&data, &topics, false).unwrap();
+        assert_eq!(
+            (ev.tick_lower, ev.tick_upper, ev.liquidity),
+            (1270, 1280, 5445657651465410868971u128)
+        );
     }
 
     #[test]
