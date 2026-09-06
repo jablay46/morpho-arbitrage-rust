@@ -28,22 +28,39 @@ pub struct Venue {
     pub router: Address,
     pub kind: VenueKind,
     /// Pool fee in basis points charged on the input amount (30 = 0.3%).
+    #[serde(default = "default_fee_bps")]
     pub fee_bps: u64,
     /// Pool factory. Required when `pair` is zero (auto-resolve);
     /// Address::ZERO for Aerodrome means the router's default factory.
+    #[serde(default)]
     pub factory: Address,
     /// Aerodrome stable-pool flag. Unused for V2/V3/V4.
+    #[serde(default)]
     pub stable: bool,
     /// Uniswap V3 fee tier in hundredths of a bip (500 = 0.05%). Unused for V2/Aero.
+    #[serde(default = "default_fee_tier")]
     pub fee_tier: u32,
     /// Uniswap V4 pool ID (bytes32) for PoolManager. Unused for V2/V3.
-    #[serde(deserialize_with = "deserialize_pool_id")]
+    #[serde(default = "default_pool_id")]
     pub pool_id: [u8; 32],
     /// Per-venue QuoterV2 override (V3 only). Address::ZERO = use the
     /// global `Config::quoter_v2`. Needed for V3 venues whose quotes live
     /// on a different deployment (e.g. PancakeSwap V3), since each factory
     /// has its own quoter contract.
+    #[serde(default)]
     pub quoter: Address,
+}
+
+fn default_fee_bps() -> u64 {
+    30
+}
+
+fn default_fee_tier() -> u32 {
+    3000
+}
+
+fn default_pool_id() -> [u8; 32] {
+    [0u8; 32]
 }
 
 impl Venue {
