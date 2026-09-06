@@ -41,7 +41,7 @@ pub struct Venue {
     #[serde(default = "default_fee_tier")]
     pub fee_tier: u32,
     /// Uniswap V4 pool ID (bytes32) for PoolManager. Unused for V2/V3.
-    #[serde(default = "default_pool_id")]
+    #[serde(deserialize_with = "deserialize_pool_id", default = "default_pool_id")]
     pub pool_id: [u8; 32],
     /// Per-venue QuoterV2 override (V3 only). Address::ZERO = use the
     /// global `Config::quoter_v2`. Needed for V3 venues whose quotes live
@@ -390,7 +390,7 @@ impl Config {
         // DEX venues: load from CONFIG_FILE (default config.toml), with DEX_VENUES
         // as a deprecated fallback. This avoids silently ignoring custom
         // venue lists in dotenv files after the TOML migration.
-        let venues = {
+        let mut venues = {
             let config_path = env::var("CONFIG_FILE").unwrap_or_else(|_| "config.toml".to_string());
             match std::fs::read_to_string(&config_path) {
                 Ok(config_text) => {
@@ -405,7 +405,7 @@ impl Config {
                             "WARNING: DEX_VENUES is deprecated and will be removed in a future release. \
                              Please migrate to config.toml (see CONFIG_FILE)."
                         );
-                        parse_dex_venues(&venues_raw)?
+                        Self::parse_dex_venues(&venues_raw)?
                     } else {
                         return Err(eyre!(
                             "no venue configuration found: set CONFIG_FILE or DEX_VENUES (deprecated)"
@@ -420,7 +420,7 @@ impl Config {
         if venues.len() < 2 {
             return Err(eyre!("at least two venues required"));
         }
-        for (idx, venue) in venues.iter_mut().enumerate() {
+        for (idx, venue) in venues.iter().enumerate() {
             if venue.fee_bps >= 10_000 {
                 return Err(eyre!("venue {idx}: fee_bps {} too high", venue.fee_bps));
             }
