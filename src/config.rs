@@ -390,7 +390,7 @@ impl Config {
         // DEX venues: load from CONFIG_FILE (default config.toml), with DEX_VENUES
         // as a deprecated fallback. This avoids silently ignoring custom
         // venue lists in dotenv files after the TOML migration.
-        let mut venues = {
+        let venues = {
             let config_path = env::var("CONFIG_FILE").unwrap_or_else(|_| "config.toml".to_string());
             match std::fs::read_to_string(&config_path) {
                 Ok(config_text) => {
