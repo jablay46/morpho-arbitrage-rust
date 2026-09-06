@@ -283,7 +283,8 @@ Variabel yang tersedia:
 | `LOAN_TOKEN` | Ya | Token yang dipinjam + unit profit. **Harus sama dengan `WRAPPED_NATIVE`** (gas dibayar ETH; hanya loan native yang bisa memperhitungkan gas secara eksak). |
 | `QUOTE_TOKEN` | Ya | Token perantara cycle (mis. USDC `0x8335...2913`). |
 | `WRAPPED_NATIVE` | Tidak | Default WETH Base. `LOAN_TOKEN` wajib menyamainya. |
-| `DEX_VENUES` | Ya | Daftar venue, format di bawah. |
+| `CONFIG_FILE` | Tidak | Path file TOML berisi daftar venue (`[[venues]]`). Default `config.toml`. **Direkomendasikan menggantikan `DEX_VENUES`.** |
+| `DEX_VENUES` | Tidak* | **Deprecated.** Daftar venue koma-separated (format lama). Masih didukung tapi akan dihapus; gunakan `CONFIG_FILE`. |
 | `LOAN_AMOUNTS` | Tidak | Ukuran pinjaman yang diuji, koma-separated (base unit). Default `1000000000000000000` (1 token). |
 | `MIN_PROFIT` | Ya* | Profit bersih minimum (base unit loan token). **Harus > 0 jika `DRY_RUN=false`**. |
 | `SLIPPAGE_BPS` | Tidak | Toleransi slippage per leg dalam bps. Default `50` (0.5%). |
@@ -300,13 +301,22 @@ Variabel yang tersedia:
 | `USE_PENDING_LOGS` | Tidak | Subscribe `pendingLogs` (Flashblock-level). Default `true`. Picu scan ~200ms setelah pool event. Best-effort fallback ke log sealed. |
 | `USE_PENDING_SIM` | Tidak | Gate `estimate_gas` terhadap state `pending`. Default `false` (off; menambah eth_call per peluang). |
 
-Format `DEX_VENUES` (koma-separated):
+Format `config.toml` (direkomendasikan):
 
-```
-<POOL>:<ROUTER>[:<kind>[:<fee_bps>[:<factory>[:<stable>[:<fee_tier>[:<pool_id>[:<quoter>]]]]]]
+```toml
+[[venues]]
+pair = "auto"                    # atau alamat pool, "auto" = resolve dari factory
+router = "0x4752ba5DBc23f44D87826276BF6Fd6b1c372aD24"
+kind = "v2"                      # v2 | aero | v3 | slipstream (v4 belum didukung)
+fee_bps = 30                     # fee pool dalam basis point (default 30; untuk V2/Aero)
+factory = "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
+stable = false                   # true untuk pool stable Aerodrome
+fee_tier = 3000                  # fee tier V3 (500/3000/10000); untuk slipstream = tickSpacing (1/50/100/200/2000)
+pool_id = "0x0000..."            # Uniswap V4 pool ID (default 0)
+quoter = "0x0000..."             # override QuoterV2 per-venue (V3, opsional)
 ```
 
-- `POOL` = alamat pool/pair, atau `auto` untuk resolve dari `factory` saat startup.
+- `pair` = alamat pool/pair, atau `"auto"` untuk resolve dari `factory` saat startup.
 - `kind` = `v2` (default) | `aero` | `v3` | `slipstream` (`v4` belum didukung).
 - `fee_bps` = fee pool dalam basis point (default 30; untuk V2/Aero).
 - `fee_tier` = fee tier Uniswap V3 dalam hundredths of a bip (500/3000/10000).
@@ -315,6 +325,17 @@ Format `DEX_VENUES` (koma-separated):
 - `quoter` = override QuoterV2 per-venue (V3, opsional). Kosongkan untuk
   memakai `QUOTER_V2` global. Wajib diisi untuk V3 venue non-Uniswap
   (mis. PancakeSwap V3) karena tiap factory punya quoter sendiri.
+
+---
+
+**Legacy format `DEX_VENUES` (deprecated, akan dihapus):**
+
+Jika `CONFIG_FILE` tidak diset dan `DEX_VENUES` ada di environment, bot akan
+menggunakannya sambil menampilkan peringatan deprecation. Format lama:
+
+```
+<POOL>:<ROUTER>[:<kind>[:<fee_bps>[:<factory>[:<stable>[:<fee_tier>[:<pool_id>[:<quoter>]]]]]]
+```
 
 Alamat terverifikasi di Base:
 
@@ -337,18 +358,58 @@ WETH                0x4200000000000000000000000000000000000006
 USDC                0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
 ```
 
-Contoh WETH/USDC di 3 venue sekaligus (pool auto-resolve):
+Contoh WETH/USDC di 3 venue sekaligus (pool auto-resolve) — format TOML:
 
-```bash
-DEX_VENUES=auto:0x4752ba5DBc23f44D87826276BF6Fd6b1c372aD24:v2:30:0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6,auto:0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874e43:aero:30:0x420DD381b31aEf6683db6B902084cB0FFECe40Da,auto:0x2626664c2603336E57B271c5C0b26F421741e481:v3:30:0x33128a8fC17869897dcE68Ed026d694621f6FDfD::3000
+```toml
+[[venues]]
+pair = "auto"
+router = "0x4752ba5DBc23f44D87826276BF6Fd6b1c372aD24"
+kind = "v2"
+fee_bps = 30
+factory = "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
+stable = false
+fee_tier = 3000
+pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+quoter = "0x0000000000000000000000000000000000000000"
+
+[[venues]]
+pair = "auto"
+router = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874e43"
+kind = "aero"
+fee_bps = 30
+factory = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
+stable = false
+fee_tier = 3000
+pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+quoter = "0x0000000000000000000000000000000000000000"
+
+[[venues]]
+pair = "auto"
+router = "0x2626664c2603336E57B271c5C0b26F421741e481"
+kind = "v3"
+fee_bps = 30
+factory = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+stable = false
+fee_tier = 3000
+pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+quoter = "0x0000000000000000000000000000000000000000"
 ```
 
 Contoh menambah PancakeSwap V3 (fee tier 500 = 0.05%). Pool di-resolve
 otomatis dari factory, dan `quoter` diisi karena quoter Pancake berbeda
 dari Uniswap:
 
-```bash
-DEX_VENUES=...,auto:0x1b81D678ffb9C0263b24A97847620C99d213eB14:v3:30:0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865::500::0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
+```toml
+[[venues]]
+pair = "auto"
+router = "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
+kind = "v3"
+fee_bps = 30
+factory = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
+stable = false
+fee_tier = 500
+pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+quoter = "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"
 ```
 
 Catatan: `auto` untuk V3 me-resolve pool lewat `getPool(loan, quote,
@@ -360,8 +421,17 @@ Contoh menambah Aerodrome Slipstream (CL). Di sini `fee_tier` membawa
 tickSpacing=100, dan quoter Slipstream (0x254c...) dipakai otomatis —
 tidak perlu mengisi kolom `quoter`:
 
-```bash
-DEX_VENUES=...,auto:0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5:slipstream:30:0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A:false:100
+```toml
+[[venues]]
+pair = "auto"
+router = "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"
+kind = "slipstream"
+fee_bps = 30
+factory = "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"
+stable = false
+fee_tier = 100
+pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+quoter = "0x0000000000000000000000000000000000000000"
 ```
 
 ## 6. Menjalankan Bot
@@ -444,7 +514,7 @@ Tips produksi:
 | Gejala | Penyebab umum | Solusi |
 |---|---|---|
 | `missing env var ...` | `.env` belum dibuat/diisi | `cp .env.example .env` lalu isi |
-| `venue N pool ... does not contain loan/quote token` | pool bukan pasangan LOAN/QUOTE | periksa alamat pool di `DEX_VENUES` |
+| `venue N pool ... does not contain loan/quote token` | pool bukan pasangan LOAN/QUOTE | periksa alamat pool di `config.toml` (atau `DEX_VENUES` legacy) |
 | `V3 venue returned no usable quotes` | fee_tier salah / pool tipis / `QUOTER_V2` salah chain | cek `fee_tier` cocok dengan pool (500/3000/10000); cek alamat QuoterV2 |
 | `MIN_PROFIT must be greater than zero` | live mode dengan floor 0 | set `MIN_PROFIT` > 0 |
 | `opportunity filtered out by gas cost` terus-menerus | spread < biaya gas | normal; naikkan `LOAN_AMOUNTS` atau tunggu volatilitas |

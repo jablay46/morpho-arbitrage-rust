@@ -187,6 +187,137 @@ impl Config {
             || self.use_pending_sim
     }
 
+    fn parse_dex_venues(venues_raw: &str) -> Result<Vec<Venue>> {
+        let venues = venues_raw
+            .split(',')
+            .map(|entry| {
+                let entry = entry.trim();
+                let mut parts = entry.split(':');
+                let pair = parts.next().ok_or_else(|| {
+                    eyre!("invalid DEX_VENUES entry '{entry}', expected <pair>:<router>...")
+                })?;
+                let router = parts
+                    .next()
+                    .ok_or_else(|| eyre!("invalid DEX_VENUES entry '{entry}', missing router"))?;
+                let kind = match parts.next().map(str::trim).unwrap_or("v2") {
+                    "v2" => VenueKind::UniswapV2,
+                    "aero" => VenueKind::Aerodrome,
+                    "v3" => VenueKind::UniswapV3,
+                    "slipstream" | "cl" => VenueKind::Slipstream,
+                    "v4" => {
+                        return Err(eyre!(
+                            "kind 'v4' in DEX_VENUES '{entry}' is not supported yet"
+                        ));
+                    }
+                    other => return Err(eyre!("invalid kind '{other}' in DEX_VENUES '{entry}'")),
+                };
+                let fee_bps = parts
+                    .next()
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u64>()
+                            .map_err(|e| eyre!("invalid fee_bps in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(30);
+                if fee_bps >= 10_000 {
+                    return Err(eyre!("fee_bps {fee_bps} too high in DEX_VENUES '{entry}'"));
+                }
+                // Optional fields: empty string = default.
+                let factory = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        Address::from_str(s.trim())
+                            .map_err(|e| eyre!("invalid factory in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(Address::ZERO);
+                let stable = parts
+                    .next()
+                    .map(|s| matches!(s.trim(), "true" | "1" | "yes"))
+                    .unwrap_or(false);
+                let fee_tier = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u32>()
+                            .map_err(|e| eyre!("invalid fee_tier in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(3000);
+                let pool_id = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        let s = s.trim().trim_start_matches("0x");
+                        let bytes = alloy::hex::decode(s)
+                            .map_err(|e| eyre!("invalid pool_id in DEX_VENUES '{entry}': {e}"))?;
+                        if bytes.len() != 32 {
+                            return Err(eyre!("pool_id must be 32 bytes in DEX_VENUES '{entry}'"));
+                        }
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        Ok::<_, eyre::Report>(arr)
+                    })
+                    .transpose()?
+                    .unwrap_or([0u8; 32]);
+                // Optional per-venue QuoterV2 override (V3 only); empty or
+                // absent = fall back to the global QUOTER_V2.
+                let quoter = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        Address::from_str(s.trim())
+                            .map_err(|e| eyre!("invalid quoter in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(Address::ZERO);
+                if parts.next().is_some() {
+                    return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
+                }
+                // Slipstream CL pools are discriminated by tickSpacing (not a
+                // fee), stored in `fee_tier` (uint24) so the leg carries it to
+                // both the quoter call and the on-chain exactInputSingle.
+                if kind == VenueKind::Slipstream && !matches!(fee_tier, 1 | 50 | 100 | 200 | 2000) {
+                    return Err(eyre!(
+                        "DEX_VENUES '{entry}': slipstream fee_tier must be a tickSpacing \
+                         in {{1, 50, 100, 200, 2000}}"
+                    ));
+                }
+                // "auto" = resolve the pool from the factory at startup.
+                let pair = if pair.trim().eq_ignore_ascii_case("auto") {
+                    if factory == Address::ZERO && kind != VenueKind::Aerodrome {
+                        return Err(eyre!(
+                            "DEX_VENUES '{entry}': 'auto' pool requires a factory address"
+                        ));
+                    }
+                    Address::ZERO
+                } else {
+                    Address::from_str(pair.trim())
+                        .map_err(|e| eyre!("invalid pair in DEX_VENUES '{entry}': {e}"))?
+                };
+                Ok::<_, eyre::Report>(Venue {
+                    pair,
+                    router: Address::from_str(router.trim())
+                        .map_err(|e| eyre!("invalid router in DEX_VENUES '{entry}': {e}"))?,
+                    kind,
+                    fee_bps,
+                    factory,
+                    stable,
+                    fee_tier,
+                    pool_id,
+                    quoter,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if venues.len() < 2 {
+            return Err(eyre!("DEX_VENUES needs at least two venues"));
+        }
+        Ok(venues)
+    }
+
     pub fn from_env() -> Result<Self> {
         // ENV_FILE selects an alternate dotenv file (e.g. .env.virtual);
         // unset = default .env lookup, missing file = hard error since the
@@ -239,15 +370,26 @@ impl Config {
             ));
         }
 
-        // DEX venues loaded from config.toml (see [[venues]] tables).
-        let config_path = env::var("CONFIG_FILE").unwrap_or_else(|_| "config.toml".to_string());
-        let config_text = std::fs::read_to_string(&config_path)
-            .map_err(|e| eyre!("failed to read {config_path}: {e}"))?;
-        let config: TomlConfig = toml::from_str(&config_text)
-            .map_err(|e| eyre!("failed to parse {config_path}: {e}"))?;
-        let mut venues = config.venues;
+        // DEX venues: prefer config.toml, but fall back to DEX_VENUES env var
+        // with a deprecation warning. This avoids silently ignoring custom
+        // venue lists in dotenv files after the TOML migration.
+        let venues = if let Ok(venues_raw) = env::var("DEX_VENUES") {
+            eprintln!(
+                "WARNING: DEX_VENUES is deprecated and will be removed in a future release. \
+                 Please migrate to config.toml (see CONFIG_FILE)."
+            );
+            parse_dex_venues(&venues_raw)?
+        } else {
+            // DEX venues loaded from config.toml (see [[venues]] tables).
+            let config_path = env::var("CONFIG_FILE").unwrap_or_else(|_| "config.toml".to_string());
+            let config_text = std::fs::read_to_string(&config_path)
+                .map_err(|e| eyre!("failed to read {config_path}: {e}"))?;
+            let config: TomlConfig = toml::from_str(&config_text)
+                .map_err(|e| eyre!("failed to parse {config_path}: {e}"))?;
+            config.venues
+        };
         if venues.len() < 2 {
-            return Err(eyre!("config.toml needs at least two venues"));
+            return Err(eyre!("at least two venues required"));
         }
         for (idx, venue) in venues.iter_mut().enumerate() {
             if venue.fee_bps >= 10_000 {
@@ -270,7 +412,7 @@ impl Config {
             }
             if venue.kind == VenueKind::UniswapV4 {
                 return Err(eyre!(
-                    "venue {idx}: kind 'v4' in config.toml is not supported yet"
+                    "venue {idx}: kind 'v4' is not supported yet"
                 ));
             }
         }
