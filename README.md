@@ -284,7 +284,7 @@ Variabel yang tersedia:
 | `QUOTE_TOKEN` | Ya | Token perantara cycle (mis. USDC `0x8335...2913`). |
 | `WRAPPED_NATIVE` | Tidak | Default WETH Base. `LOAN_TOKEN` wajib menyamainya. |
 | `CONFIG_FILE` | Tidak | Path file TOML berisi daftar venue (`[[venues]]`). Default `config.toml`. **Direkomendasikan menggantikan `DEX_VENUES`.** |
-| `DEX_VENUES` | Tidak* | **Deprecated.** Daftar venue koma-separated (format lama). Masih didukung tapi akan dihapus; gunakan `CONFIG_FILE`. |
+| `DEX_VENUES` | Tidak* | **Deprecated.** Daftar venue koma-separated (format lama). Hanya dipakai sebagai fallback jika `CONFIG_FILE` (atau default `config.toml`) tidak ditemukan. Akan dihapus di rilis mendatang. |
 | `LOAN_AMOUNTS` | Tidak | Ukuran pinjaman yang diuji, koma-separated (base unit). Default `1000000000000000000` (1 token). |
 | `MIN_PROFIT` | Ya* | Profit bersih minimum (base unit loan token). **Harus > 0 jika `DRY_RUN=false`**. |
 | `SLIPPAGE_BPS` | Tidak | Toleransi slippage per leg dalam bps. Default `50` (0.5%). |
@@ -330,8 +330,7 @@ quoter = "0x0000..."             # override QuoterV2 per-venue (V3, opsional)
 
 **Legacy format `DEX_VENUES` (deprecated, akan dihapus):**
 
-Jika `CONFIG_FILE` tidak diset dan `DEX_VENUES` ada di environment, bot akan
-menggunakannya sambil menampilkan peringatan deprecation. Format lama:
+Format ini hanya digunakan sebagai *fallback* jika file konfigurasi TOML (via `CONFIG_FILE` atau default `config.toml`) tidak ditemukan. Bot akan menampilkan peringatan deprecation saat menggunakannya. Format lama:
 
 ```
 <POOL>:<ROUTER>[:<kind>[:<fee_bps>[:<factory>[:<stable>[:<fee_tier>[:<pool_id>[:<quoter>]]]]]]

@@ -370,23 +370,35 @@ impl Config {
             ));
         }
 
-        // DEX venues: prefer config.toml, but fall back to DEX_VENUES env var
-        // with a deprecation warning. This avoids silently ignoring custom
+        // DEX venues: load from CONFIG_FILE (default config.toml), with DEX_VENUES
+        // as a deprecated fallback. This avoids silently ignoring custom
         // venue lists in dotenv files after the TOML migration.
-        let venues = if let Ok(venues_raw) = env::var("DEX_VENUES") {
-            eprintln!(
-                "WARNING: DEX_VENUES is deprecated and will be removed in a future release. \
-                 Please migrate to config.toml (see CONFIG_FILE)."
-            );
-            parse_dex_venues(&venues_raw)?
-        } else {
-            // DEX venues loaded from config.toml (see [[venues]] tables).
+        let venues = {
             let config_path = env::var("CONFIG_FILE").unwrap_or_else(|_| "config.toml".to_string());
-            let config_text = std::fs::read_to_string(&config_path)
-                .map_err(|e| eyre!("failed to read {config_path}: {e}"))?;
-            let config: TomlConfig = toml::from_str(&config_text)
-                .map_err(|e| eyre!("failed to parse {config_path}: {e}"))?;
-            config.venues
+            match std::fs::read_to_string(&config_path) {
+                Ok(config_text) => {
+                    let config: TomlConfig = toml::from_str(&config_text)
+                        .map_err(|e| eyre!("failed to parse {config_path}: {e}"))?;
+                    config.venues
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Config file not found; try deprecated DEX_VENUES fallback
+                    if let Ok(venues_raw) = env::var("DEX_VENUES") {
+                        eprintln!(
+                            "WARNING: DEX_VENUES is deprecated and will be removed in a future release. \
+                             Please migrate to config.toml (see CONFIG_FILE)."
+                        );
+                        parse_dex_venues(&venues_raw)?
+                    } else {
+                        return Err(eyre!(
+                            "no venue configuration found: set CONFIG_FILE or DEX_VENUES (deprecated)"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(eyre!("failed to read {config_path}: {e}"));
+                }
+            }
         };
         if venues.len() < 2 {
             return Err(eyre!("at least two venues required"));
