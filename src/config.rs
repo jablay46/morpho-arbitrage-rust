@@ -22,8 +22,8 @@ pub enum VenueKind {
 /// One tradable venue: a pool plus its swap router and fee model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct Venue {
-    /// Pool/pair address, or Address::ZERO to auto-resolve from the factory
-    /// at startup (requires `factory`).
+    /// Pool/pair address, or "auto" to resolve from factory at startup.
+    #[serde(deserialize_with = "deserialize_pair")]
     pub pair: Address,
     pub router: Address,
     pub kind: VenueKind,
@@ -52,6 +52,17 @@ impl Venue {
     pub fn pool_address(&self) -> Address {
         self.pair
     }
+}
+
+fn deserialize_pair<'de, D>(deserializer: D) -> Result<Address, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.trim().eq_ignore_ascii_case("auto") {
+        return Ok(Address::ZERO);
+    }
+    Address::from_str(s.trim()).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_pool_id<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
