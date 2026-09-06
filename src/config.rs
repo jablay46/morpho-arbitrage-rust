@@ -1,28 +1,26 @@
 use alloy::primitives::{Address, U256};
 use eyre::{eyre, Result};
+use serde::Deserialize;
 use std::env;
 use std::str::FromStr;
 
 /// Router family of a venue; must match `KIND_*` constants in the contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum VenueKind {
-    /// Uniswap-V2-style router taking `address[] path` (also Sushiswap V2,
-    /// Pancakeswap V2).
+    #[serde(rename = "v2")]
     UniswapV2 = 0,
-    /// Aerodrome-style router taking `Route[]` structs.
+    #[serde(rename = "aero")]
     Aerodrome = 1,
-    /// Uniswap-V3-style router using `exactInputSingle` with `sqrtPriceLimitX96`.
+    #[serde(rename = "v3")]
     UniswapV3 = 2,
-    /// Uniswap-V4-style PoolManager using `unlock` + `swap` with hooks.
+    #[serde(rename = "v4")]
     UniswapV4 = 3,
-    /// Aerodrome Slipstream concentrated-liquidity router. Structurally the
-    /// same exactInputSingle shape as Uniswap V3, but the pool discriminator
-    /// is `int24 tickSpacing` instead of `uint24 fee`, so it has a different
-    /// selector and is NOT callable through the V3 branch.
+    #[serde(rename = "slipstream", alias = "cl")]
     Slipstream = 4,
 }
 
 /// One tradable venue: a pool plus its swap router and fee model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct Venue {
     /// Pool/pair address, or Address::ZERO to auto-resolve from the factory
     /// at startup (requires `factory`).
@@ -39,6 +37,7 @@ pub struct Venue {
     /// Uniswap V3 fee tier in hundredths of a bip (500 = 0.05%). Unused for V2/Aero.
     pub fee_tier: u32,
     /// Uniswap V4 pool ID (bytes32) for PoolManager. Unused for V2/V3.
+    #[serde(deserialize_with = "deserialize_pool_id")]
     pub pool_id: [u8; 32],
     /// Per-venue QuoterV2 override (V3 only). Address::ZERO = use the
     /// global `Config::quoter_v2`. Needed for V3 venues whose quotes live
@@ -53,6 +52,27 @@ impl Venue {
     pub fn pool_address(&self) -> Address {
         self.pair
     }
+}
+
+fn deserialize_pool_id<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    let s = s.trim_start_matches("0x");
+    let bytes = alloy::hex::decode(s).map_err(serde::de::Error::custom)?;
+    if bytes.len() != 32 {
+        return Err(serde::de::Error::custom("pool_id must be 32 bytes"));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlConfig {
+    #[serde(rename = "venues")]
+    venues: Vec<Venue>,
 }
 
 /// Bot configuration loaded from environment variables / .env file.
@@ -208,143 +228,40 @@ impl Config {
             ));
         }
 
-        // DEX venues as comma-separated entries:
-        //   <pair>:<router>[:<kind>[:<fee_bps>[:<factory>[:<stable>[:<fee_tier>[:<pool_id>]]]]]
-        // kind: v2 (default) | aero | v3 | v4
-        // fee_bps: default 30 (V2/Aero only; V3 uses fee_tier, V4 uses pool_id)
-        // factory: default zero (Aero only)
-        // stable: default false (Aero only)
-        // fee_tier: default 3000 (V3 only, in hundredths of a bip)
-        // pool_id: default zero (V4 only, bytes32 hex)
-        let venues_raw = env::var("DEX_VENUES").map_err(|_| eyre!("missing env var DEX_VENUES"))?;
-        let venues = venues_raw
-            .split(',')
-            .map(|entry| {
-                let entry = entry.trim();
-                let mut parts = entry.split(':');
-                let pair = parts.next().ok_or_else(|| {
-                    eyre!("invalid DEX_VENUES entry '{entry}', expected <pair>:<router>...")
-                })?;
-                let router = parts
-                    .next()
-                    .ok_or_else(|| eyre!("invalid DEX_VENUES entry '{entry}', missing router"))?;
-                let kind = match parts.next().map(str::trim).unwrap_or("v2") {
-                    "v2" => VenueKind::UniswapV2,
-                    "aero" => VenueKind::Aerodrome,
-                    "v3" => VenueKind::UniswapV3,
-                    "slipstream" | "cl" => VenueKind::Slipstream,
-                    // V4 reverts on-chain (unlock/lock pattern unsupported);
-                    // fail fast at config time instead of at execution.
-                    "v4" => {
-                        return Err(eyre!(
-                            "kind 'v4' in DEX_VENUES '{entry}' is not supported yet"
-                        ));
-                    }
-                    other => return Err(eyre!("invalid kind '{other}' in DEX_VENUES '{entry}'")),
-                };
-                let fee_bps = parts
-                    .next()
-                    .map(|s| {
-                        s.trim()
-                            .parse::<u64>()
-                            .map_err(|e| eyre!("invalid fee_bps in DEX_VENUES '{entry}': {e}"))
-                    })
-                    .transpose()?
-                    .unwrap_or(30);
-                if fee_bps >= 10_000 {
-                    return Err(eyre!("fee_bps {fee_bps} too high in DEX_VENUES '{entry}'"));
-                }
-                // Optional fields: empty string = default.
-                let factory = parts
-                    .next()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| {
-                        Address::from_str(s.trim())
-                            .map_err(|e| eyre!("invalid factory in DEX_VENUES '{entry}': {e}"))
-                    })
-                    .transpose()?
-                    .unwrap_or(Address::ZERO);
-                let stable = parts
-                    .next()
-                    .map(|s| matches!(s.trim(), "true" | "1" | "yes"))
-                    .unwrap_or(false);
-                let fee_tier = parts
-                    .next()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| {
-                        s.trim()
-                            .parse::<u32>()
-                            .map_err(|e| eyre!("invalid fee_tier in DEX_VENUES '{entry}': {e}"))
-                    })
-                    .transpose()?
-                    .unwrap_or(3000);
-                let pool_id = parts
-                    .next()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| {
-                        let s = s.trim().trim_start_matches("0x");
-                        let bytes = alloy::hex::decode(s)
-                            .map_err(|e| eyre!("invalid pool_id in DEX_VENUES '{entry}': {e}"))?;
-                        if bytes.len() != 32 {
-                            return Err(eyre!("pool_id must be 32 bytes in DEX_VENUES '{entry}'"));
-                        }
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
-                        Ok::<_, eyre::Report>(arr)
-                    })
-                    .transpose()?
-                    .unwrap_or([0u8; 32]);
-                // Optional per-venue QuoterV2 override (V3 only); empty or
-                // absent = fall back to the global QUOTER_V2.
-                let quoter = parts
-                    .next()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| {
-                        Address::from_str(s.trim())
-                            .map_err(|e| eyre!("invalid quoter in DEX_VENUES '{entry}': {e}"))
-                    })
-                    .transpose()?
-                    .unwrap_or(Address::ZERO);
-                if parts.next().is_some() {
-                    return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
-                }
-                // Slipstream CL pools are discriminated by tickSpacing (not a
-                // fee), stored in `fee_tier` (uint24) so the leg carries it to
-                // both the quoter call and the on-chain exactInputSingle.
-                if kind == VenueKind::Slipstream && !matches!(fee_tier, 1 | 50 | 100 | 200 | 2000) {
+        // DEX venues loaded from config.toml (see [[venues]] tables).
+        let config_path = env::var("CONFIG_FILE").unwrap_or_else(|_| "config.toml".to_string());
+        let config_text = std::fs::read_to_string(&config_path)
+            .map_err(|e| eyre!("failed to read {config_path}: {e}"))?;
+        let config: TomlConfig = toml::from_str(&config_text)
+            .map_err(|e| eyre!("failed to parse {config_path}: {e}"))?;
+        let mut venues = config.venues;
+        if venues.len() < 2 {
+            return Err(eyre!("config.toml needs at least two venues"));
+        }
+        for (idx, venue) in venues.iter_mut().enumerate() {
+            if venue.fee_bps >= 10_000 {
+                return Err(eyre!("venue {idx}: fee_bps {} too high", venue.fee_bps));
+            }
+            if venue.kind == VenueKind::Slipstream
+                && !matches!(venue.fee_tier, 1 | 50 | 100 | 200 | 2000)
+            {
+                return Err(eyre!(
+                    "venue {idx}: slipstream fee_tier must be a tickSpacing \
+                     in {{1, 50, 100, 200, 2000}}"
+                ));
+            }
+            if venue.pair.is_zero() {
+                if venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome {
                     return Err(eyre!(
-                        "DEX_VENUES '{entry}': slipstream fee_tier must be a tickSpacing \
-                         in {{1, 50, 100, 200, 2000}}"
+                        "venue {idx}: 'auto' pool requires a factory address"
                     ));
                 }
-                // "auto" = resolve the pool from the factory at startup.
-                let pair = if pair.trim().eq_ignore_ascii_case("auto") {
-                    if factory == Address::ZERO && kind != VenueKind::Aerodrome {
-                        return Err(eyre!(
-                            "DEX_VENUES '{entry}': 'auto' pool requires a factory address"
-                        ));
-                    }
-                    Address::ZERO
-                } else {
-                    Address::from_str(pair.trim())
-                        .map_err(|e| eyre!("invalid pair in DEX_VENUES '{entry}': {e}"))?
-                };
-                Ok::<_, eyre::Report>(Venue {
-                    pair,
-                    router: Address::from_str(router.trim())
-                        .map_err(|e| eyre!("invalid router in DEX_VENUES '{entry}': {e}"))?,
-                    kind,
-                    fee_bps,
-                    factory,
-                    stable,
-                    fee_tier,
-                    pool_id,
-                    quoter,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if venues.len() < 2 {
-            return Err(eyre!("DEX_VENUES needs at least two venues"));
+            }
+            if venue.kind == VenueKind::UniswapV4 {
+                return Err(eyre!(
+                    "venue {idx}: kind 'v4' in config.toml is not supported yet"
+                ));
+            }
         }
 
         let loan_amounts = env::var("LOAN_AMOUNTS")

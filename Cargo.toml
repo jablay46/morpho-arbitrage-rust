@@ -13,3 +13,5 @@ dotenvy = "0.15"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 revm = { version = "38", features = ["alloydb", "asyncdb", "optional_balance_check", "optional_no_base_fee", "optional_eip3607"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
