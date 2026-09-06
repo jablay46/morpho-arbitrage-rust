@@ -1,50 +1,66 @@
 use alloy::primitives::{Address, U256};
 use eyre::{eyre, Result};
+use serde::Deserialize;
 use std::env;
 use std::str::FromStr;
 
 /// Router family of a venue; must match `KIND_*` constants in the contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum VenueKind {
-    /// Uniswap-V2-style router taking `address[] path` (also Sushiswap V2,
-    /// Pancakeswap V2).
+    #[serde(rename = "v2")]
     UniswapV2 = 0,
-    /// Aerodrome-style router taking `Route[]` structs.
+    #[serde(rename = "aero")]
     Aerodrome = 1,
-    /// Uniswap-V3-style router using `exactInputSingle` with `sqrtPriceLimitX96`.
+    #[serde(rename = "v3")]
     UniswapV3 = 2,
-    /// Uniswap-V4-style PoolManager using `unlock` + `swap` with hooks.
+    #[serde(rename = "v4")]
     UniswapV4 = 3,
-    /// Aerodrome Slipstream concentrated-liquidity router. Structurally the
-    /// same exactInputSingle shape as Uniswap V3, but the pool discriminator
-    /// is `int24 tickSpacing` instead of `uint24 fee`, so it has a different
-    /// selector and is NOT callable through the V3 branch.
+    #[serde(rename = "slipstream", alias = "cl")]
     Slipstream = 4,
 }
 
 /// One tradable venue: a pool plus its swap router and fee model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct Venue {
-    /// Pool/pair address, or Address::ZERO to auto-resolve from the factory
-    /// at startup (requires `factory`).
+    /// Pool/pair address, or "auto" to resolve from factory at startup.
+    #[serde(deserialize_with = "deserialize_pair")]
     pub pair: Address,
     pub router: Address,
     pub kind: VenueKind,
     /// Pool fee in basis points charged on the input amount (30 = 0.3%).
+    #[serde(default = "default_fee_bps")]
     pub fee_bps: u64,
     /// Pool factory. Required when `pair` is zero (auto-resolve);
     /// Address::ZERO for Aerodrome means the router's default factory.
+    #[serde(default)]
     pub factory: Address,
     /// Aerodrome stable-pool flag. Unused for V2/V3/V4.
+    #[serde(default)]
     pub stable: bool,
     /// Uniswap V3 fee tier in hundredths of a bip (500 = 0.05%). Unused for V2/Aero.
+    #[serde(default = "default_fee_tier")]
     pub fee_tier: u32,
     /// Uniswap V4 pool ID (bytes32) for PoolManager. Unused for V2/V3.
+    #[serde(deserialize_with = "deserialize_pool_id", default = "default_pool_id")]
     pub pool_id: [u8; 32],
     /// Per-venue QuoterV2 override (V3 only). Address::ZERO = use the
     /// global `Config::quoter_v2`. Needed for V3 venues whose quotes live
     /// on a different deployment (e.g. PancakeSwap V3), since each factory
     /// has its own quoter contract.
+    #[serde(default)]
     pub quoter: Address,
+}
+
+fn default_fee_bps() -> u64 {
+    30
+}
+
+fn default_fee_tier() -> u32 {
+    3000
+}
+
+fn default_pool_id() -> [u8; 32] {
+    [0u8; 32]
 }
 
 impl Venue {
@@ -53,6 +69,38 @@ impl Venue {
     pub fn pool_address(&self) -> Address {
         self.pair
     }
+}
+
+fn deserialize_pair<'de, D>(deserializer: D) -> Result<Address, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.trim().eq_ignore_ascii_case("auto") {
+        return Ok(Address::ZERO);
+    }
+    Address::from_str(s.trim()).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_pool_id<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    let s = s.trim_start_matches("0x");
+    let bytes = alloy::hex::decode(s).map_err(serde::de::Error::custom)?;
+    if bytes.len() != 32 {
+        return Err(serde::de::Error::custom("pool_id must be 32 bytes"));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlConfig {
+    #[serde(rename = "venues")]
+    venues: Vec<Venue>,
 }
 
 /// Bot configuration loaded from environment variables / .env file.
@@ -156,67 +204,7 @@ impl Config {
             || self.use_pending_sim
     }
 
-    pub fn from_env() -> Result<Self> {
-        // ENV_FILE selects an alternate dotenv file (e.g. .env.virtual);
-        // unset = default .env lookup, missing file = hard error since the
-        // user explicitly asked for it.
-        if let Some(path) = env::var("ENV_FILE").ok().filter(|s| !s.is_empty()) {
-            dotenvy::from_filename(&path)
-                .map_err(|e| eyre!("failed to load ENV_FILE={path}: {e}"))?;
-        } else {
-            let _ = dotenvy::dotenv();
-        }
-
-        let parse_addr = |key: &str| -> Result<Address> {
-            let raw = env::var(key).map_err(|_| eyre!("missing env var {key}"))?;
-            Address::from_str(&raw).map_err(|e| eyre!("invalid address in {key}: {e}"))
-        };
-
-        let rpc_url = env::var("RPC_URL").map_err(|_| eyre!("missing env var RPC_URL"))?;
-        let wss_url = env::var("WSS_URL").ok().filter(|s| !s.is_empty());
-        let private_key =
-            env::var("PRIVATE_KEY").map_err(|_| eyre!("missing env var PRIVATE_KEY"))?;
-
-        let morpho = parse_addr("MORPHO_ADDRESS")?;
-        let arb_contract = parse_addr("ARB_CONTRACT")?;
-        let loan_token = parse_addr("LOAN_TOKEN")?;
-        let quote_token = parse_addr("QUOTE_TOKEN")?;
-        // Used to price gas (paid in ETH) into loan-token units.
-        let wrapped_native = env::var("WRAPPED_NATIVE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| Address::from_str(&s).map_err(|e| eyre!("invalid WRAPPED_NATIVE: {e}")))
-            .transpose()?
-            .unwrap_or_else(|| {
-                // WETH on Base mainnet.
-                Address::from_str("0x4200000000000000000000000000000000000006")
-                    .expect("valid constant address")
-            });
-        if loan_token == quote_token {
-            return Err(eyre!("LOAN_TOKEN and QUOTE_TOKEN must differ"));
-        }
-        // Gas is paid in ETH but profit accrues in the loan token. Only when
-        // the loan token IS the wrapped native token can the gas cost be
-        // subtracted exactly; for any other loan token there is no trusted
-        // on-the-fly conversion, and pretending otherwise turns net-profit
-        // filtering into gross-profit filtering. Restrict rather than
-        // mislead.
-        if loan_token != wrapped_native {
-            return Err(eyre!(
-                "LOAN_TOKEN must equal WRAPPED_NATIVE ({wrapped_native}); \
-                 non-native loans cannot account for gas correctly"
-            ));
-        }
-
-        // DEX venues as comma-separated entries:
-        //   <pair>:<router>[:<kind>[:<fee_bps>[:<factory>[:<stable>[:<fee_tier>[:<pool_id>]]]]]
-        // kind: v2 (default) | aero | v3 | v4
-        // fee_bps: default 30 (V2/Aero only; V3 uses fee_tier, V4 uses pool_id)
-        // factory: default zero (Aero only)
-        // stable: default false (Aero only)
-        // fee_tier: default 3000 (V3 only, in hundredths of a bip)
-        // pool_id: default zero (V4 only, bytes32 hex)
-        let venues_raw = env::var("DEX_VENUES").map_err(|_| eyre!("missing env var DEX_VENUES"))?;
+    fn parse_dex_venues(venues_raw: &str) -> Result<Vec<Venue>> {
         let venues = venues_raw
             .split(',')
             .map(|entry| {
@@ -233,8 +221,6 @@ impl Config {
                     "aero" => VenueKind::Aerodrome,
                     "v3" => VenueKind::UniswapV3,
                     "slipstream" | "cl" => VenueKind::Slipstream,
-                    // V4 reverts on-chain (unlock/lock pattern unsupported);
-                    // fail fast at config time instead of at execution.
                     "v4" => {
                         return Err(eyre!(
                             "kind 'v4' in DEX_VENUES '{entry}' is not supported yet"
@@ -345,6 +331,119 @@ impl Config {
             .collect::<Result<Vec<_>>>()?;
         if venues.len() < 2 {
             return Err(eyre!("DEX_VENUES needs at least two venues"));
+        }
+        Ok(venues)
+    }
+
+    pub fn from_env() -> Result<Self> {
+        // ENV_FILE selects an alternate dotenv file (e.g. .env.virtual);
+        // unset = default .env lookup, missing file = hard error since the
+        // user explicitly asked for it.
+        if let Some(path) = env::var("ENV_FILE").ok().filter(|s| !s.is_empty()) {
+            dotenvy::from_filename(&path)
+                .map_err(|e| eyre!("failed to load ENV_FILE={path}: {e}"))?;
+        } else {
+            let _ = dotenvy::dotenv();
+        }
+
+        let parse_addr = |key: &str| -> Result<Address> {
+            let raw = env::var(key).map_err(|_| eyre!("missing env var {key}"))?;
+            Address::from_str(&raw).map_err(|e| eyre!("invalid address in {key}: {e}"))
+        };
+
+        let rpc_url = env::var("RPC_URL").map_err(|_| eyre!("missing env var RPC_URL"))?;
+        let wss_url = env::var("WSS_URL").ok().filter(|s| !s.is_empty());
+        let private_key =
+            env::var("PRIVATE_KEY").map_err(|_| eyre!("missing env var PRIVATE_KEY"))?;
+
+        let morpho = parse_addr("MORPHO_ADDRESS")?;
+        let arb_contract = parse_addr("ARB_CONTRACT")?;
+        let loan_token = parse_addr("LOAN_TOKEN")?;
+        let quote_token = parse_addr("QUOTE_TOKEN")?;
+        // Used to price gas (paid in ETH) into loan-token units.
+        let wrapped_native = env::var("WRAPPED_NATIVE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| Address::from_str(&s).map_err(|e| eyre!("invalid WRAPPED_NATIVE: {e}")))
+            .transpose()?
+            .unwrap_or_else(|| {
+                // WETH on Base mainnet.
+                Address::from_str("0x4200000000000000000000000000000000000006")
+                    .expect("valid constant address")
+            });
+        if loan_token == quote_token {
+            return Err(eyre!("LOAN_TOKEN and QUOTE_TOKEN must differ"));
+        }
+        // Gas is paid in ETH but profit accrues in the loan token. Only when
+        // the loan token IS the wrapped native token can the gas cost be
+        // subtracted exactly; for any other loan token there is no trusted
+        // on-the-fly conversion, and pretending otherwise turns net-profit
+        // filtering into gross-profit filtering. Restrict rather than
+        // mislead.
+        if loan_token != wrapped_native {
+            return Err(eyre!(
+                "LOAN_TOKEN must equal WRAPPED_NATIVE ({wrapped_native}); \
+                 non-native loans cannot account for gas correctly"
+            ));
+        }
+
+        // DEX venues: load from CONFIG_FILE (default config.toml), with DEX_VENUES
+        // as a deprecated fallback. This avoids silently ignoring custom
+        // venue lists in dotenv files after the TOML migration.
+        let mut venues = {
+            let config_path = env::var("CONFIG_FILE").unwrap_or_else(|_| "config.toml".to_string());
+            match std::fs::read_to_string(&config_path) {
+                Ok(config_text) => {
+                    let config: TomlConfig = toml::from_str(&config_text)
+                        .map_err(|e| eyre!("failed to parse {config_path}: {e}"))?;
+                    config.venues
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Config file not found; try deprecated DEX_VENUES fallback
+                    if let Ok(venues_raw) = env::var("DEX_VENUES") {
+                        eprintln!(
+                            "WARNING: DEX_VENUES is deprecated and will be removed in a future release. \
+                             Please migrate to config.toml (see CONFIG_FILE)."
+                        );
+                        Self::parse_dex_venues(&venues_raw)?
+                    } else {
+                        return Err(eyre!(
+                            "no venue configuration found: set CONFIG_FILE or DEX_VENUES (deprecated)"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(eyre!("failed to read {config_path}: {e}"));
+                }
+            }
+        };
+        if venues.len() < 2 {
+            return Err(eyre!("at least two venues required"));
+        }
+        for (idx, venue) in venues.iter().enumerate() {
+            if venue.fee_bps >= 10_000 {
+                return Err(eyre!("venue {idx}: fee_bps {} too high", venue.fee_bps));
+            }
+            if venue.kind == VenueKind::Slipstream
+                && !matches!(venue.fee_tier, 1 | 50 | 100 | 200 | 2000)
+            {
+                return Err(eyre!(
+                    "venue {idx}: slipstream fee_tier must be a tickSpacing \
+                     in {{1, 50, 100, 200, 2000}}"
+                ));
+            }
+            if venue.pair.is_zero() {
+                if venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome {
+                    return Err(eyre!(
+                        "venue {idx}: 'auto' pool requires a factory address"
+                    ));
+                }
+            }
+            if venue.kind == VenueKind::UniswapV4 {
+                return Err(eyre!(
+                    "venue {idx}: kind 'v4' is not supported yet"
+                ));
+            }
         }
 
         let loan_amounts = env::var("LOAN_AMOUNTS")
