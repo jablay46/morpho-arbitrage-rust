@@ -43,12 +43,29 @@ pub struct Venue {
     /// Uniswap V4 pool ID (bytes32) for PoolManager. Unused for V2/V3.
     #[serde(deserialize_with = "deserialize_pool_id", default = "default_pool_id")]
     pub pool_id: [u8; 32],
+    /// Uniswap V4 tick spacing (kind v4 only; the PoolKey must carry it).
+    /// Unused for other kinds.
+    #[serde(default = "default_tick_spacing")]
+    pub tick_spacing: i32,
+    /// Uniswap V4 hooks address (kind v4 only; zero = no hooks).
+    /// Unused for other kinds.
+    #[serde(default)]
+    pub hooks: Address,
+    /// Uniswap V4 swap direction (kind v4 only): true = currency0 -> currency1.
+    /// Derived at startup from `pool_id` vs the sorted (loan, quote) pair, but
+    /// explicit here so auto-resolve and V4-only setups stay unambiguous.
+    #[serde(default)]
+    pub zero_for_one: bool,
     /// Per-venue QuoterV2 override (V3 only). Address::ZERO = use the
     /// global `Config::quoter_v2`. Needed for V3 venues whose quotes live
     /// on a different deployment (e.g. PancakeSwap V3), since each factory
     /// has its own quoter contract.
     #[serde(default)]
     pub quoter: Address,
+}
+
+fn default_tick_spacing() -> i32 {
+    60
 }
 
 fn default_fee_bps() -> u64 {
@@ -221,11 +238,7 @@ impl Config {
                     "aero" => VenueKind::Aerodrome,
                     "v3" => VenueKind::UniswapV3,
                     "slipstream" | "cl" => VenueKind::Slipstream,
-                    "v4" => {
-                        return Err(eyre!(
-                            "kind 'v4' in DEX_VENUES '{entry}' is not supported yet"
-                        ));
-                    }
+                    "v4" => VenueKind::UniswapV4,
                     other => return Err(eyre!("invalid kind '{other}' in DEX_VENUES '{entry}'")),
                 };
                 let fee_bps = parts
@@ -291,6 +304,39 @@ impl Config {
                     })
                     .transpose()?
                     .unwrap_or(Address::ZERO);
+                // Whitelisted V4 pool-id override; like only valid for V4.
+                if !pool_id.iter().all(|&b| b == 0) && kind != VenueKind::UniswapV4 {
+                    return Err(eyre!(
+                        "DEX_VENUES '{entry}': pool_id is only valid for kind 'v4'"
+                    ));
+                }
+                // Uniswap V4 tick spacing (optional; applies to v4 only, ignored
+                // otherwise -- kept in the positional format for TOML parity).
+                let tick_spacing = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        s.trim()
+                            .parse::<i32>()
+                            .map_err(|e| eyre!("invalid tick_spacing in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(default_tick_spacing());
+                // Uniswap V4 hooks address (optional; v4 only).
+                let hooks = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        Address::from_str(s.trim())
+                            .map_err(|e| eyre!("invalid hooks in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(Address::ZERO);
+                // Uniswap V4 swap direction (optional; v4 only).
+                let zero_for_one = parts
+                    .next()
+                    .map(|s| matches!(s.trim(), "true" | "1" | "yes"))
+                    .unwrap_or(false);
                 if parts.next().is_some() {
                     return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
                 }
@@ -325,6 +371,9 @@ impl Config {
                     stable,
                     fee_tier,
                     pool_id,
+                    tick_spacing,
+                    hooks,
+                    zero_for_one,
                     quoter,
                 })
             })
@@ -432,17 +481,41 @@ impl Config {
                      in {{1, 50, 100, 200, 2000}}"
                 ));
             }
-            if venue.pair.is_zero() {
-                if venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome {
-                    return Err(eyre!(
-                        "venue {idx}: 'auto' pool requires a factory address"
-                    ));
-                }
+            if venue.pair.is_zero() && venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome
+            {
+                return Err(eyre!("venue {idx}: 'auto' pool requires a factory address"));
             }
             if venue.kind == VenueKind::UniswapV4 {
-                return Err(eyre!(
-                    "venue {idx}: kind 'v4' is not supported yet"
-                ));
+                // tick_spacing must be positive (type int24 on chain; the i32
+                // config keeps negatives representable for clearer errors).
+                if venue.tick_spacing <= 0 || venue.tick_spacing > i32::from(i16::MAX) {
+                    return Err(eyre!(
+                        "venue {idx}: v4 tick_spacing must be in 1..=32767, got {}",
+                        venue.tick_spacing
+                    ));
+                }
+                // pool_id must be present: the contract needs it to reconstruct
+                // and verify the PoolKey (Uniswap V4 pool ID = keccak256 of the
+                // ABI-encoded PoolKey).
+                if venue.pool_id.iter().all(|&b| b == 0) {
+                    return Err(eyre!(
+                        "venue {idx}: kind 'v4' requires a non-zero pool_id \
+                         (keccak256(abi.encode(PoolKey)))"
+                    ));
+                }
+                // fee_tier carries the V4 pool fee in hundredths of a bip
+                // (max uint24 on chain).
+                if venue.fee_tier > 0xffffff {
+                    return Err(eyre!(
+                        "venue {idx}: v4 fee_tier must fit in uint24, got {}",
+                        venue.fee_tier
+                    ));
+                }
+                if venue.fee_tier & 0x800000 != 0 {
+                    return Err(eyre!(
+                        "venue {idx}: v4 dynamic-fee pools (0x800000) are unsupported"
+                    ));
+                }
             }
         }
 

@@ -383,34 +383,34 @@ fn compute_swap_step(
     )
     .unwrap_or(U256::ZERO);
 
-    let sqrt_price_next;
-    let mut amount_in_used;
-    let amount_out;
-    if remaining_less_fee >= amount_in {
-        sqrt_price_next = sqrt_ratio_target;
-        amount_in_used = amount_in;
+    let (sqrt_price_next, mut amount_in_used) = if remaining_less_fee >= amount_in {
+        (sqrt_ratio_target, amount_in)
     } else {
-        sqrt_price_next = get_next_sqrt_price_from_input(
+        let next = get_next_sqrt_price_from_input(
             sqrt_ratio_current,
             liquidity,
             remaining_less_fee,
             zero_for_one,
         )?;
-        let max = sqrt_price_next == sqrt_ratio_target;
-        amount_in_used = if zero_for_one {
-            get_amount0_delta(sqrt_ratio_current, sqrt_price_next, liquidity, true)
+        if next == sqrt_ratio_target {
+            (next, amount_in)
+        } else if zero_for_one {
+            (
+                next,
+                get_amount0_delta(sqrt_ratio_current, next, liquidity, true),
+            )
         } else {
-            get_amount1_delta(sqrt_ratio_current, sqrt_price_next, liquidity, true)
-        };
-        if max {
-            amount_in_used = amount_in;
+            (
+                next,
+                get_amount1_delta(sqrt_ratio_current, next, liquidity, true),
+            )
         }
-    }
+    };
 
     // The output interval is ALWAYS from the current price to the resulting
     // next price (sqrt_price_next == target for fully consumed ranges) —
     // never between target and next.
-    amount_out = if zero_for_one {
+    let amount_out = if zero_for_one {
         get_amount1_delta(sqrt_ratio_current, sqrt_price_next, liquidity, false)
     } else {
         get_amount0_delta(sqrt_ratio_current, sqrt_price_next, liquidity, false)
@@ -519,13 +519,7 @@ pub fn cl_quote_exact_in(pool: &PoolState, zero_for_one: bool, amount_in: U256) 
         // Clamp traversal to the protocol tick bounds (Solidity never
         // exceeds them because the extreme ticks are always initialized in
         // the bitmap; a sparse cache can overshoot them).
-        let next_tick = if next_tick_raw < MIN_TICK {
-            MIN_TICK
-        } else if next_tick_raw > MAX_TICK {
-            MAX_TICK
-        } else {
-            next_tick_raw
-        };
+        let next_tick = next_tick_raw.clamp(MIN_TICK, MAX_TICK);
         let mut sqrt_ratio_target = get_sqrt_ratio_at_tick(next_tick)?;
         if (zero_for_one && sqrt_ratio_target < sqrt_price_limit)
             || (!zero_for_one && sqrt_ratio_target > sqrt_price_limit)

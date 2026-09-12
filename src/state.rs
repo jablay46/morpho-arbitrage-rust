@@ -87,7 +87,7 @@ impl PoolState {
                 tick_bitmap.insert(*w, *v);
             }
             for (t, info) in o_tk {
-                ticks.insert(*t, info.clone());
+                ticks.insert(*t, *info);
             }
         }
     }
@@ -143,8 +143,8 @@ pub struct StateStore {
     pub refresh_backoff_until: Option<std::time::Instant>,
 }
 
-impl StateStore {
-    pub fn new() -> Self {
+impl Default for StateStore {
+    fn default() -> Self {
         Self {
             pools: HashMap::new(),
             last_event_at: None,
@@ -153,6 +153,12 @@ impl StateStore {
             refresh_failures: 0,
             refresh_backoff_until: None,
         }
+    }
+}
+
+impl StateStore {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn insert(&mut self, pool: Address, state: PoolState) {
@@ -212,17 +218,28 @@ impl StateStore {
         self.pools.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.pools.is_empty()
+    }
+
     /// V2 `Sync` applier — reserves carried by the event are absolute.
-    pub fn apply_v2_sync(&mut self, pool: Address, ev: SyncEvent) {
+    /// Returns `true` when the pool was present and the event actually
+    /// mutated its cached state; `false` when the pool is unknown (nothing
+    /// to update) — lets callers skip work that would be a no-op.
+    pub fn apply_v2_sync(&mut self, pool: Address, ev: SyncEvent) -> bool {
         if let Some(PoolState::V2 { reserve0, reserve1 }) = self.pools.get_mut(&pool) {
             *reserve0 = ev.reserve0;
             *reserve1 = ev.reserve1;
             self.touch();
+            true
+        } else {
+            false
         }
     }
 
-    /// CL `Swap` applier — event carries absolute inventory.
-    pub fn apply_cl_swap(&mut self, pool: Address, ev: ClSwapEvent) {
+    /// CL `Swap` applier — event carries absolute inventory. Returns
+    /// `true` when the pool was present and the event mutated cached state.
+    pub fn apply_cl_swap(&mut self, pool: Address, ev: ClSwapEvent) -> bool {
         if let Some(PoolState::Cl {
             sqrt_price_x96,
             tick,
@@ -234,6 +251,9 @@ impl StateStore {
             *tick = ev.tick;
             *liquidity = ev.liquidity;
             self.touch();
+            true
+        } else {
+            false
         }
     }
 
@@ -241,7 +261,15 @@ impl StateStore {
     /// `liquidityNet`/`liquidityGross` on both bounds, flips bitmap bits
     /// on (de)initialization, and adjusts in-range liquidity when the
     /// current tick sits inside the modified range.
-    pub fn apply_cl_liquidity(&mut self, pool: Address, ev: ClLiquidityEvent, is_burn: bool) {
+    /// Returns `true` when the pool was present and the event mutated state
+    /// (including a no-op-size but valid re-application); `false` when the
+    /// pool is unknown.
+    pub fn apply_cl_liquidity(
+        &mut self,
+        pool: Address,
+        ev: ClLiquidityEvent,
+        is_burn: bool,
+    ) -> bool {
         let delta: i128 = if is_burn {
             -(ev.liquidity as i128)
         } else {
@@ -256,7 +284,7 @@ impl StateStore {
             ..
         }) = self.pools.get_mut(&pool)
         else {
-            return;
+            return false;
         };
 
         for (boundary, sign) in [(ev.tick_lower, 1i128), (ev.tick_upper, -1i128)] {
@@ -285,6 +313,7 @@ impl StateStore {
             };
         }
         self.touch();
+        true
     }
 }
 
@@ -754,6 +783,57 @@ mod tests {
         };
         assert_eq!(*liquidity, 140);
         assert_eq!(ticks[&-60].liquidity_net, 40);
+    }
+
+    #[test]
+    fn appliers_report_false_for_unknown_pool() {
+        let mut store = StateStore::new();
+        assert!(!store.apply_v2_sync(
+            Address::ZERO,
+            SyncEvent {
+                reserve0: U256::from(10u64),
+                reserve1: U256::from(20u64),
+            }
+        ));
+        assert!(!store.apply_cl_swap(
+            Address::ZERO,
+            ClSwapEvent {
+                sqrt_price_x96: U256::from(1u64),
+                tick: 0,
+                liquidity: 1,
+            }
+        ));
+        assert!(!store.apply_cl_liquidity(
+            Address::ZERO,
+            ClLiquidityEvent {
+                tick_lower: -60,
+                tick_upper: 60,
+                liquidity: 1,
+            },
+            false,
+        ));
+
+        // Once the pool is present, the same appliers must report success.
+        store.insert(
+            Address::ZERO,
+            PoolState::Cl {
+                sqrt_price_x96: U256::from(1u8),
+                tick: 0,
+                liquidity: 100,
+                tick_spacing: 60,
+                fee: 3000,
+                tick_bitmap: HashMap::new(),
+                ticks: HashMap::new(),
+            },
+        );
+        assert!(store.apply_cl_swap(
+            Address::ZERO,
+            ClSwapEvent {
+                sqrt_price_x96: U256::from(2u64),
+                tick: 0,
+                liquidity: 99,
+            }
+        ));
     }
 
     #[test]

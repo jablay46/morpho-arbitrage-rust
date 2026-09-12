@@ -624,8 +624,7 @@ where
                     cache.pending.insert(pool, base.clone());
                 }
             }
-            apply_pool_log(&mut cache.pending, l);
-            pending_dirty = true;
+            pending_dirty |= apply_pool_log(&mut cache.pending, l);
         }
         let trigger = match (reason, trig_block) {
             ("sweep", b) => Some((reason, b)),
@@ -766,16 +765,21 @@ fn cl_burn_hash() -> alloy::primitives::B256 {
     alloy::primitives::keccak256("Burn(address,int24,int24,uint128,uint256,uint256)")
 }
 
-/// Fold one pool log into the local state store. Only Sync/CL-Swap/
-/// Mint/Burn events change price; anything else is skipped silently.
-/// Malformed payloads are ignored — one bad log never crashes the loop.
-fn apply_pool_log(store: &mut StateStore, log: &alloy::rpc::types::eth::Log) {
+/// Fold one known pool log into the local state store. Only
+/// Sync/CL-Swap/Mint/Burn events can change the price; anything else is
+/// skipped. Returns `true` only when the underlying pool state was
+/// actually mutated — `false` for unknown/unrelated topics, undecodable
+/// payloads, or pools absent from the store. The event loop uses this to
+/// avoid re-scanning on preconfirmations that left the pending overlay
+/// unchanged. Malformed payloads are ignored—one bad log never crashes
+/// the loop.
+fn apply_pool_log(store: &mut StateStore, log: &alloy::rpc::types::eth::Log) -> bool {
     let pool = log.address();
     let topics = log.topics();
     let data = log.data();
     let data: &[u8] = data.data.as_ref();
     let Some(&topic0) = topics.first() else {
-        return;
+        return false;
     };
     let v2_sync = v2_sync_hash();
     let cl_swap = cl_swap_hash();
@@ -784,18 +788,19 @@ fn apply_pool_log(store: &mut StateStore, log: &alloy::rpc::types::eth::Log) {
     if topic0 == v2_sync {
         if let Some(ev) = state::decode_v2_sync(data) {
             debug!(pool = %pool, kind = "sync", "applied pool log to state store");
-            store.apply_v2_sync(pool, ev);
+            return store.apply_v2_sync(pool, ev);
         }
     } else if topic0 == cl_swap {
         if let Some(ev) = state::decode_cl_swap(data) {
-            store.apply_cl_swap(pool, ev);
+            return store.apply_cl_swap(pool, ev);
         }
     } else if topic0 == cl_mint || topic0 == cl_burn {
         let is_burn = topic0 == cl_burn;
         if let Some(ev) = state::decode_cl_liquidity(data, topics, is_burn) {
-            store.apply_cl_liquidity(pool, ev, is_burn);
+            return store.apply_cl_liquidity(pool, ev, is_burn);
         }
     }
+    false
 }
 
 /// Subscribe to Base's non-standard `pendingLogs` subscription: emits the
@@ -807,13 +812,10 @@ fn apply_pool_log(store: &mut StateStore, log: &alloy::rpc::types::eth::Log) {
 ///
 /// Returns the raw subscription stream of `Log`; the caller drops reorged
 /// (`removed`) entries and falls back to sealed logs if this fails.
-async fn subscribe_pending_logs<P: alloy::providers::Provider>(
+async fn subscribe_pending_logs<P: alloy::providers::Provider + 'static>(
     provider: &P,
     filter: &alloy::rpc::types::Filter,
-) -> eyre::Result<alloy::pubsub::Subscription<alloy::rpc::types::eth::Log>>
-where
-    P: 'static,
-{
+) -> eyre::Result<alloy::pubsub::Subscription<alloy::rpc::types::eth::Log>> {
     // eth_subscribe("pendingLogs", filter) — params serialize as the
     // 2-element array Base expects: [subscription-kind, filter-object].
     let params = ("pendingLogs", filter.clone());
@@ -1115,8 +1117,7 @@ where
     // Run the per-size backfill for cached pools (same pinned block), then
     // merge local + RPC results and push those legs.
     if !backfill_sizes.is_empty() {
-        let backfill_reqs: Vec<QuoteRequest> =
-            leg1_backfill.iter().map(|(_, _, r)| r.clone()).collect();
+        let backfill_reqs: Vec<QuoteRequest> = leg1_backfill.iter().map(|(_, _, r)| *r).collect();
         let backfilled: Vec<Option<U256>> = if backfill_reqs.is_empty() {
             Vec::new()
         } else {

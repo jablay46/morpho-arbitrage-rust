@@ -20,8 +20,42 @@ use revm::context::{BlockEnv, TxEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use revm::database::{AlloyDB, BlockId, CacheDB};
 use revm::database_interface::WrapDatabaseAsync;
-use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
+use revm::primitives::eip4844::{
+    BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE,
+};
+use revm::primitives::hardfork::SpecId;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
+
+/// Infer the hardfork [`SpecId`] a block was produced under from the block
+/// header's fork-gated fields. This is chain-agnostic — it keys off the
+/// canonical EIP-4895/4844/4788/7685 marker fields rather than per-chain
+/// activation block numbers — so it stays correct for Base and any other
+/// EVM chain sim targets.
+///
+/// Ordering matters: later forks add fields, so the most recent marker
+/// present wins. A legacy (pre-London) header has none of these; the bot's
+/// chains are all post-merge, so LONDON is the conservative floor there.
+fn spec_id_from_header(header: &alloy::consensus::Header) -> SpecId {
+    if header.requests_hash.is_some() {
+        // EIP-7685 requests root: Prague or later.
+        SpecId::PRAGUE
+    } else if header.excess_blob_gas.is_some() || header.parent_beacon_block_root.is_some() {
+        // EIP-4844 blob gas / EIP-4788 beacon root: Cancun or later.
+        // (parent_beacon_block_root appeared in Cancun alongside 4844.)
+        SpecId::CANCUN
+    } else if header.withdrawals_root.is_some() {
+        // EIP-4895 withdrawals: Shanghai or later.
+        SpecId::SHANGHAI
+    } else if header.base_fee_per_gas.is_some() {
+        // EIP-1559 base fee: London or later.
+        SpecId::LONDON
+    } else {
+        // Pre-London block (no fork markers we key on). MERGE is the first
+        // fork that treats prevrandao as randomness, which matches what the
+        // env sets below; anything older would need difficulty semantics.
+        SpecId::MERGE
+    }
+}
 
 /// Gas ceiling handed to the EVM for the simulated call. Deliberately far
 /// above any realistic flashloan-arb execution so the estimate is bounded by
@@ -48,6 +82,9 @@ pub enum SimOutcome {
 pub struct SimEnv {
     pub block: BlockEnv,
     pub chain_id: u64,
+    /// Hardfork the pinned block was produced under; derived from the header
+    /// so the EVM executes the exact opcode/gas rules the node used.
+    pub spec_id: SpecId,
 }
 
 /// Fetch the header of `block` and the chain id, and build the matching
@@ -59,6 +96,15 @@ pub async fn fetch_sim_env<P: Provider>(provider: &P, block: BlockId) -> Result<
         .ok_or_else(|| eyre!("block {block:?} not found for local sim"))?
         .header;
     let chain_id = provider.get_chain_id().await?;
+    let spec_id = spec_id_from_header(&header);
+    // The blob base fee update fraction must match the hardfork the block
+    // lived under (EIP-7840 changed it at Prague); pick it from the same
+    // inferred spec that drives the EVM config below, instead of hardcoding
+    // one fork's constant.
+    let blob_fraction = match spec_id {
+        s if s.is_enabled_in(SpecId::PRAGUE) => BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE,
+        _ => BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN,
+    };
     Ok(SimEnv {
         block: BlockEnv {
             number: U256::from(header.number),
@@ -70,10 +116,11 @@ pub async fn fetch_sim_env<P: Provider>(provider: &P, block: BlockId) -> Result<
             prevrandao: Some(header.mix_hash),
             blob_excess_gas_and_price: header
                 .excess_blob_gas
-                .map(|e| BlobExcessGasAndPrice::new(e, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE)),
+                .map(|e| BlobExcessGasAndPrice::new(e, blob_fraction)),
             ..Default::default()
         },
         chain_id,
+        spec_id,
     })
 }
 
@@ -109,11 +156,22 @@ pub fn simulate_call<P: Provider>(
     let ctx = Context::mainnet()
         .with_block(block_env)
         .modify_cfg_chained(|cfg| {
+            // Pin the hardfork the pinned block was produced under. Without
+            // this, revm's default (`SpecId::default()`) can silently run a
+            // different rule set than the node — wrong opcode/gas behaviour
+            // for anything post-London, plus `prevrandao`/blob semantics that
+            // don't match the header we just filled in.
+            if let Some(e) = &env {
+                cfg.set_spec_and_mainnet_gas_params(e.spec_id);
+            }
             // Simulation must mirror eth_estimateGas semantics: the call is
             // unsigned, the caller may not pay for gas, and the nonce is not
             // checked by the node either.
             cfg.disable_nonce_check = true;
             cfg.disable_balance_check = true;
+            // eth_call-style sim: base fee is not charged for an unsigned
+            // zero-gas-price call. Keep this (it mirrors the node) while the
+            // spec above keeps blob/prevrandao interpretation correct.
             cfg.disable_base_fee = true;
             cfg.disable_eip3607 = true;
             if let Some(id) = chain_id {
@@ -199,5 +257,63 @@ mod tests {
     fn raw_payload_falls_back_to_hex() {
         let s = decode_revert_reason(&[0xde, 0xad]);
         assert_eq!(s, "reverted: 0xdead");
+    }
+
+    #[test]
+    fn spec_id_tracks_fork_gated_header_fields() {
+        use alloy::consensus::Header;
+
+        // No EIP-4895/4844/4788/7685 markers: the conservative post-merge
+        // floor (prevrandao-as-randomness is what BlockEnv sets).
+        assert_eq!(spec_id_from_header(&Header::default()), SpecId::MERGE);
+
+        assert_eq!(
+            spec_id_from_header(&Header {
+                base_fee_per_gas: Some(1),
+                ..Default::default()
+            }),
+            SpecId::LONDON
+        );
+
+        assert_eq!(
+            spec_id_from_header(&Header {
+                base_fee_per_gas: Some(1),
+                withdrawals_root: Some(alloy::primitives::B256::ZERO),
+                ..Default::default()
+            }),
+            SpecId::SHANGHAI
+        );
+
+        assert_eq!(
+            spec_id_from_header(&Header {
+                base_fee_per_gas: Some(1),
+                withdrawals_root: Some(alloy::primitives::B256::ZERO),
+                excess_blob_gas: Some(0),
+                ..Default::default()
+            }),
+            SpecId::CANCUN
+        );
+
+        // EIP-4788 beacon root alone is also Cancun+.
+        assert_eq!(
+            spec_id_from_header(&Header {
+                base_fee_per_gas: Some(1),
+                withdrawals_root: Some(alloy::primitives::B256::ZERO),
+                parent_beacon_block_root: Some(alloy::primitives::B256::ZERO),
+                ..Default::default()
+            }),
+            SpecId::CANCUN
+        );
+
+        assert_eq!(
+            spec_id_from_header(&Header {
+                base_fee_per_gas: Some(1),
+                withdrawals_root: Some(alloy::primitives::B256::ZERO),
+                excess_blob_gas: Some(0),
+                requests_hash: Some(alloy::primitives::B256::ZERO),
+                ..Default::default()
+            }),
+            SpecId::PRAGUE
+        );
     }
 }
