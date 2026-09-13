@@ -8,6 +8,37 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
 
+/// Error carrying the account mismatch that made a trade unsafe to broadcast.
+///
+/// Simulations/gas estimates must run `from` the contract owner and the
+/// broadcast wallet must BE the owner (`onlyOwner`), so the executor keeps a
+/// (possibly refreshed) copy of the on-chain owner. When that owner is not
+/// the wallet the bot signs with, every simulation silently reverts
+/// `NotOwner` while broadcasts would be rejected too — stop with a
+/// descriptive error instead of scanning against a stale owner.
+#[derive(Debug, Clone)]
+pub struct OwnershipMismatch {
+    /// Owner read from the contract (possibly refreshed after a transfer).
+    pub owner: Address,
+    /// Signer address of the configured `PRIVATE_KEY`.
+    pub signer: Address,
+}
+
+impl std::fmt::Display for OwnershipMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "contract owner {} != bot signing wallet {}: the FlashArbitrage \
+             contract has been transferred to a key the bot does not hold. \
+             Point PRIVATE_KEY at the new owner key and restart the bot in \
+             coordination with the on-chain ownership transfer",
+            self.owner, self.signer
+        )
+    }
+}
+
+impl std::error::Error for OwnershipMismatch {}
+
 sol! {
     struct SwapLeg {
         address router;
@@ -38,9 +69,11 @@ sol! {
     }
 }
 
-/// Read the contract owner once at startup; the owner never changes, so
-/// per-scan simulations/gas estimates reuse the cached value instead of an
-/// extra RPC call per opportunity.
+/// Read the contract's current owner. Called at startup and re-checked on a
+/// timer: the contract supports two-step ownership transfer at runtime, so
+/// a stale startup-only value would keep simulations running `from` the
+/// former owner and reject every candidate after a transfer. The caller
+/// throttles this to one extra eth_call per `owner_refresh_secs`.
 pub async fn fetch_owner<P: Provider>(provider: &P, contract: Address) -> Result<Address> {
     let arb = IFlashArbitrage::new(contract, provider);
     Ok(arb.owner().call().await?)
@@ -478,6 +511,7 @@ mod tests {
             min_profit: U256::ZERO,
             gas_price_wei: None,
             slippage_bps: 50,
+            owner_refresh_secs: 60,
             poll_interval_ms: 0,
             state_refresh_secs: 60,
             sweep_interval_blocks: 10,
@@ -558,6 +592,7 @@ mod tests {
             min_profit: U256::ZERO,
             gas_price_wei: None,
             slippage_bps: 50,
+            owner_refresh_secs: 60,
             poll_interval_ms: 0,
             state_refresh_secs: 60,
             sweep_interval_blocks: 10,
@@ -653,5 +688,21 @@ mod tests {
             decoded.feeTier,
             alloy::primitives::Uint::<24, 1>::from(500u32)
         );
+    }
+
+    #[test]
+    fn ownership_mismatch_report_is_explicit() {
+        use crate::executor::OwnershipMismatch;
+        let err = OwnershipMismatch {
+            owner: address!("1111111111111111111111111111111111111111"),
+            signer: address!("2222222222222222222222222222222222222222"),
+        };
+        let report = eyre::Report::new(err.clone());
+        let msg = format!("{report:#}");
+        assert!(msg.contains("0x1111"));
+        assert!(msg.contains("0x2222"));
+        assert!(msg.contains("PRIVATE_KEY"));
+        assert!(msg.contains("restart"));
+        let _ = err; // still usable after conversion
     }
 }

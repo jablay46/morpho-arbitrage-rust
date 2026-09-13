@@ -255,6 +255,26 @@ forge create contracts/FlashArbitrage.sol:FlashArbitrage --rpc-url https://base-
   `ARB_CONTRACT` di `.env`.
 - Deployer otomatis menjadi `owner` kontrak; hanya owner yang bisa
   `execute` dan `sweep` profit.
+- Ownership dua langkah (`pendingOwner`): untuk memindahkan kontrol, owner
+  saat ini memanggil `transferOwnership(newOwner)` lalu kandidat memanggil
+  `acceptOwnership()`. Kesalahan ketik alamat tidak mengunci kontrak
+  permanen (bisa diganti lagi sebelum di-accept).
+
+**Transfer kepemilikan saat bot berjalan.** `PRIVATE_KEY` bot ditetapkan
+saat startup dan tidak bisa di-hot-reload (provider alloy memegang wallet
+di dalamnya). Bot membaca ulang `owner()` kontrak secara periodik
+(`OWNER_REFRESH_SECS`), lalu:
+
+- Jika owner baru masih sama dengan wallet signing bot (misalnya transfer
+  antar dua key milik Anda dan bot tetap pakai key tersebut), cache owner
+  diperbarui dan bot lanjut berjalan tanpa intervensi.
+- Jika owner tidak lagi cocok dengan wallet signing, bot **berhenti dengan
+  error eksplisit** (`ownership mismatch`) — bukan hanya menolak semua
+  kandidat. Prosedur yang benar untuk perpindahan ke key baru:
+
+  1. Jalankan `transferOwnership(newOwner)` + `acceptOwnership()` on-chain.
+  2. Hentikan bot, set `PRIVATE_KEY` (dan `MIN_PROFIT`, dst.) ke value baru,
+     lalu nyalakan ulang — koordinasikan agar downtime singkat.
 
 Alternatif tanpa `--private-key` di command line (lebih aman, interaktif),
 dengan verifikasi source via Sourcify (tanpa API key):
@@ -288,6 +308,7 @@ Variabel yang tersedia:
 | `LOAN_AMOUNTS` | Tidak | Ukuran pinjaman yang diuji, koma-separated (base unit). Default `1000000000000000000` (1 token). |
 | `MIN_PROFIT` | Ya* | Profit bersih minimum (base unit loan token). **Harus > 0 jika `DRY_RUN=false`**. |
 | `SLIPPAGE_BPS` | Tidak | Toleransi slippage per leg dalam bps. Default `50` (0.5%). |
+| `OWNER_REFRESH_SECS` | Tidak | Frekuensi re-check `owner()` kontrak (detik). Owner bisa berpindah saat runtime (transfer dua langkah); cache di-refresh dan divalidasi terhadap wallet signing. Bila berpindah ke key lain, bot berhenti dengan error eksplisit. Default `60`. |
 | `GAS_PRICE_WEI` | Tidak | Override gas price; default diambil on-chain. |
 | `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (**khusus Base**; chain lain wajib diisi, mis. Ethereum mainnet `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`). |
 | `QUOTER_SLIPSTREAM` | Tidak | Alamat Quoter Aerodrome Slipstream untuk pricing venue `slipstream`. Default `0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0` (**khusus Base**). |
@@ -537,6 +558,7 @@ Tips produksi:
 | `opportunity filtered out by gas cost` terus-menerus | spread < biaya gas | normal; naikkan `LOAN_AMOUNTS` atau tunggu volatilitas |
 | `arbitrage transaction reverted on-chain` | kalah balapan bot lain / harga drift | normal sesekali; pertimbangkan RPC lebih cepat |
 | batch RPC gagal | RPC publik kena rate-limit | pakai endpoint berbayar |
+| `ownership mismatch: contract owner ... != bot signing wallet ...` | `owner()` kontrak dipindahkan ke key yang tidak dipegang bot (transfer dua langkah) | jalankan ulang bot dengan `PRIVATE_KEY` pemilik baru (koordinasikan dengan transfer on-chain) — lihat bagian transfer kepemilikan |
 
 ## Catatan Keamanan
 
@@ -544,6 +566,15 @@ Tips produksi:
 - Pakai wallet khusus bot dengan saldo minimal; profit tersimpan di kontrak
   dan hanya bisa di-`sweep` oleh owner.
 - `FlashArbitrage.sol` dibatasi `onlyOwner`; callback dibatasi ke Morpho.
+- Transfer kepemilikan dua langkah (`pendingOwner`): kesalahan ketik alamat
+  tidak mengunci kontrak permanen. Bot otomatis memvalidasi `owner()` ulang
+  secara periodik dan berhenti dengan error eksplisit bila kontrak berpindah
+  ke key yang tidak dipegangnya — lihat bagian transfer kepemilikan.
+- Reentrancy guard (`nonReentrant`) pada `execute`/`onMorphoFlashLoan`/`sweep`
+  — token dengan transfer hook tidak bisa menyusup masuk ulang ke tengah
+  flashloan.
+- Event `ArbExecuted`/`Swept`/`OwnershipTransfer*` ter-emit untuk monitoring
+  off-chain.
 - Pertahanan berlapis: `minOut` per leg → `minProfit` on-chain →
   `eth_estimateGas` sebagai gate simulasi. Kegagalan terburuk adalah rugi gas,
   bukan kehilangan principal (flash loan yang gagal otomatis revert).

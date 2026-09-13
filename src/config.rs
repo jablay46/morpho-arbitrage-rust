@@ -68,6 +68,18 @@ pub struct Venue {
     pub quoter: Address,
 }
 
+/// Ownership-refresh cadence from `OWNER_REFRESH_SECS`. Absent var -> 60;
+/// malformed value is a hard error (matching `SLIPPAGE_BPS`), so a typo in
+/// the cadence is reported instead of silently reverting to the default.
+fn parse_owner_refresh_secs(raw: Option<&str>) -> Result<u64> {
+    match raw {
+        None => Ok(60),
+        Some(s) => s
+            .parse::<u64>()
+            .map_err(|e| eyre!("invalid OWNER_REFRESH_SECS: {e}")),
+    }
+}
+
 fn default_tick_spacing() -> i32 {
     60
 }
@@ -178,6 +190,14 @@ pub struct Config {
     /// simulated leg output scaled by (1 - slippage) becomes the on-chain
     /// `minOut`, bounding price drift and raising the cost of sandwiching.
     pub slippage_bps: u64,
+    /// Re-check the contract's `owner()` at least this often (seconds
+    /// wall-clock). The contract supports two-step ownership transfer at
+    /// runtime; the cached owner is used as `from` in simulations and must
+    /// match the signing wallet, so a stale value silently rejects every
+    /// candidate (`NotOwner`) after a transfer. A mismatch stops the bot
+    /// with an explicit ownership error instead of scanning endlessly.
+    /// Default 60; floating-point fractions not supported.
+    pub owner_refresh_secs: u64,
     /// Poll interval between scans, milliseconds.
     pub poll_interval_ms: u64,
     /// Re-bootstrap local pool state at most this often (seconds). Event
@@ -639,6 +659,8 @@ impl Config {
             return Err(eyre!("SLIPPAGE_BPS {slippage_bps} too high"));
         }
 
+        let owner_refresh_secs = parse_owner_refresh_secs(env::var("OWNER_REFRESH_SECS").ok().as_deref())?;
+
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -778,6 +800,7 @@ impl Config {
             min_profit,
             gas_price_wei,
             slippage_bps,
+            owner_refresh_secs,
             poll_interval_ms,
             state_refresh_secs,
             sweep_interval_blocks,
@@ -814,6 +837,29 @@ mod tests {
             hooks: Address::ZERO,
             zero_for_one: false,
             quoter: Address::ZERO,
+        }
+    }
+
+    #[test]
+    fn owner_refresh_secs_defaults_when_absent() {
+        assert_eq!(parse_owner_refresh_secs(None).unwrap(), 60);
+    }
+
+    #[test]
+    fn owner_refresh_secs_parses_valid_value() {
+        assert_eq!(parse_owner_refresh_secs(Some("0")).unwrap(), 0);
+        assert_eq!(parse_owner_refresh_secs(Some("1")).unwrap(), 1);
+        assert_eq!(parse_owner_refresh_secs(Some("120")).unwrap(), 120);
+    }
+
+    #[test]
+    fn owner_refresh_secs_rejects_malformed_value() {
+        for bad in ["abc", "", "-1", "1.5", " 60", "60 ", "99999999999999999999999"] {
+            let err = parse_owner_refresh_secs(Some(bad)).unwrap_err();
+            assert!(
+                err.to_string().starts_with("invalid OWNER_REFRESH_SECS"),
+                "unexpected error for {bad:?}: {err}"
+            );
         }
     }
 

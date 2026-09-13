@@ -112,6 +112,15 @@ library PoolIdLibrary {
  *         approving Morpho to pull `assets` back inside the callback.
  *         Supports Uniswap-V2-style, Aerodrome vAMM, Uniswap-V3-style,
  *         Aerodrome Slipstream (CL), and Uniswap V4 routers.
+ *
+ * @dev Revision notes (post-audit hardening):
+ *      - Added a minimal reentrancy guard on `execute` / `onMorphoFlashLoan`
+ *        as defense-in-depth against tokens with transfer hooks.
+ *      - Added two-step ownership transfer so control isn't permanently
+ *        bound to a single key with no rotation path.
+ *      - Added events for off-chain monitoring/indexing.
+ *      - Added a bounds check on the Slipstream tickSpacing cast so an
+ *        out-of-range `feeTier` reverts instead of silently wrapping.
  */
 contract FlashArbitrage {
     uint8 internal constant KIND_UNISWAP_V2 = 0;
@@ -119,6 +128,11 @@ contract FlashArbitrage {
     uint8 internal constant KIND_UNISWAP_V3 = 2;
     uint8 internal constant KIND_UNISWAP_V4 = 3;
     uint8 internal constant KIND_SLIPSTREAM = 4;
+
+    // Slipstream tickSpacing is expected in 1..2000 in practice; int24's
+    // range is far wider, so this just guards against a corrupted/garbage
+    // feeTier value silently wrapping when narrowed to int24.
+    int256 internal constant MAX_TICK_SPACING = 2_000;
 
     struct SwapLeg {
         address router;
@@ -156,13 +170,32 @@ contract FlashArbitrage {
 
     address public immutable morpho;
     address public owner;
+    address public pendingOwner;
+
+    // --- reentrancy guard state ---
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _reentrancyStatus = _NOT_ENTERED;
+
+    event ArbExecuted(
+        address indexed token,
+        address indexed quote,
+        uint256 amount,
+        uint256 profit
+    );
+    event Swept(address indexed token, address indexed to, uint256 amount);
+    event OwnershipTransferStarted(address indexed currentOwner, address indexed pendingOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     error NotOwner();
+    error NotPendingOwner();
     error NotMorpho();
+    error Reentrant();
     error UnknownLegKind(uint8 kind);
     error Unprofitable(uint256 profit, uint256 minProfit);
     error ApproveFailed(address token, address spender);
     error TransferFailed(address token, address to);
+    error TickSpacingOutOfRange(uint24 feeTier);
     error V4InputMismatch(address currency, bytes32 poolId);
     error V4PoolIdMismatch(bytes32 expected, bytes32 actual);
     error V4SwapDeltaMismatch();
@@ -179,6 +212,7 @@ contract FlashArbitrage {
     constructor(address _morpho) {
         morpho = _morpho;
         owner = msg.sender;
+        emit OwnershipTransferred(address(0), msg.sender);
     }
 
     modifier onlyOwner() {
@@ -186,14 +220,26 @@ contract FlashArbitrage {
         _;
     }
 
+    modifier nonReentrant() {
+        if (_reentrancyStatus == _ENTERED) revert Reentrant();
+        _reentrancyStatus = _ENTERED;
+        _;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
+
     /// Called by the Rust bot. Starts the flash loan with the encoded params.
-    function execute(ArbParams calldata params) external onlyOwner {
+    function execute(ArbParams calldata params) external onlyOwner nonReentrant {
         IMorphoBlue(morpho).flashLoan(params.token, params.amount, abi.encode(params));
     }
 
     /// Morpho Blue flash loan callback; only Morpho may call this.
+    /// Guarded by the same reentrancy lock `execute` holds for the duration
+    /// of the flash loan, so this only ever runs as part of one in-flight
+    /// `execute` call — it cannot be entered on its own.
     function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
         if (msg.sender != morpho) revert NotMorpho();
+        if (_reentrancyStatus != _ENTERED) revert Reentrant();
+
         ArbParams memory params = abi.decode(data, (ArbParams));
 
         uint256 balBefore = IERC20(params.token).balanceOf(address(this));
@@ -215,11 +261,31 @@ contract FlashArbitrage {
         if (profit > 0) {
             _safeTransfer(params.token, owner, profit);
         }
+
+        emit ArbExecuted(params.token, params.quote, assets, profit);
     }
 
     /// Rescue any token stuck in this contract (dust, failed runs).
-    function sweep(address token) external onlyOwner {
-        _safeTransfer(token, owner, IERC20(token).balanceOf(address(this)));
+    function sweep(address token) external onlyOwner nonReentrant {
+        uint256 amount = IERC20(token).balanceOf(address(this));
+        _safeTransfer(token, owner, amount);
+        emit Swept(token, owner, amount);
+    }
+
+    /// Step 1 of ownership transfer: current owner nominates a successor.
+    /// Two-step so a typo'd address can't permanently brick control.
+    function transferOwnership(address newOwner) external onlyOwner {
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    /// Step 2: the nominated address must accept before control moves.
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner();
+        address previousOwner = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(previousOwner, owner);
     }
 
     function _swap(SwapLeg memory leg, address from, address to, uint256 amountIn)
@@ -267,11 +333,14 @@ contract FlashArbitrage {
             // Aerodrome Slipstream (CL) router: structurally identical to V3
             // but the pool discriminator is int24 tickSpacing, not uint24 fee
             // (selector 0xa026383e, not 0x414bf389).
+            if (uint256(leg.feeTier) > uint256(MAX_TICK_SPACING)) {
+                revert TickSpacingOutOfRange(leg.feeTier);
+            }
             ISlipstreamRouter.ExactInputSingleParams memory params = ISlipstreamRouter.ExactInputSingleParams({
                 tokenIn: from,
                 tokenOut: to,
                 // feeTier holds the Slipstream tickSpacing (1..2000, all
-                // positive); widen via uint256 then narrow through int256.
+                // positive); validated above so the int24 cast never wraps.
                 tickSpacing: int24(int256(uint256(leg.feeTier))),
                 recipient: address(this),
                 deadline: block.timestamp,
