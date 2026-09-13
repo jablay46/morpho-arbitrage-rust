@@ -255,6 +255,10 @@ forge create contracts/FlashArbitrage.sol:FlashArbitrage --rpc-url https://base-
   `ARB_CONTRACT` di `.env`.
 - Deployer otomatis menjadi `owner` kontrak; hanya owner yang bisa
   `execute` dan `sweep` profit.
+- Ownership dua langkah (`pendingOwner`): untuk memindahkan kontrol, owner
+  saat ini memanggil `transferOwnership(newOwner)` lalu kandidat memanggil
+  `acceptOwnership()`. Kesalahan ketik alamat tidak mengunci kontrak
+  permanen (bisa diganti lagi sebelum di-accept).
 
 Alternatif tanpa `--private-key` di command line (lebih aman, interaktif),
 dengan verifikasi source via Sourcify (tanpa API key):
@@ -544,6 +548,11 @@ Tips produksi:
 - Pakai wallet khusus bot dengan saldo minimal; profit tersimpan di kontrak
   dan hanya bisa di-`sweep` oleh owner.
 - `FlashArbitrage.sol` dibatasi `onlyOwner`; callback dibatasi ke Morpho.
+- Reentrancy guard (`nonReentrant`) pada `execute`/`onMorphoFlashLoan`/`sweep`
+  — token dengan transfer hook tidak bisa menyusup masuk ulang ke tengah
+  flashloan.
+- Event `ArbExecuted`/`Swept`/`OwnershipTransfer*` ter-emit untuk monitoring
+  off-chain.
 - Pertahanan berlapis: `minOut` per leg → `minProfit` on-chain →
   `eth_estimateGas` sebagai gate simulasi. Kegagalan terburuk adalah rugi gas,
   bukan kehilangan principal (flash loan yang gagal otomatis revert).
