@@ -291,6 +291,7 @@ Variabel yang tersedia:
 | `GAS_PRICE_WEI` | Tidak | Override gas price; default diambil on-chain. |
 | `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (**khusus Base**; chain lain wajib diisi, mis. Ethereum mainnet `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`). |
 | `QUOTER_SLIPSTREAM` | Tidak | Alamat Quoter Aerodrome Slipstream untuk pricing venue `slipstream`. Default `0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0` (**khusus Base**). |
+| `QUOTER_V4` | Tidak | Alamat Uniswap V4 Quoter untuk pricing venue `v4`. Default `0x0d5e0f971ed27fbff6c2837bf31316121532048d` (**khusus Base**). |
 | `POLL_INTERVAL_MS` | Tidak | Interval polling untuk mode `scan` tanpa WSS. Default `500`. |
 | `SWEEP_INTERVAL_BLOCKS` | Tidak | Interval sweep penuh (block) sebagai safety net di mode event-driven: scan dipicu event pool, tapi tetap dipaksa minimal tiap N block. Default `10`. |
 | `MIN_SCAN_INTERVAL_MS` | Tidak | Jeda minimum antar scan event-driven (ms). Membatasi burst JSON-RPC pada plan dengan RPS rendah (mis. Chainstack 25 RPS); trigger dalam masa cooldown di-drop karena scan berikutnya membaca block `latest` yang sudah mencakup perubahannya. Default `0` (tanpa batas). |
@@ -307,7 +308,7 @@ Format `config.toml` (direkomendasikan):
 [[venues]]
 pair = "auto"                    # atau alamat pool, "auto" = resolve dari factory
 router = "0x4752ba5DBc23f44D87826276BF6Fd6b1c372aD24"
-kind = "v2"                      # v2 | aero | v3 | slipstream (v4 belum didukung)
+kind = "v2"                      # v2 | aero | v3 | slipstream | v4
 fee_bps = 30                     # fee pool dalam basis point (default 30; untuk V2/Aero)
 factory = "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
 stable = false                   # true untuk pool stable Aerodrome
@@ -317,11 +318,18 @@ quoter = "0x0000..."             # override QuoterV2 per-venue (V3, opsional)
 ```
 
 - `pair` = alamat pool/pair, atau `"auto"` untuk resolve dari `factory` saat startup.
-- `kind` = `v2` (default) | `aero` | `v3` | `slipstream` (`v4` belum didukung).
+- `kind` = `v2` (default) | `aero` | `v3` | `slipstream` | `v4`.
 - `fee_bps` = fee pool dalam basis point (default 30; untuk V2/Aero).
 - `fee_tier` = fee tier Uniswap V3 dalam hundredths of a bip (500/3000/10000).
   Untuk `slipstream` field ini membawa **tickSpacing** pool (1/50/100/200/2000).
+  Untuk `v4` field ini membawa **fee PoolKey** (hundredths of a bip).
 - `stable` = `true` untuk pool stable Aerodrome.
+- Untuk `v4`: `pool_id` wajib diisi (pool ID = `keccak256(abi.encode(PoolKey))`),
+  `tick_spacing` positif, dan `hooks` = alamat hooks pool. `pair` TIDAK boleh
+  `"auto"` — V4 tidak punya `getPair`/`token0()`; token ordering diambil dari
+  pair (loan, quote) yang di-sort. Arah swap (`zero_for_one`) diturunkan per
+  leg di executor, bukan dari konfigurasi. Harga diambil via V4 Quoter
+  (`QUOTER_V4`).
 - `quoter` = override QuoterV2 per-venue (V3, opsional). Kosongkan untuk
   memakai `QUOTER_V2` global. Wajib diisi untuk V3 venue non-Uniswap
   (mis. PancakeSwap V3) karena tiap factory punya quoter sendiri.

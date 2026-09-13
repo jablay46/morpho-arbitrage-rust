@@ -52,7 +52,12 @@ struct VenueCache {
     /// uncached, or via local cl_math when bootstrap state is present).
     v3_idx: Vec<usize>,
     v3_pairs: Vec<Address>,
-    /// All resolved pool addresses (V2 + V3), for the event filter.
+    /// V4 venue indices. V4 pools live in the singleton PoolManager and are
+    /// addressed by poolId, not a pair address, so no `v4_pairs` exists:
+    /// every V4 venue is priced through the V4 Quoter on every scan.
+    v4_idx: Vec<usize>,
+    /// All resolved pool addresses (V2 + V3; for V4, the PoolManager), for
+    /// the event filter.
     pool_addrs: Vec<Address>,
     /// Event-driven pool-state cache, bootstrapped at startup; CL venues
     /// present here are priced locally on every scan.
@@ -80,6 +85,7 @@ impl VenueCache {
         let mut v2_pairs = Vec::new();
         let mut v3_idx = Vec::new();
         let mut v3_pairs = Vec::new();
+        let mut v4_idx = Vec::new();
         let mut pool_addrs = Vec::with_capacity(cfg.venues.len());
         for (idx, venue) in cfg.venues.iter().enumerate() {
             // Auto-resolve the pool from the venue's factory when the
@@ -113,6 +119,21 @@ impl VenueCache {
                 v3_idx.push(idx);
                 v3_pairs.push(pool);
                 fetch_cl_pair_tokens(provider, pool).await?
+            } else if venue.kind == VenueKind::UniswapV4 {
+                // V4 pools are NOT contracts of their own: they live in the
+                // singleton PoolManager (venue.router) and are addressed by
+                // poolId = keccak256(abi.encode(PoolKey)), so token0()/token1()
+                // and getReserves() do not exist. The contract rebuilds the
+                // PoolKey from the cycle pair with currencies sorted by
+                // address, so the venue is exactly the (sorted) loan/quote
+                // pair — no on-chain reads needed.
+                v4_idx.push(idx);
+                let (token0, token1) = if cfg.loan_token < cfg.quote_token {
+                    (cfg.loan_token, cfg.quote_token)
+                } else {
+                    (cfg.quote_token, cfg.loan_token)
+                };
+                PairTokens { token0, token1 }
             } else {
                 v2_idx.push(idx);
                 v2_pairs.push(pool);
@@ -126,7 +147,16 @@ impl VenueCache {
                 }
             }
             pair_tokens.push(tokens);
-            pool_addrs.push(pool);
+            // For V4 the "pool" is not a contract — it is the singleton
+            // PoolManager, whose address is the venue's router. V4 events
+            // (and any V2/CL-shaped log from a manager with such a pool —
+            // none in practice) live there; V4 Swap events use a different
+            // signature, so apply_pool_log ignores them.
+            pool_addrs.push(if venue.kind == VenueKind::UniswapV4 {
+                venue.router
+            } else {
+                pool
+            });
         }
         let owner = executor::fetch_owner(provider, cfg.arb_contract).await?;
         // Probe Flashblock capability once, at startup, using ONLY the
@@ -169,6 +199,7 @@ impl VenueCache {
             v2_pairs,
             v3_idx,
             v3_pairs,
+            v4_idx,
             pool_addrs,
             state,
             owner,
@@ -300,17 +331,42 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Pick the quoter for a V3 venue: its per-venue override when set,
-/// otherwise the global config quoter (QUOTER_V2 for Uniswap-style V3,
-/// QUOTER_SLIPSTREAM for Aerodrome CL).
+/// Pick the quoter for a venue: its per-venue override when set, otherwise
+/// the global config quoter (QUOTER_V2 for Uniswap-style V3,
+/// QUOTER_SLIPSTREAM for Aerodrome CL, QUOTER_V4 for Uniswap V4).
 fn resolve_quoter(cfg: &Config, venue: &morpho_arbitrage_bot::config::Venue) -> Address {
     if venue.quoter != Address::ZERO {
         return venue.quoter;
     }
-    if venue.kind == VenueKind::Slipstream {
-        return cfg.quoter_slipstream;
+    match venue.kind {
+        VenueKind::Slipstream => cfg.quoter_slipstream,
+        VenueKind::UniswapV4 => cfg.quoter_v4,
+        _ => cfg.quoter_v2,
     }
-    cfg.quoter_v2
+}
+
+/// Build the quote request for one leg of `venue`. Picks the right quoter
+/// ABI by kind and carries the V4 PoolKey fields (pool_id, tick_spacing,
+/// hooks) through so the V4 Quoter can price the pool off-chain.
+fn quote_request(
+    cfg: &Config,
+    venue: &morpho_arbitrage_bot::config::Venue,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+) -> QuoteRequest {
+    QuoteRequest {
+        token_in,
+        token_out,
+        fee_tier: venue.fee_tier,
+        amount_in,
+        quoter: resolve_quoter(cfg, venue),
+        slipstream: venue.kind == VenueKind::Slipstream,
+        v4: venue.kind == VenueKind::UniswapV4,
+        pool_id: venue.pool_id,
+        tick_spacing: venue.tick_spacing,
+        hooks: venue.hooks,
+    }
 }
 
 /// Strip credentials from a URL for logging: keep scheme + host, drop the
@@ -993,24 +1049,44 @@ where
         }
     }
     let mut leg1_requests = Vec::new();
+    let mut leg1_v4_requests = Vec::new();
     for (j, &idx) in cache.v3_idx.iter().enumerate() {
         if cached_cl(cache, cache.v3_pairs[j], want_pending).is_some() {
             continue;
         }
         let venue = &cfg.venues[idx];
-        let slipstream = venue.kind == VenueKind::Slipstream;
         for &size in sizes {
-            leg1_requests.push(QuoteRequest {
-                token_in: cfg.loan_token,
-                token_out: cfg.quote_token,
-                fee_tier: venue.fee_tier,
-                amount_in: size,
-                quoter: resolve_quoter(cfg, venue),
-                slipstream,
-            });
+            leg1_requests.push(quote_request(
+                cfg,
+                venue,
+                cfg.loan_token,
+                cfg.quote_token,
+                size,
+            ));
         }
     }
-    let snapshot = fetch_scan_snapshot(provider, &cache.v2_pairs, &leg1_requests, block).await?;
+    // V4 venues have no local state and no pair address: every V4 leg-1
+    // quote rides the V4 Quoter (separate ABI, decoded into its own slice).
+    for &idx in &cache.v4_idx {
+        let venue = &cfg.venues[idx];
+        for &size in sizes {
+            leg1_v4_requests.push(quote_request(
+                cfg,
+                venue,
+                cfg.loan_token,
+                cfg.quote_token,
+                size,
+            ));
+        }
+    }
+    let snapshot = fetch_scan_snapshot(
+        provider,
+        &cache.v2_pairs,
+        &leg1_requests,
+        &leg1_v4_requests,
+        block,
+    )
+    .await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
 
     // Assemble leg-1 outputs per venue; V3 quotes come straight from the
@@ -1070,14 +1146,7 @@ where
                     leg1_backfill.push((
                         j,
                         si,
-                        QuoteRequest {
-                            token_in: cfg.loan_token,
-                            token_out: cfg.quote_token,
-                            fee_tier: venue.fee_tier,
-                            amount_in: sizes[si],
-                            quoter: resolve_quoter(cfg, venue),
-                            slipstream: venue.kind == VenueKind::Slipstream,
-                        },
+                        quote_request(cfg, venue, cfg.loan_token, cfg.quote_token, sizes[si]),
                     ));
                 }
             }
@@ -1151,9 +1220,32 @@ where
         }
     }
 
+    // V4 leg-1 assembly: every V4 venue was priced via the V4 Quoter in the
+    // snapshot (v4_quotes), one quote per size, in v4_idx order.
+    let mut next_v4 = 0usize;
+    for &idx in &cache.v4_idx {
+        let leg1: Vec<LegOutput> = snapshot.v4_quotes[next_v4..next_v4 + n_sizes]
+            .iter()
+            .map(|&q| (q, false))
+            .collect();
+        next_v4 += n_sizes;
+        if leg1.iter().all(|q| q.0.is_none()) {
+            warn!(venue = idx, "V4 venue returned no usable quotes; skipping venue");
+            continue;
+        }
+        legs.push(Leg1 {
+            quotes: VenueQuotes {
+                venue: idx,
+                leg1,
+                leg2: Vec::new(),
+            },
+            v2_reserves: None,
+        });
+    }
+
     // Phase 2: leg 2 (quote -> loan) for every distinct leg-1 output of the
-    // OTHER venues. V2 legs are exact local math; V3 legs go through one
-    // more QuoterV2 batch.
+    // OTHER venues. V2/V4 legs are exact local math / V4 Quoter calls; V3
+    // legs go through one more QuoterV2 batch.
     let mut phase2: Vec<(usize, QuoteRequest)> = Vec::new(); // (position in legs, request)
     for s in 0..legs.len() {
         let mut inputs: Vec<U256> = Vec::new();
@@ -1202,14 +1294,7 @@ where
             if !failed.is_empty() {
                 let reqs: Vec<QuoteRequest> = failed
                     .iter()
-                    .map(|&q| QuoteRequest {
-                        token_in: cfg.quote_token,
-                        token_out: cfg.loan_token,
-                        fee_tier: venue.fee_tier,
-                        amount_in: q,
-                        quoter: resolve_quoter(cfg, venue),
-                        slipstream: venue.kind == VenueKind::Slipstream,
-                    })
+                    .map(|&q| quote_request(cfg, venue, cfg.quote_token, cfg.loan_token, q))
                     .collect();
                 let backfilled = fetch_quotes(provider, &reqs, block)
                     .await
@@ -1227,18 +1312,10 @@ where
             }
             legs[s].quotes.leg2 = leg2;
         } else {
-            let slipstream = venue.kind == VenueKind::Slipstream;
             for q in inputs {
                 phase2.push((
                     s,
-                    QuoteRequest {
-                        token_in: cfg.quote_token,
-                        token_out: cfg.loan_token,
-                        fee_tier: venue.fee_tier,
-                        amount_in: q,
-                        quoter: resolve_quoter(cfg, venue),
-                        slipstream,
-                    },
+                    quote_request(cfg, venue, cfg.quote_token, cfg.loan_token, q),
                 ));
             }
         }
@@ -1516,28 +1593,26 @@ where
     if opp.leg1_local {
         if let Some(pool) = v3_pool_of(opp.first) {
             let venue = &cfg.venues[opp.first];
-            auth_requests.push(QuoteRequest {
-                token_in: cfg.loan_token,
-                token_out: cfg.quote_token,
-                fee_tier: venue.fee_tier,
-                amount_in: opp.loan_amount,
-                quoter: resolve_quoter(cfg, venue),
-                slipstream: venue.kind == VenueKind::Slipstream,
-            });
+            auth_requests.push(quote_request(
+                cfg,
+                venue,
+                cfg.loan_token,
+                cfg.quote_token,
+                opp.loan_amount,
+            ));
             auth_legs.push((pool, opp.quote_out));
         }
     }
     if opp.leg2_local {
         if let Some(pool) = v3_pool_of(opp.second) {
             let venue = &cfg.venues[opp.second];
-            auth_requests.push(QuoteRequest {
-                token_in: cfg.quote_token,
-                token_out: cfg.loan_token,
-                fee_tier: venue.fee_tier,
-                amount_in: opp.quote_out,
-                quoter: resolve_quoter(cfg, venue),
-                slipstream: venue.kind == VenueKind::Slipstream,
-            });
+            auth_requests.push(quote_request(
+                cfg,
+                venue,
+                cfg.quote_token,
+                cfg.loan_token,
+                opp.quote_out,
+            ));
             auth_legs.push((pool, opp.amount_out));
         }
     }

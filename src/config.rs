@@ -52,8 +52,11 @@ pub struct Venue {
     #[serde(default)]
     pub hooks: Address,
     /// Uniswap V4 swap direction (kind v4 only): true = currency0 -> currency1.
-    /// Derived at startup from `pool_id` vs the sorted (loan, quote) pair, but
-    /// explicit here so auto-resolve and V4-only setups stay unambiguous.
+    /// IGNORED for actual execution — the executor derives the direction per
+    /// leg from that leg's input token against the PoolKey currency ordering,
+    /// because the same pool sells the loan token as leg A and the quote
+    /// token as leg B with opposite directions. Kept only for DEX_VENUES/TOML
+    /// parity, so configs written with an explicit direction still load.
     #[serde(default)]
     pub zero_for_one: bool,
     /// Per-venue QuoterV2 override (V3 only). Address::ZERO = use the
@@ -175,6 +178,10 @@ pub struct Config {
     /// Aerodrome Slipstream Quoter used to price CL legs. Defaults to the
     /// Base deployment; set QUOTER_SLIPSTREAM explicitly for other chains.
     pub quoter_slipstream: Address,
+    /// Uniswap V4 Quoter used to price V4 legs off-chain (simulates the swap
+    /// via the PoolManager and reverts with the output). Defaults to the Base
+    /// deployment; set QUOTER_V4 explicitly for any other chain.
+    pub quoter_v4: Address,
     /// Read chain state (reserves, quotes, gas) against the `pending` block
     /// tag, i.e. the latest Flashblock preconfirmation (~200ms fresh on Base)
     /// instead of the sealed `latest` block (~2s). Requires a Flashblock-aware
@@ -486,6 +493,17 @@ impl Config {
                 return Err(eyre!("venue {idx}: 'auto' pool requires a factory address"));
             }
             if venue.kind == VenueKind::UniswapV4 {
+                // V4 pools are addressed by poolId = keccak256(abi.encode(
+                // PoolKey)), NOT by a factory getPool(Pair) lookup, so the
+                // "auto" resolution path cannot produce one. Reject it here at
+                // validation time with a clear message instead of failing
+                // later inside resolve_pool.
+                if venue.pair.is_zero() {
+                    return Err(eyre!(
+                        "venue {idx}: kind 'v4' does not support pair=\"auto\"; \
+                         configure the explicit pool_id (keccak256(abi.encode(PoolKey)))"
+                    ));
+                }
                 // tick_spacing must be positive (type int24 on chain; the i32
                 // config keeps negatives representable for clearer errors).
                 if venue.tick_spacing <= 0 || venue.tick_spacing > i32::from(i16::MAX) {
@@ -639,6 +657,19 @@ impl Config {
                     .expect("valid constant address")
             });
 
+        // Uniswap V4 Quoter on Base. Chain-specific like QUOTER_V2; a wrong or
+        // missing address makes every V4 quote revert and V4 venues are
+        // silently skipped, so QUOTER_V4 must be set for non-Base chains.
+        let quoter_v4 = env::var("QUOTER_V4")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| Address::from_str(&s).map_err(|e| eyre!("invalid QUOTER_V4: {e}")))
+            .transpose()?
+            .unwrap_or_else(|| {
+                Address::from_str("0x0d5e0f971ed27fbff6c2837bf31316121532048d")
+                    .expect("valid constant address")
+            });
+
         // Flashblock (Base 200ms preconfirmation) options. All default off so
         // a non-Flashblock endpoint behaves exactly as before; enabling them
         // only helps when the RPC/WSS endpoint streams Flashblocks.
@@ -702,6 +733,7 @@ impl Config {
             dry_run,
             quoter_v2,
             quoter_slipstream,
+            quoter_v4,
             use_pending_state,
             use_flashblock_sync,
             use_pending_logs,

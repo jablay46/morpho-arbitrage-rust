@@ -399,7 +399,11 @@ contract FlashArbitrage {
         int128 outDelta = zeroForOne ? int128(rawDelta) : int128(rawDelta >> 128);
         if (inDelta >= 0 || outDelta <= 0) revert V4SwapDeltaMismatch();
         uint256 actualIn = uint256(uint128(-inDelta));
-        amountOut = uint256(uint128(-outDelta));
+        // `outDelta` is the positive output side of the exact-input swap (the
+        // guard above rejects non-positive output). Negating it here would
+        // produce the two's-complement representation of a huge number and
+        // make `take` request an impossible payout.
+        amountOut = uint256(uint128(outDelta));
         if (amountOut < leg.minOut) revert V4MinOutput(amountOut, leg.minOut);
 
         // Withdraw the output to this contract.

@@ -46,7 +46,20 @@ pub async fn fetch_owner<P: Provider>(provider: &P, contract: Address) -> Result
     Ok(arb.owner().call().await?)
 }
 
-fn build_leg(venue: &Venue, min_out: U256) -> SwapLeg {
+/// Build one swap leg. For V4 venues the swap direction is NOT a per-venue
+/// constant: the same pool sells the loan token as leg A and the quote token
+/// as leg B, and the contract's reconstructed PoolKey orders currencies by
+/// address (`currency0 = min(from, to)`), so a leg sells currency0 exactly
+/// when its input token sorts below its output token. Derive `zeroForOne`
+/// from that per-leg ordering; the configured `venue.zero_for_one` is
+/// ignored for V4 (it is kept for DEX_VENUES/TOML parity and non-V4 kinds,
+/// where the contract never reads it).
+fn build_leg(venue: &Venue, min_out: U256, token_in: Address, token_out: Address) -> SwapLeg {
+    let zero_for_one = if venue.kind == crate::config::VenueKind::UniswapV4 {
+        token_in < token_out
+    } else {
+        venue.zero_for_one
+    };
     SwapLeg {
         router: venue.router,
         kind: venue.kind as u8,
@@ -57,7 +70,7 @@ fn build_leg(venue: &Venue, min_out: U256) -> SwapLeg {
         poolId: alloy::primitives::FixedBytes(venue.pool_id),
         tickSpacing: I24::try_from(i64::from(venue.tick_spacing)).expect("tick_spacing fits int24"),
         hooks: venue.hooks,
-        zeroForOne: venue.zero_for_one,
+        zeroForOne: zero_for_one,
     }
 }
 
@@ -73,20 +86,34 @@ fn with_slippage(expected: U256, slippage_bps: u64) -> U256 {
 /// instead of letting a gross-positive-but-net-negative trade broadcast
 /// and revert later (wasted gas).
 pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbParams {
-    // Single-slippage bound per leg. `opp.amount_out` is the leg-2 output for
-    // the full `quote_out` input; if leg 1 delivers less (down to
-    // legA.minOut = quote_out * (1-s)), leg 2's output scales along with it,
-    // so one decay on `amount_out` covers both effects without over-shrinking
-    // the bound (compounding the tolerance twice would reject candidates that
-    // still clear minProfit).
+    // Leg B's input is leg A's *actual* output, which may land as low as
+    // legA.minOut (= quote_out * (1 - s)). Leg B's output then scales down
+    // with it, so a single-slippage bound on `amount_out` would revert on an
+    // independent adverse move in the second pool even though every leg
+    // remains within the configured tolerance and the cycle still clears
+    // minProfit. Apply the tolerance twice on leg B so it compounds; the
+    // final `minProfit` check is the profitability backstop after both legs.
     let leg_a_min = with_slippage(opp.quote_out, cfg.slippage_bps);
-    let leg_b_min = with_slippage(opp.amount_out, cfg.slippage_bps);
+    let leg_b_min = with_slippage(
+        with_slippage(opp.amount_out, cfg.slippage_bps),
+        cfg.slippage_bps,
+    );
     ArbParams {
         token: cfg.loan_token,
         quote: cfg.quote_token,
         amount: opp.loan_amount,
-        legA: build_leg(&cfg.venues[opp.first], leg_a_min),
-        legB: build_leg(&cfg.venues[opp.second], leg_b_min),
+        legA: build_leg(
+            &cfg.venues[opp.first],
+            leg_a_min,
+            cfg.loan_token,
+            cfg.quote_token,
+        ),
+        legB: build_leg(
+            &cfg.venues[opp.second],
+            leg_b_min,
+            cfg.quote_token,
+            cfg.loan_token,
+        ),
         minProfit: min_profit,
     }
 }
@@ -419,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn build_params_applies_single_slippage_per_leg() {
+    fn build_params_compounds_slippage_on_leg_b() {
         use crate::arbitrage::Opportunity;
         use crate::config::{Config, Venue, VenueKind};
 
@@ -459,6 +486,7 @@ mod tests {
             dry_run: true,
             quoter_v2: Address::ZERO,
             quoter_slipstream: Address::ZERO,
+            quoter_v4: Address::ZERO,
             use_pending_state: false,
             use_flashblock_sync: false,
             use_pending_logs: false,
@@ -480,12 +508,90 @@ mod tests {
         // Leg A tolerates one slippage interval: 20000 * 0.995 = 19900.
         assert_eq!(params.legA.minOut, U256::from(19_900u64));
         assert_eq!(params.minProfit, U256::ZERO);
-        // Leg B tolerates ONE slippage interval on the final output:
-        // floor(10100 * 0.995) = 10049. Compounding it twice would reject
-        // candidates that still clear minProfit.
-        let expected_b = U256::from(10_100u64) * U256::from(9_950u64) / U256::from(10_000u64);
+        // Leg B tolerates two compounded intervals (its own input may drift
+        // down by the leg-A tolerance AND the second pool may move against it
+        // independently): floor(10100 * 0.995^2) = 9998.
+        let expected_b = U256::from(10_100u64) * U256::from(9_950u64) / U256::from(10_000u64)
+            * U256::from(9_950u64)
+            / U256::from(10_000u64);
         assert_eq!(params.legB.minOut, expected_b);
-        assert_eq!(expected_b, U256::from(10_049u64));
+        assert_eq!(expected_b, U256::from(9_998u64));
+    }
+
+    /// The V4 direction is NOT a per-venue constant: the same pool sells the
+    /// loan token as leg A and the quote token as leg B, which the contract's
+    /// PoolKey reconstruction (currencies sorted by address) requires to
+    /// have opposite `zeroForOne` flags. Putting one V4 venue in both
+    /// positions must derive opposite directions from each leg's own input
+    /// token — never from the once-per-venue config field.
+    #[test]
+    fn build_params_derives_opposite_v4_direction_per_leg() {
+        use crate::arbitrage::Opportunity;
+        use crate::config::{Config, Venue, VenueKind};
+
+        let v4 = Venue {
+            pair: Address::ZERO,
+            router: Address::ZERO,
+            kind: VenueKind::UniswapV4,
+            fee_bps: 30,
+            factory: Address::ZERO,
+            stable: false,
+            fee_tier: 3000,
+            pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+            zero_for_one: false, // configured value must be derived away
+            quoter: Address::ZERO,
+        };
+        let cfg = Config {
+            rpc_url: String::new(),
+            wss_url: None,
+            private_key: String::new(),
+            morpho: Address::ZERO,
+            arb_contract: Address::ZERO,
+            // loan_token < quote_token numerically, so currency0 = loan_token.
+            loan_token: address!("1000000000000000000000000000000000000001"),
+            quote_token: address!("2000000000000000000000000000000000000002"),
+            wrapped_native: Address::ZERO,
+            venues: vec![v4, v4.clone()],
+            loan_amounts: vec![],
+            min_profit: U256::ZERO,
+            gas_price_wei: None,
+            slippage_bps: 50,
+            poll_interval_ms: 0,
+            state_refresh_secs: 60,
+            sweep_interval_blocks: 10,
+            use_new_heads: false,
+            min_scan_interval_ms: 0,
+            dry_run: true,
+            quoter_v2: Address::ZERO,
+            quoter_slipstream: Address::ZERO,
+            quoter_v4: Address::ZERO,
+            use_pending_state: false,
+            use_flashblock_sync: false,
+            use_pending_logs: false,
+            use_pending_sim: false,
+            use_local_sim: false,
+        };
+        let opp = Opportunity {
+            first: 0,
+            second: 1,
+            loan_amount: U256::from(10_000u64),
+            quote_out: U256::from(20_000u64),
+            amount_out: U256::from(10_100u64),
+            profit: U256::from(100u64),
+            leg1_local: false,
+            leg2_local: false,
+        };
+
+        let params = build_params(&cfg, &opp, cfg.min_profit);
+        // Leg A sells the loan token (currency0 here), leg B sells the quote
+        // token (currency1 here), so the flags must be opposite.
+        assert!(params.legA.zeroForOne, "leg A sells currency0 (loan token)");
+        assert!(
+            !params.legB.zeroForOne,
+            "leg B sells currency1 (quote token)"
+        );
     }
 
     /// The Slipstream leg kind (4) must round-trip through the alloy binding
