@@ -178,6 +178,14 @@ pub struct Config {
     /// simulated leg output scaled by (1 - slippage) becomes the on-chain
     /// `minOut`, bounding price drift and raising the cost of sandwiching.
     pub slippage_bps: u64,
+    /// Re-check the contract's `owner()` at least this often (seconds
+    /// wall-clock). The contract supports two-step ownership transfer at
+    /// runtime; the cached owner is used as `from` in simulations and must
+    /// match the signing wallet, so a stale value silently rejects every
+    /// candidate (`NotOwner`) after a transfer. A mismatch stops the bot
+    /// with an explicit ownership error instead of scanning endlessly.
+    /// Default 60; floating-point fractions not supported.
+    pub owner_refresh_secs: u64,
     /// Poll interval between scans, milliseconds.
     pub poll_interval_ms: u64,
     /// Re-bootstrap local pool state at most this often (seconds). Event
@@ -639,6 +647,12 @@ impl Config {
             return Err(eyre!("SLIPPAGE_BPS {slippage_bps} too high"));
         }
 
+        let owner_refresh_secs = env::var("OWNER_REFRESH_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(1);
+
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -778,6 +792,7 @@ impl Config {
             min_profit,
             gas_price_wei,
             slippage_bps,
+            owner_refresh_secs,
             poll_interval_ms,
             state_refresh_secs,
             sweep_interval_blocks,

@@ -14,7 +14,7 @@ use morpho_arbitrage_bot::dex::{
     fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id, PairTokens,
     QuoteRequest,
 };
-use morpho_arbitrage_bot::executor;
+use morpho_arbitrage_bot::executor::{self, OwnershipMismatch};
 use morpho_arbitrage_bot::sim::SimOutcome;
 use morpho_arbitrage_bot::state::{self, bootstrap_cl_at, PoolState, StateStore};
 use std::sync::Arc;
@@ -40,8 +40,9 @@ enum Command {
 }
 
 /// Immutable per-venue metadata resolved once at startup, so per-scan RPC
-/// traffic is only getReserves / QuoterV2 / gasPrice (token0/token1 and the
-/// contract owner never change).
+/// traffic is only getReserves / QuoterV2 / gasPrice (token0/token1 never
+/// change; the contract owner is re-checked on a timer and the cached copy
+/// refreshed — see `owner_refresh_secs`).
 struct VenueCache {
     /// (token0, token1) per venue, aligned with cfg.venues.
     pair_tokens: Vec<PairTokens>,
@@ -67,8 +68,18 @@ struct VenueCache {
     /// Event-driven pool-state cache, bootstrapped at startup; CL venues
     /// present here are priced locally on every scan.
     state: StateStore,
-    /// Contract owner, used as `from` in simulations/gas estimates.
+    /// Contract owner, used as `from` in simulations/gas estimates. The
+    /// contract can change owners at runtime, so this is refreshed on a
+    /// timer (`owner_refresh_secs`) and re-validated against the broadcast
+    /// signer; see [`Self::refresh_owner`].
     owner: Address,
+    /// Address of the configured boot signer (`PRIVATE_KEY`). Immutable for
+    /// the process lifetime — alloy providers hold the wallet by value, so
+    /// hot-reloading a different key would require rebuilding the
+    /// broadcaster mid-run.
+    signer: Address,
+    /// When the cached owner was last checked against the contract.
+    owner_checked_at: std::time::Instant,
     /// Pending (Flashblock) overlay: preconfirmed logs land here, never in
     /// `state`. Sealed scans price from `state` only; pending scans price
     /// from `state` + `pending`. Cleared on every sealed trigger (the sealed
@@ -84,7 +95,11 @@ struct VenueCache {
 }
 
 impl VenueCache {
-    async fn build<P: alloy::providers::Provider>(provider: &P, cfg: &Config) -> Result<Self> {
+    async fn build<P: alloy::providers::Provider>(
+        provider: &P,
+        cfg: &Config,
+        signer: Address,
+    ) -> Result<Self> {
         let mut pair_tokens = Vec::with_capacity(cfg.venues.len());
         let mut v2_idx = Vec::new();
         let mut v2_pairs = Vec::new();
@@ -166,6 +181,9 @@ impl VenueCache {
             });
         }
         let owner = executor::fetch_owner(provider, cfg.arb_contract).await?;
+        if owner != signer {
+            return Err(executor::OwnershipMismatch { owner, signer }.into());
+        }
         // Probe Flashblock capability once, at startup, using ONLY the
         // Flashblock-specific `newFlashblocks` WebSocket subscription. The
         // `pending`-vs-`latest` block-number heuristic is deliberately NOT
@@ -211,9 +229,42 @@ impl VenueCache {
             pool_addrs,
             state,
             owner,
+            signer,
+            owner_checked_at: std::time::Instant::now(),
             flashblocks_available,
             pending: StateStore::new(),
         })
+    }
+
+    /// Refresh the cached contract owner from chain state at most once per
+    /// `cfg.owner_refresh_secs`. When the on-chain owner differs from the
+    /// bot's signing wallet, stop with [`OwnershipMismatch`]: the signer is
+    /// fixed for the process lifetime and a transferred contract can only be
+    /// traded again after the operator points `PRIVATE_KEY` at the new owner
+    /// and restarts in coordination with the transfer.
+    async fn refresh_owner<P: alloy::providers::Provider>(
+        &mut self,
+        provider: &P,
+        arb_contract: Address,
+        owner_refresh_secs: u64,
+    ) -> Result<()> {
+        if self.owner_checked_at.elapsed().as_secs() < owner_refresh_secs {
+            return Ok(());
+        }
+        let onchain_owner = executor::fetch_owner(provider, arb_contract).await?;
+        self.owner_checked_at = std::time::Instant::now();
+        if onchain_owner != self.owner {
+            info!(
+                previous = %self.owner,
+                current = %onchain_owner,
+                "contract ownership changed on-chain; refreshed cached owner"
+            );
+            self.owner = onchain_owner;
+        }
+        if self.owner != self.signer {
+            return Err(OwnershipMismatch { owner: self.owner, signer: self.signer }.into());
+        }
+        Ok(())
     }
 }
 
@@ -279,15 +330,18 @@ async fn main() -> Result<()> {
     // reused across scans (executor no longer opens a fresh connection per
     // trade).
     let broadcaster = build_broadcaster(&cfg)?;
+    let signer = broadcaster_signer(&cfg)?;
 
     // One-off startup resolution: pair tokens for orientation/validation and
     // the contract owner for simulations. ~3 RPC calls per venue, once.
-    let mut cache = VenueCache::build(&broadcaster, &cfg).await?;
+    let mut cache = VenueCache::build(&broadcaster, &cfg, signer).await?;
 
     info!(
         morpho = %cfg.morpho,
         arb_contract = %cfg.arb_contract,
         owner = %cache.owner,
+        signer = %cache.signer,
+        owner_refresh_secs = cfg.owner_refresh_secs,
         loan_token = %cfg.loan_token,
         quote_token = %cfg.quote_token,
         venues = cfg.venues.len(),
@@ -328,6 +382,9 @@ async fn main() -> Result<()> {
                 loop {
                     if let Err(e) = run_once(&cfg, &mut cache, &broadcaster, Some(&inflight)).await
                     {
+                        if is_ownership_mismatch(&e) {
+                            return Err(eyre::eyre!("{e:#}"));
+                        }
                         warn!(error = %e, "scan iteration failed");
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms))
@@ -400,6 +457,15 @@ fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider + C
     Ok(alloy::providers::ProviderBuilder::new()
         .wallet(wallet)
         .connect_http(cfg.rpc_url.parse()?))
+}
+
+/// Address of the wallet attached to `build_broadcaster`'s provider — the
+/// immutable bot signing key. The owner-refresh logic compares this against
+/// the on-chain owner and stops on mismatch (the signer cannot be hot-swapped
+/// mid-process).
+fn broadcaster_signer(cfg: &Config) -> Result<Address> {
+    let signer: alloy::signers::local::PrivateKeySigner = cfg.private_key.parse()?;
+    Ok(signer.address())
 }
 
 /// Topic-0 signatures of pool events that can move the price of a watched
@@ -724,7 +790,18 @@ where
         }
         last_scan_at = std::time::Instant::now();
         info!(block, reason, "scanning");
-        match run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await {
+        let outcome = run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight))
+            .await;
+        if let Err(e) = &outcome {
+            if is_ownership_mismatch(e) {
+                // A transferred contract pointed at a foreign key must stop
+                // the bot, not just back off: until the operator updates
+                // PRIVATE_KEY and restarts, every scan would exhaustively
+                // reject stale-owner candidates.
+                return Err(eyre::eyre!("{e:#}"));
+            }
+        }
+        match outcome {
             // Advance by the block the scan actually read (latest at scan
             // time), not the trigger block, so buffered events for blocks
             // already covered by that read don't fire redundant scans.
@@ -749,6 +826,9 @@ where
     warn!("block subscription ended; falling back to polling");
     loop {
         if let Err(e) = run_once(cfg, cache, broadcaster, Some(inflight)).await {
+            if is_ownership_mismatch(&e) {
+                return Err(eyre::eyre!("{e:#}"));
+            }
             warn!(error = %e, "scan iteration failed");
         }
         tokio::time::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms)).await;
@@ -1005,6 +1085,16 @@ where
         pending_state = cfg.use_pending_state,
         "scan pinned to block"
     );
+
+    // Ownership is a runtime state (two-step transfer); verify the cached
+    // owner against the contract at most once per `owner_refresh_secs`. The
+    // owner is used as `from` in simulations/gas estimates, so refreshing
+    // keeps post-transfer scans priced against the CURRENT owner. When the
+    // on-chain owner is not the boot signer, stop with an explicit
+    // ownership error instead of exhaustively rejecting candidates.
+    cache
+        .refresh_owner(provider, cfg.arb_contract, cfg.owner_refresh_secs)
+        .await?;
 
     // Phase 1 batch: reserves + leg-1 quotes (loan -> quote) + gas price.
     // CL venues with a bootstrapped PoolState are priced locally and
@@ -1804,6 +1894,15 @@ where
     Ok(block_number)
 }
 
+/// True when `err` is an ownership mismatch (`OwnershipMismatch` — the
+/// on-chain contract owner moved to a key the bot does not sign with).
+/// Scan loops treat this as fatal: continuing would only reject every
+/// candidate (`onlyOwner` simulations) until the operator reruns the bot
+/// with the new owner's key.
+fn is_ownership_mismatch(err: &eyre::Report) -> bool {
+    err.downcast_ref::<OwnershipMismatch>().is_some()
+}
+
 /// Run one scan iteration (convenience wrapper for polling mode).
 async fn run_once<B>(
     cfg: &Config,
@@ -1822,7 +1921,9 @@ where
 
 #[cfg(test)]
 mod pool_event_tests {
-    use super::{is_watched_log, pool_event_signatures, v4_swap_hash, VenueCache};
+    use super::{
+        is_ownership_mismatch, is_watched_log, pool_event_signatures, v4_swap_hash, VenueCache,
+    };
     use alloy::primitives::{b256, Address, Bytes, B256};
     use morpho_arbitrage_bot::state::StateStore;
 
@@ -1872,6 +1973,8 @@ mod pool_event_tests {
             state: StateStore::new(),
             pending: StateStore::new(),
             owner: Address::ZERO,
+            signer: Address::ZERO,
+            owner_checked_at: std::time::Instant::now(),
             flashblocks_available: false,
         }
     }
@@ -1903,6 +2006,19 @@ mod pool_event_tests {
         // Non-V4 topics (e.g. a V2 Sync on a watched pool address) count.
         let v2_sync = b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
         assert!(is_watched_log(&cache, &rpc_log(vec![v2_sync])));
+    }
+
+    #[test]
+    fn ownership_mismatch_detection_downcasts() {
+        use morpho_arbitrage_bot::executor::OwnershipMismatch;
+        let report = eyre::eyre!(OwnershipMismatch {
+            owner: Address::repeat_byte(0x11),
+            signer: Address::repeat_byte(0x22),
+        });
+        assert!(is_ownership_mismatch(&report));
+        assert!(format!("{report:#}").contains("PRIVATE_KEY"));
+        // Ordinary scan failures are NOT fatal.
+        assert!(!is_ownership_mismatch(&eyre::eyre!("rpc error: ctor")));
     }
 }
 
