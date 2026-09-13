@@ -302,6 +302,8 @@ contract FlashArbitrage {
     {
         IUniswapV4PoolManager manager = IUniswapV4PoolManager(leg.router);
         _v4LastOut = 0;
+        if (_v4Unlocker != address(0)) revert V4InputMismatch(msg.sender, leg.poolId);
+        _v4Unlocker = leg.router;
         // The callback reconstructs the PoolKey from `from`/`to`/leg; passing
         // the whole `leg` (instead of ten scalars) keeps the call frame under
         // the legacy stack limit.
@@ -311,6 +313,10 @@ contract FlashArbitrage {
         // unwinds the whole outer transaction.
         amountOut = _v4LastOut;
         _v4LastOut = 0;
+        // Clear the unlock window. If `unlock` reverted, the whole
+        // transaction (including this write) is unwound, so the flag can
+        // never get stuck set from a failed run.
+        _v4Unlocker = address(0);
         if (amountOut < leg.minOut) revert V4MinOutput(amountOut, leg.minOut);
     }
 
@@ -320,17 +326,26 @@ contract FlashArbitrage {
     /// by `_swapV4` before unlocking again.
     uint256 private _v4LastOut;
 
+    /// Authorization window for [`unlockCallback`]: non-zero only between the
+    /// `manager.unlock(...)` call in [`_swapV4`] and its re-lock. Guards the
+    /// external callback from direct calls, see [`unlockCallback`].
+    address private _v4Unlocker;
+
     /// The PoolManager unlock callback; executes the V4 swap plus settlement.
-    /// Guarded: only the PoolManager may call this (msg.sender check) and the
-    /// data must be well-formed (otherwise a griefing caller could force
-    /// arbitrary `take` recipients via a crafted call, since the manager calls
-    /// ANY address's unlockCallback after unlock()). The swap/accounting is
-    /// otherwise self-contained inside the callback.
+    /// Only reachable from inside the [`_swapV4`] `manager.unlock(...)` call:
+    /// `_v4Unlocker` is zero outside that window, and inside it is set to the
+    /// pool manager we just unlocked — the address the caller *must* be. The
+    /// router in `leg` is caller-supplied data and is therefore NOT trusted
+    /// for authorization; it is only used to locate the manager to enter.
+    /// This blocks two entry paths: an attacker calling `unlockCallback`
+    /// directly, and a rogue `unlock` implementation calling back into this
+    /// contract (both would send real `transfer(... manager, actualIn)`).
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         (SwapLeg memory leg, address from, address to, uint256 amountIn) =
             abi.decode(data, (SwapLeg, address, address, uint256));
-        // `leg.router` is the PoolManager; only it may enter the callback.
-        if (msg.sender != leg.router) revert V4InputMismatch(msg.sender, leg.poolId);
+        if (msg.sender != _v4Unlocker || _v4Unlocker == address(0)) {
+            revert V4InputMismatch(msg.sender, leg.poolId);
+        }
         if (from == to) revert V4InputMismatch(from, leg.poolId);
         _v4LastOut = _v4Settle(leg, from, to, amountIn);
         return "";
