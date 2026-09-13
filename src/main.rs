@@ -56,6 +56,11 @@ struct VenueCache {
     /// addressed by poolId, not a pair address, so no `v4_pairs` exists:
     /// every V4 venue is priced through the V4 Quoter on every scan.
     v4_idx: Vec<usize>,
+    /// Configured V4 pool IDs, aligned with `v4_idx`. The PoolManager emits
+    /// ONE Swap event per pool but always FROM the manager's address, so a
+    /// V4 swap can only be tied to a watched pool through its indexed pool
+    /// ID (topic1), never the log address.
+    v4_pool_ids: Vec<B256>,
     /// All resolved pool addresses (V2 + V3; for V4, the PoolManager), for
     /// the event filter.
     pool_addrs: Vec<Address>,
@@ -86,6 +91,7 @@ impl VenueCache {
         let mut v3_idx = Vec::new();
         let mut v3_pairs = Vec::new();
         let mut v4_idx = Vec::new();
+        let mut v4_pool_ids = Vec::new();
         let mut pool_addrs = Vec::with_capacity(cfg.venues.len());
         for (idx, venue) in cfg.venues.iter().enumerate() {
             // Auto-resolve the pool from the venue's factory when the
@@ -128,6 +134,7 @@ impl VenueCache {
                 // address, so the venue is exactly the (sorted) loan/quote
                 // pair — no on-chain reads needed.
                 v4_idx.push(idx);
+                v4_pool_ids.push(B256::from(venue.pool_id));
                 let (token0, token1) = if cfg.loan_token < cfg.quote_token {
                     (cfg.loan_token, cfg.quote_token)
                 } else {
@@ -148,10 +155,10 @@ impl VenueCache {
             }
             pair_tokens.push(tokens);
             // For V4 the "pool" is not a contract — it is the singleton
-            // PoolManager, whose address is the venue's router. V4 events
-            // (and any V2/CL-shaped log from a manager with such a pool —
-            // none in practice) live there; V4 Swap events use a different
-            // signature, so apply_pool_log ignores them.
+            // PoolManager, whose address is the venue's router. V4 Swap
+            // events are emitted from the manager (covers ALL V4 pools of
+            // the factory), so recognition of a V4 event happens through its
+            // indexed pool ID (v4_pool_ids), never the log address.
             pool_addrs.push(if venue.kind == VenueKind::UniswapV4 {
                 venue.router
             } else {
@@ -200,6 +207,7 @@ impl VenueCache {
             v3_idx,
             v3_pairs,
             v4_idx,
+            v4_pool_ids,
             pool_addrs,
             state,
             owner,
@@ -400,6 +408,8 @@ fn build_broadcaster(cfg: &Config) -> Result<impl alloy::providers::Provider + C
 /// from Uniswap V2 and therefore hash to different topic0 values.
 /// Aerodrome Slipstream (CL) is a UniV3 fork with identical event
 /// signatures, so its Swap/Mint/Burn topic0s are already covered here.
+/// The Uniswap V4 PoolManager Swap event is included too: V4 pools emit
+/// swaps from the manager's address with the pool's ID indexed in topic1.
 fn pool_event_signatures() -> Vec<alloy::primitives::B256> {
     [
         // Uniswap V2 (also Sushiswap/Pancakeswap V2).
@@ -416,6 +426,10 @@ fn pool_event_signatures() -> Vec<alloy::primitives::B256> {
         "Swap(address,address,int256,int256,uint160,uint128,int24)",
         "Mint(address,address,int24,int24,uint128,uint256,uint256)",
         "Burn(address,int24,int24,uint128,uint256,uint256)",
+        // Uniswap V4 PoolManager: Swap(PoolId indexed id, address indexed
+        // sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96,
+        // uint128 liquidity, int24 tick, uint24 fee).
+        "Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)",
     ]
     .into_iter()
     .map(alloy::primitives::keccak256)
@@ -635,6 +649,11 @@ where
         // skip any pending copies of logs that arrived sealed in the same
         // batch.
         let mut pending_dirty = false;
+        // Unrelated V4 manager Swap events (a pool we don't watch) and any
+        // non-matching address hit the subscription because the filter is
+        // address/topic based; drop them before accounting for the batch.
+        block_logs.retain(|l| is_watched_log(cache, l));
+        pend_logs.retain(|l| is_watched_log(cache, l));
         if !block_logs.is_empty() {
             cache.pending = StateStore::new();
             let sealed_ids: std::collections::HashSet<(B256, Option<u64>)> = block_logs
@@ -670,6 +689,8 @@ where
         }
         // Pending overlay: clone the pool's sealed state on first touch,
         // then fold preconfirmed events on top. Sealed scans never see it.
+        // V4 Swap logs mutate no state store (their venue is priced via the
+        // V4 Quoter on every scan), so they mark the batch dirty explicitly.
         for l in &pend_logs {
             if l.removed {
                 continue;
@@ -680,11 +701,15 @@ where
                     cache.pending.insert(pool, base.clone());
                 }
             }
-            pending_dirty |= apply_pool_log(&mut cache.pending, l);
+            pending_dirty |= apply_pool_log(&mut cache.pending, l)
+                || l.topics().first() == Some(&v4_swap_hash());
         }
         let trigger = match (reason, trig_block) {
             ("sweep", b) => Some((reason, b)),
-            ("pool event", b) if b > last_scanned => Some((reason, b)),
+            // Only fire when a watched pool's log actually survived the
+            // filter: an unrelated V4 manager Swap (a pool we don't watch)
+            // strips block_logs to empty and must not spend a scan.
+            ("pool event", b) if !block_logs.is_empty() && b > last_scanned => Some((reason, b)),
             ("flashblock event", b) if pending_dirty => Some((reason, b)),
             _ => None,
         };
@@ -821,6 +846,31 @@ fn cl_burn_hash() -> alloy::primitives::B256 {
     alloy::primitives::keccak256("Burn(address,int24,int24,uint128,uint256,uint256)")
 }
 
+/// Uniswap V4 PoolManager Swap topic0
+/// `Swap(PoolId indexed id, address indexed sender, int128 amount0,
+/// int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick,
+/// uint24 fee)`. The pool's ID is the SECOND topic (indexed `id`); V4 pools
+/// do not have their own address, so this is the only way to associate a
+/// manager Swap event with a watched pool.
+fn v4_swap_hash() -> alloy::primitives::B256 {
+    alloy::primitives::keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
+}
+
+/// True when a delivered log should be allowed to fire a scan. Non-V4 logs
+/// in the filter are tied to one specific watched pool address and always
+/// count; a V4 PoolManager Swap is emitted from the shared manager address
+/// for EVERY pool of the factory, so it only counts when its indexed pool ID
+/// (topic1) matches a configured V4 venue.
+fn is_watched_log(cache: &VenueCache, log: &alloy::rpc::types::eth::Log) -> bool {
+    if log.topics().first() == Some(&v4_swap_hash()) {
+        log.topics()
+            .get(1)
+            .is_some_and(|id| cache.v4_pool_ids.contains(&B256::from(*id)))
+    } else {
+        true
+    }
+}
+
 /// Fold one known pool log into the local state store. Only
 /// Sync/CL-Swap/Mint/Burn events can change the price; anything else is
 /// skipped. Returns `true` only when the underlying pool state was
@@ -828,7 +878,9 @@ fn cl_burn_hash() -> alloy::primitives::B256 {
 /// payloads, or pools absent from the store. The event loop uses this to
 /// avoid re-scanning on preconfirmations that left the pending overlay
 /// unchanged. Malformed payloads are ignored—one bad log never crashes
-/// the loop.
+/// the loop. V4 Swap logs mutate no local state (the venue is priced
+/// through the V4 Quoter on every scan), so they always return `false`
+/// here; the event loop recognizes them separately.
 fn apply_pool_log(store: &mut StateStore, log: &alloy::rpc::types::eth::Log) -> bool {
     let pool = log.address();
     let topics = log.topics();
@@ -1230,7 +1282,10 @@ where
             .collect();
         next_v4 += n_sizes;
         if leg1.iter().all(|q| q.0.is_none()) {
-            warn!(venue = idx, "V4 venue returned no usable quotes; skipping venue");
+            warn!(
+                venue = idx,
+                "V4 venue returned no usable quotes; skipping venue"
+            );
             continue;
         }
         legs.push(Leg1 {
@@ -1767,23 +1822,87 @@ where
 
 #[cfg(test)]
 mod pool_event_tests {
-    use super::pool_event_signatures;
-    use alloy::primitives::{b256, B256};
+    use super::{is_watched_log, pool_event_signatures, v4_swap_hash, VenueCache};
+    use alloy::primitives::{b256, Address, Bytes, B256};
+    use morpho_arbitrage_bot::state::StateStore;
 
     #[test]
     fn signatures_match_canonical_topic0() {
         let sigs = pool_event_signatures();
-        // Well-known topic0 values, cross-checked against Uniswap V2/V3
+        // Well-known topic0 values, cross-checked against Uniswap V2/V3/V4
         // deployments; a typo in the signature strings would silently
         // disable event triggers.
         let v2_sync = b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
         let v3_swap = b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+        // keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
+        let v4_swap = b256!("40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f");
         assert!(sigs.contains(&v2_sync));
         assert!(sigs.contains(&v3_swap));
-        assert_eq!(sigs.len(), 10);
+        assert!(sigs.contains(&v4_swap));
+        // The dedicated hash helper must agree with the signature list.
+        assert_eq!(v4_swap_hash(), v4_swap);
+        assert_eq!(sigs.len(), 11);
         // All distinct: a duplicate would only bloat the filter.
         let unique: std::collections::HashSet<B256> = sigs.iter().copied().collect();
         assert_eq!(unique.len(), sigs.len());
+    }
+
+    #[test]
+    fn v4_swap_hash_is_pool_manager_swap_topic0() {
+        // Cross-checked against Uniswap v4-core's IPoolManager.Swap:
+        // Swap(PoolId indexed id, address indexed sender, int128 amount0,
+        // int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24
+        // tick, uint24 fee).
+        let expected = b256!("40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f");
+        assert_eq!(v4_swap_hash(), expected);
+    }
+
+    /// Minimal VenueCache shaped exactly like `VenueCache::build` leaves the
+    /// V4 fields: one watched V4 venue, `pool_addrs` carrying the PoolManager.
+    fn v4_cache(watched_pool: B256) -> VenueCache {
+        VenueCache {
+            pair_tokens: Vec::new(),
+            v2_idx: Vec::new(),
+            v2_pairs: Vec::new(),
+            v3_idx: Vec::new(),
+            v3_pairs: Vec::new(),
+            v4_idx: vec![0],
+            v4_pool_ids: vec![watched_pool],
+            pool_addrs: vec![Address::ZERO],
+            state: StateStore::new(),
+            pending: StateStore::new(),
+            owner: Address::ZERO,
+            flashblocks_available: false,
+        }
+    }
+
+    fn rpc_log(topics: Vec<B256>) -> alloy::rpc::types::eth::Log {
+        // `alloy::primitives::Log` validates the topic-list length (<= 4).
+        alloy::rpc::types::eth::Log {
+            inner: alloy::primitives::Log::new(Address::ZERO, topics, Bytes::new())
+                .expect("topic list within bounds"),
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        }
+    }
+
+    #[test]
+    fn v4_swap_filter_matches_only_configured_pool_ids() {
+        let pid_a = B256::from([0xaa; 32]);
+        let pid_b = B256::from([0xbb; 32]);
+        let cache = v4_cache(pid_a);
+        // Matches the configured venue's pool id.
+        assert!(is_watched_log(&cache, &rpc_log(vec![v4_swap_hash(), pid_a])));
+        // A PoolManager Swap for a pool we do NOT watch must NOT fire a scan.
+        assert!(!is_watched_log(&cache, &rpc_log(vec![v4_swap_hash(), pid_b])));
+        // Non-V4 topics (e.g. a V2 Sync on a watched pool address) count.
+        let v2_sync = b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+        assert!(is_watched_log(&cache, &rpc_log(vec![v2_sync])));
     }
 }
 

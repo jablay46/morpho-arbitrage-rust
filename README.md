@@ -330,6 +330,16 @@ quoter = "0x0000..."             # override QuoterV2 per-venue (V3, opsional)
   pair (loan, quote) yang di-sort. Arah swap (`zero_for_one`) diturunkan per
   leg di executor, bukan dari konfigurasi. Harga diambil via V4 Quoter
   (`QUOTER_V4`).
+- `pool_id` divalidasi saat startup terhadap PoolKey turunan dari
+  `(loan_token, quote_token, fee_tier, tick_spacing, hooks)`; konfigurasi yang
+  tidak cocok ditolak sebelum scan, bukan gagal/revert di dalam kontrak.
+- Scan event-driven (poll/kontrak) juga mengenali Swap Uniswap V4: PoolManager
+  memancarkan satu event `Swap(bytes32 indexed poolId, address indexed sender,
+  int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity,
+  int24 tick, uint24 fee)` dari alamat manager (URL `router`) untuk SEMUA pool
+  factory, sehingga event disaring lewat `poolId` terindeks (topic1) milik
+  venue V4 yang dikonfigurasi, bukan alamat log. Tanpa ini, perubahan harga V4
+  tidak pernah memicu scan event-driven.
 - `quoter` = override QuoterV2 per-venue (V3, opsional). Kosongkan untuk
   memakai `QUOTER_V2` global. Wajib diisi untuk V3 venue non-Uniswap
   (mis. PancakeSwap V3) karena tiap factory punya quoter sendiri.
