@@ -4,7 +4,7 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Whether the RPC endpoint exposes Flashblock preconfirmed state via the
 /// `pending` block tag. This is a heuristic: a node that streams Flashblocks
@@ -168,6 +168,35 @@ sol! {
                 uint32 initializedTicksCrossed,
                 uint256 gasEstimate
             );
+    }
+
+    // Uniswap V4 Quoter (0x0d5e0f97...2048d on Base) simulates a single
+    // exact-input swap through the PoolManager via the contract's `unlock`
+    // locker: the swap reverts with a QuoteSwap payload that the quoter
+    // parses and returns as a plain `(amountOut, gasEstimate)` pair. Not
+    // `view`, so it always rides eth_call (Multicall3 / provider.call). The
+    // pool is addressed by its full PoolKey (currencies sorted by address,
+    // fee, tickSpacing, hooks), not by a factory getPool lookup.
+    struct V4PoolKey {
+        address currency0;
+        address currency1;
+        uint24 fee;
+        int24 tickSpacing;
+        address hooks;
+    }
+
+    struct V4QuoteExactSingleParams {
+        V4PoolKey poolKey;
+        bool zeroForOne;
+        uint128 exactAmount;
+        bytes hookData;
+    }
+
+    #[sol(rpc)]
+    interface IV4Quoter {
+        function quoteExactInputSingle(V4QuoteExactSingleParams memory params)
+            external
+            returns (uint256 amountOut, uint256 gasEstimate);
     }
 
     #[sol(rpc)]
@@ -492,24 +521,39 @@ pub async fn fetch_reserves<P: Provider>(
     })
 }
 
-/// One QuoterV2 `quoteExactInputSingle` request. The fee tier must be the
-/// venue's actual pool fee — quoting with a different tier prices a
-/// different pool. For Slipstream venues the field carries tickSpacing and
-/// the call goes through `IQuoterSlipstream`.
+/// One `quoteExactInputSingle` request. The fee tier must be the venue's
+/// actual pool fee — quoting with a different tier prices a different pool.
+/// For Slipstream venues the field carries tickSpacing and the call goes
+/// through `IQuoterSlipstream`; for V4 venues it carries the PoolKey fee and
+/// the call goes through `IV4Quoter` with the V4 fields below.
 #[derive(Debug, Clone, Copy)]
 pub struct QuoteRequest {
     pub token_in: Address,
     pub token_out: Address,
     pub fee_tier: u32,
     pub amount_in: U256,
-    /// QuoterV2 contract to call; per-request so a single batch can price
-    /// venues whose V3 quotes live on different quoter deployments (e.g.
+    /// Quoter contract to call; per-request so a single batch can price
+    /// venues whose quotes live on different quoter deployments (e.g.
     /// Uniswap vs PancakeSwap), which have distinct factories and therefore
     /// distinct quoter contracts.
     pub quoter: Address,
     /// When true, encode with `IQuoterSlipstream` (int24 tickSpacing)
     /// instead of `IQuoterV2` (uint24 fee). Set per venue kind.
     pub slipstream: bool,
+    /// When true, encode with `IV4Quoter.quoteExactInputSingle` (PoolKey +
+    /// direction + exact amount). The PoolKey is built from the fields below
+    /// plus `fee_tier`, with currencies sorted by address; `zeroForOne` is
+    /// derived from `token_in` vs `token_out` (the smaller sort first).
+    pub v4: bool,
+    /// Pool ID of the V4 pool = keccak256(abi.encode(PoolKey)), matching the
+    /// venue's `pool_id`. The quoter derives the pool from the PoolKey so
+    /// this is informational only (used to log the venue being priced), but
+    /// it is kept in the request so a V4 request is self-describing.
+    pub pool_id: [u8; 32],
+    /// V4 PoolKey tickSpacing (int24 on-chain).
+    pub tick_spacing: i32,
+    /// V4 PoolKey hooks address.
+    pub hooks: Address,
 }
 
 /// Per-scan bundle of everything the bot needs from the chain, fetched in
@@ -524,6 +568,11 @@ pub struct ScanSnapshot {
     /// `fetch_scan_snapshot`; None when that quote reverted (e.g. the trade
     /// exceeds the pool's liquidity).
     pub v3_quotes: Vec<Option<U256>>,
+    /// V4 Quoter amountOut per entry of the `v4_quotes` slice passed to
+    /// `fetch_scan_snapshot`; None when that quote reverted. Kept separate
+    /// from `v3_quotes` so V4 venues (different quoter ABI) assemble legs
+    /// from their own section of the same batch.
+    pub v4_quotes: Vec<Option<U256>>,
     pub gas_price: U256,
     /// The block the snapshot was pinned to, when it was read from a
     /// numbered block (None for a pending-tag pin). Local pool-state
@@ -532,36 +581,85 @@ pub struct ScanSnapshot {
     pub pinned_block: Option<u64>,
 }
 
+/// Checked conversion of a U256 to the V4 Quoter's `exactAmount` uint128.
+/// Returns `None` instead of silently truncating, so a quote request whose
+/// amount cannot be represented by the quoter is skipped rather than
+/// silently pricing a different (smaller) trade than the one executed.
+fn n128(v: U256) -> Option<u128> {
+    u128::try_from(v).ok()
+}
+
 /// Encode one quote request as an eth_call transaction against its quoter.
-/// Calldata for a QuoterV2/Slipstream `quoteExactInputSingle` eth_call.
-fn quote_calldata(req: &QuoteRequest) -> Bytes {
-    if req.slipstream {
-        IQuoterSlipstream::quoteExactInputSingleCall {
-            params: QuoteExactInputSingleClParams {
-                tokenIn: req.token_in,
-                tokenOut: req.token_out,
-                amountIn: req.amount_in,
-                // Config validation already bounds slipstream fee_tier to
-                // {1, 50, 100, 200, 2000}, well inside i24.
-                tickSpacing: alloy::primitives::aliases::I24::try_from(req.fee_tier)
-                    .expect("slipstream tickSpacing validated at config"),
-                sqrtPriceLimitX96: Default::default(),
-            },
-        }
-        .abi_encode()
-        .into()
+/// Calldata for a QuoterV2 / Slipstream / V4 `quoteExactInputSingle` eth_call.
+/// A V4 request whose amount exceeds u128::MAX (and therefore cannot be
+/// priced by the quoter) returns `None`; callers skip it as they would a
+/// quote that reverts.
+fn quote_calldata(req: &QuoteRequest) -> Option<Bytes> {
+    if req.v4 {
+        // The contract reconstructs the PoolKey from each leg's `from`/`to`
+        // as (min, max), so the quoter must receive the same ordering. The
+        // leg's input token sells currency0 exactly when it sorts below the
+        // output token.
+        let (c0, c1) = if req.token_in < req.token_out {
+            (req.token_in, req.token_out)
+        } else {
+            (req.token_out, req.token_in)
+        };
+        let exact_amount = n128(req.amount_in)?;
+        Some(
+            IV4Quoter::quoteExactInputSingleCall {
+                params: V4QuoteExactSingleParams {
+                    poolKey: V4PoolKey {
+                        currency0: c0,
+                        currency1: c1,
+                        fee: alloy::primitives::Uint::<24, 1>::from(req.fee_tier),
+                        tickSpacing: alloy::primitives::aliases::I24::try_from(i64::from(
+                            req.tick_spacing,
+                        ))
+                        .expect("v4 tick_spacing validated at config"),
+                        hooks: req.hooks,
+                    },
+                    zeroForOne: req.token_in < req.token_out,
+                    exactAmount: exact_amount,
+                    hookData: Bytes::new(),
+                },
+            }
+            .abi_encode()
+            .into(),
+        )
+    } else if req.slipstream {
+        // u256 amountIn: no range restriction.
+        Some(
+            IQuoterSlipstream::quoteExactInputSingleCall {
+                params: QuoteExactInputSingleClParams {
+                    tokenIn: req.token_in,
+                    tokenOut: req.token_out,
+                    amountIn: req.amount_in,
+                    // Config validation already bounds slipstream fee_tier to
+                    // {1, 50, 100, 200, 2000}, well inside i24.
+                    tickSpacing: alloy::primitives::aliases::I24::try_from(req.fee_tier)
+                        .expect("slipstream tickSpacing validated at config"),
+                    sqrtPriceLimitX96: Default::default(),
+                },
+            }
+            .abi_encode()
+            .into(),
+        )
     } else {
-        IQuoterV2::quoteExactInputSingleCall {
-            params: QuoteExactInputSingleParams {
-                tokenIn: req.token_in,
-                tokenOut: req.token_out,
-                amountIn: req.amount_in,
-                fee: alloy::primitives::Uint::<24, 1>::from(req.fee_tier),
-                sqrtPriceLimitX96: Default::default(),
-            },
-        }
-        .abi_encode()
-        .into()
+        // u256 amountIn: no range restriction.
+        Some(
+            IQuoterV2::quoteExactInputSingleCall {
+                params: QuoteExactInputSingleParams {
+                    tokenIn: req.token_in,
+                    tokenOut: req.token_out,
+                    amountIn: req.amount_in,
+                    fee: alloy::primitives::Uint::<24, 1>::from(req.fee_tier),
+                    sqrtPriceLimitX96: Default::default(),
+                },
+            }
+            .abi_encode()
+            .into(),
+        )
     }
 }
 
@@ -584,13 +682,19 @@ fn decode_quote(raw: &Bytes) -> Option<U256> {
 pub async fn fetch_scan_snapshot<P: Provider>(
     provider: &P,
     v2_venues: &[Address], // pair addresses
-    quotes: &[QuoteRequest],
+    quotes: &[QuoteRequest], // V3/Slipstream leg-1 quotes
+    v4_quotes: &[QuoteRequest], // V4 leg-1 quotes (separate quoter ABI)
     block: alloy::eips::BlockId,
 ) -> Result<ScanSnapshot> {
     // Reserves + leg quotes ride one Multicall3 aggregate3 (a single RPC
     // request regardless of venue/size count); eth_gasPrice is not an
     // eth_call and goes alongside as its own request.
-    let mut calls: Vec<(Address, Bytes)> = Vec::with_capacity(v2_venues.len() + quotes.len());
+    let v4_calls: Vec<Option<(Address, Bytes)>> = v4_quotes
+        .iter()
+        .map(|req| quote_calldata(req).map(|cd| (req.quoter, cd)))
+        .collect();
+    let mut calls: Vec<(Address, Bytes)> =
+        Vec::with_capacity(v2_venues.len() + quotes.len() + v4_quotes.len());
     for pair in v2_venues {
         calls.push((
             *pair,
@@ -598,7 +702,15 @@ pub async fn fetch_scan_snapshot<P: Provider>(
         ));
     }
     for req in quotes {
-        calls.push((req.quoter, quote_calldata(req)));
+        calls.push((
+            req.quoter,
+            quote_calldata(req).expect("v3/slipstream quote encodable"),
+        ));
+    }
+    for opt in &v4_calls {
+        if let Some((addr, cd)) = opt {
+            calls.push((*addr, cd.clone()));
+        }
     }
     let (results, gas_price) = futures::join!(
         run_eth_calls(provider, &calls, block),
@@ -611,6 +723,7 @@ pub async fn fetch_scan_snapshot<P: Provider>(
     // pool) yields None for that venue instead of failing the whole scan.
     let mut v2_raw = Vec::with_capacity(v2_venues.len());
     let mut v3_quotes = Vec::with_capacity(quotes.len());
+    let mut v4_out = Vec::with_capacity(v4_quotes.len());
     let mut outcomes = results.into_iter();
     for _ in v2_venues {
         let entry = match outcomes.next() {
@@ -650,33 +763,91 @@ pub async fn fetch_scan_snapshot<P: Provider>(
             None => None,
         });
     }
+    for (req, sent) in v4_quotes.iter().zip(v4_calls.iter()) {
+        v4_out.push(match sent {
+            // Out-of-range integer amount: the quoter cannot price it; skip
+            // the venue/size just as if the eth_call had reverted.
+            None => {
+                warn!(
+                    token_in = %req.token_in,
+                    token_out = %req.token_out,
+                    fee_tier = req.fee_tier,
+                    tick_spacing = req.tick_spacing,
+                    amount_in = %req.amount_in,
+                    "V4 quote amount exceeds uint128; skipping request"
+                );
+                None
+            }
+            Some(_) => match outcomes.next() {
+                Some(Ok(raw)) => match decode_quote(&raw) {
+                    Some(q) => Some(q),
+                    None => {
+                        debug!(
+                            token_in = %req.token_in,
+                            token_out = %req.token_out,
+                            fee_tier = req.fee_tier,
+                            tick_spacing = req.tick_spacing,
+                            amount_in = %req.amount_in,
+                            "V4 quote returned undecodable result"
+                        );
+                        None
+                    }
+                },
+                Some(Err(e)) => {
+                    debug!(
+                        token_in = %req.token_in,
+                        token_out = %req.token_out,
+                        fee_tier = req.fee_tier,
+                        tick_spacing = req.tick_spacing,
+                        amount_in = %req.amount_in,
+                        error = %alloy::hex::encode(&e),
+                        "V4 quote reverted"
+                    );
+                    None
+                }
+                None => None,
+            },
+        });
+    }
 
     Ok(ScanSnapshot {
         v2_raw,
         v3_quotes,
+        v4_quotes: v4_out,
         gas_price,
         pinned_block: block.as_u64(),
     })
 }
 
-/// Run a standalone batch of QuoterV2 quotes (used for leg 2, whose inputs
-/// are only known after leg 1 has been priced). None per reverted quote.
-/// Pinned to the same block as the phase-1 snapshot.
+/// Run a standalone batch of quotes (used for leg 2, whose inputs are only
+/// known after leg 1 has been priced). None per reverted quote AND per
+/// out-of-range V4 request (amount > u128::MAX cannot be priced by the V4
+/// quoter, so the request is skipped rather than silently truncated). The
+/// returned slice is aligned with `requests` 1:1. Pinned to the same block
+/// as the phase-1 snapshot.
 pub async fn fetch_quotes<P: Provider>(
     provider: &P,
     requests: &[QuoteRequest],
     block: alloy::eips::BlockId,
 ) -> Result<Vec<Option<U256>>> {
-    let calls: Vec<(Address, Bytes)> = requests
+    let calls: Vec<Option<(Address, Bytes)>> = requests
         .iter()
-        .map(|r| (r.quoter, quote_calldata(r)))
+        .map(|r| quote_calldata(r).map(|cd| (r.quoter, cd)))
         .collect();
-    let results = run_eth_calls(provider, &calls, block).await?;
+    let rpc_requests: Vec<(Address, Bytes)> = calls.iter().flatten().cloned().collect();
+    let results = run_eth_calls(provider, &rpc_requests, block).await?;
+    let mut res_iter = results.into_iter();
     let mut out = Vec::with_capacity(requests.len());
-    for res in results {
-        out.push(match res {
-            Ok(raw) => decode_quote(&raw),
-            Err(_) => None,
+    for sent in calls {
+        out.push(match sent {
+            // Out-of-range phase-2 input (leg-1 output above u128::MAX):
+            // skip it exactly like a reverted quote.
+            None => None,
+            Some(_) => match res_iter.next() {
+                Some(Ok(raw)) => decode_quote(&raw),
+                Some(Err(_)) => None,
+                None => None,
+            },
         });
     }
     Ok(out)
@@ -699,4 +870,76 @@ pub async fn fetch_cl_pair_tokens<P: Provider>(provider: &P, pool: Address) -> R
     let token0 = pool_contract.token0().call().await?;
     let token1 = pool_contract.token1().call().await?;
     Ok(PairTokens { token0, token1 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{n128, quote_calldata};
+    use alloy::primitives::{Address, U256};
+
+    fn v4_request(amount_in: U256) -> super::QuoteRequest {
+        super::QuoteRequest {
+            token_in: Address::ZERO,
+            token_out: Address::from([1u8; 20]),
+            fee_tier: 3000,
+            amount_in,
+            quoter: Address::ZERO,
+            slipstream: false,
+            v4: true,
+            pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+        }
+    }
+
+    #[test]
+    fn n128_round_trips_within_u128_range() {
+        assert_eq!(n128(U256::from(0u64)), Some(0));
+        assert_eq!(n128(U256::from(u128::MAX)), Some(u128::MAX));
+        assert_eq!(
+            n128(U256::from(1_000_000_000_000_000_000u128)),
+            Some(1_000_000_000_000_000_000)
+        );
+    }
+
+    #[test]
+    fn n128_rejects_out_of_range_instead_of_truncating() {
+        // u128::MAX + 1: the old truncation would silently produce 0 for
+        // this value, pricing a zero-value trade while executing the full
+        // amount.
+        let overflow = U256::from(u128::MAX) + U256::from(1u64);
+        assert_eq!(n128(overflow), None);
+        // A value 2^128 higher must also be rejected, not truncated to the
+        // same low bits.
+        let also = overflow + (U256::from(1u64) << 128);
+        assert_eq!(n128(also), None);
+    }
+
+    #[test]
+    fn quote_calldata_skips_out_of_range_v4_request() {
+        assert!(quote_calldata(&v4_request(U256::from(1000u64))).is_some());
+        // No uint128-representable amount: the request is skipped entirely.
+        assert_eq!(
+            quote_calldata(&v4_request(U256::from(u128::MAX) + U256::from(1u64))),
+            None
+        );
+    }
+
+    #[test]
+    fn quote_calldata_v4_encodes_pool_key_abi() {
+        let cd = quote_calldata(&v4_request(U256::from(1000u64))).expect("encodable");
+        // quoteExactInputSingle(V4QuoteExactSingleParams): selector (4) +
+        // head offset word to the params tuple (32) + tuple body — poolKey
+        // 5 words, zeroForOne, exactAmount, hookData offset (8 words) — +
+        // the empty hookData length word (32). The params tuple carries a
+        // dynamic `bytes`, so the body is pushed behind one offset word.
+        assert_eq!(cd.len(), 4 + 32 * 10);
+        // The 4-byte selector for the V4 quoter call must not be empty.
+        assert_ne!(&cd[..4], &[0u8; 4][..]);
+        // exactAmount sits 7 words past the selector: offset word (0),
+        // poolKey (1-5), zeroForOne (6), exactAmount (7).
+        let amount_word = &cd[4 + 32 * 7..4 + 32 * 8];
+        let decoded = U256::from_be_slice(amount_word);
+        assert_eq!(decoded, U256::from(1000u64));
+    }
 }

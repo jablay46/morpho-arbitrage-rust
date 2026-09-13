@@ -78,6 +78,10 @@ async fn local_cl_quote_matches_slipstream_quoter() {
             amount_in,
             quoter: Address::from_str(SLIPSTREAM_QUOTER).unwrap(),
             slipstream: true,
+            v4: false,
+            pool_id: [0u8; 32],
+            tick_spacing: 0,
+            hooks: Address::ZERO,
         }],
         alloy::eips::BlockId::latest(),
     )

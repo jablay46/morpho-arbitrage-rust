@@ -1,5 +1,6 @@
 use crate::arbitrage::Opportunity;
 use crate::config::{Config, Venue};
+use alloy::primitives::aliases::I24;
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::TransactionRequest;
@@ -16,6 +17,9 @@ sol! {
         uint256 minOut;
         uint24 feeTier;
         bytes32 poolId;
+        int24 tickSpacing;
+        address hooks;
+        bool zeroForOne;
     }
 
     struct ArbParams {
@@ -42,7 +46,20 @@ pub async fn fetch_owner<P: Provider>(provider: &P, contract: Address) -> Result
     Ok(arb.owner().call().await?)
 }
 
-fn build_leg(venue: &Venue, min_out: U256) -> SwapLeg {
+/// Build one swap leg. For V4 venues the swap direction is NOT a per-venue
+/// constant: the same pool sells the loan token as leg A and the quote token
+/// as leg B, and the contract's reconstructed PoolKey orders currencies by
+/// address (`currency0 = min(from, to)`), so a leg sells currency0 exactly
+/// when its input token sorts below its output token. Derive `zeroForOne`
+/// from that per-leg ordering; the configured `venue.zero_for_one` is
+/// ignored for V4 (it is kept for DEX_VENUES/TOML parity and non-V4 kinds,
+/// where the contract never reads it).
+fn build_leg(venue: &Venue, min_out: U256, token_in: Address, token_out: Address) -> SwapLeg {
+    let zero_for_one = if venue.kind == crate::config::VenueKind::UniswapV4 {
+        token_in < token_out
+    } else {
+        venue.zero_for_one
+    };
     SwapLeg {
         router: venue.router,
         kind: venue.kind as u8,
@@ -51,6 +68,9 @@ fn build_leg(venue: &Venue, min_out: U256) -> SwapLeg {
         minOut: min_out,
         feeTier: alloy::primitives::Uint::<24, 1>::from(venue.fee_tier),
         poolId: alloy::primitives::FixedBytes(venue.pool_id),
+        tickSpacing: I24::try_from(i64::from(venue.tick_spacing)).expect("tick_spacing fits int24"),
+        hooks: venue.hooks,
+        zeroForOne: zero_for_one,
     }
 }
 
@@ -66,11 +86,13 @@ fn with_slippage(expected: U256, slippage_bps: u64) -> U256 {
 /// instead of letting a gross-positive-but-net-negative trade broadcast
 /// and revert later (wasted gas).
 pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbParams {
-    // Leg 2's input is leg 1's *actual* output, which may legitimately land
-    // as low as legA.minOut (= quote_out * (1-s)). Leg 2's output then scales
-    // down proportionally to ~amount_out * (1-s), so a single-slippage bound
-    // would revert on any further drift even though the trade still clears
-    // minProfit. Apply the tolerance twice on leg B so it compounds.
+    // Leg B's input is leg A's *actual* output, which may land as low as
+    // legA.minOut (= quote_out * (1 - s)). Leg B's output then scales down
+    // with it, so a single-slippage bound on `amount_out` would revert on an
+    // independent adverse move in the second pool even though every leg
+    // remains within the configured tolerance and the cycle still clears
+    // minProfit. Apply the tolerance twice on leg B so it compounds; the
+    // final `minProfit` check is the profitability backstop after both legs.
     let leg_a_min = with_slippage(opp.quote_out, cfg.slippage_bps);
     let leg_b_min = with_slippage(
         with_slippage(opp.amount_out, cfg.slippage_bps),
@@ -80,8 +102,18 @@ pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbPar
         token: cfg.loan_token,
         quote: cfg.quote_token,
         amount: opp.loan_amount,
-        legA: build_leg(&cfg.venues[opp.first], leg_a_min),
-        legB: build_leg(&cfg.venues[opp.second], leg_b_min),
+        legA: build_leg(
+            &cfg.venues[opp.first],
+            leg_a_min,
+            cfg.loan_token,
+            cfg.quote_token,
+        ),
+        legB: build_leg(
+            &cfg.venues[opp.second],
+            leg_b_min,
+            cfg.quote_token,
+            cfg.loan_token,
+        ),
         minProfit: min_profit,
     }
 }
@@ -304,28 +336,44 @@ mod tests {
     use alloy::sol_types::{SolCall, SolValue};
 
     // Canonical calldata for `execute(ArbParams)` produced by the Solidity
-    // ABI encoder (`cast calldata`), covering both SwapLeg kinds. Regression
-    // guard: the alloy `sol!` binding must decode and re-encode it identically.
+    // ABI encoder for the 10-field SwapLeg struct (V4 fields included),
+    // covering both leg kinds. Regression guard: the alloy `sol!` binding must
+    // decode and re-encode it identically, and each field must land in the
+    // position the contract decodes.
+    //
+    // Field layout per SwapLeg (10 words):
+    //   router, kind(+pad), factory, stable(+pad), minOut,
+    //   feeTier(+pad), poolId(32 bytes), tickSpacing(+pad), hooks, zeroForOne
     const CANONICAL_CALLDATA: &str = concat!(
-        "c0b54622",
-        "0000000000000000000000001111111111111111111111111111111111111111",
-        "0000000000000000000000002222222222222222222222222222222222222222",
-        "0000000000000000000000000000000000000000000000000de0b6b3a7640000",
-        "0000000000000000000000003333333333333333333333333333333333333333",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "0000000000000000000000000000000000000000000000000000000000000384",
-        "0000000000000000000000000000000000000000000000000000000000000bb8",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "0000000000000000000000004444444444444444444444444444444444444444",
-        "0000000000000000000000000000000000000000000000000000000000000001",
-        "0000000000000000000000005555555555555555555555555555555555555555",
-        "0000000000000000000000000000000000000000000000000000000000000001",
-        "00000000000000000000000000000000000000000000000000000000000003e9",
-        "0000000000000000000000000000000000000000000000000000000000000bb8",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "0000000000000000000000000000000000000000000000000000000000003039",
+        // execute((address,address,uint256,(address,uint8,address,bool,uint256,
+        //          uint24,bytes32,int24,address,bool),(...same...),uint256)),
+        // produced by the alloy Solidity ABI encoder (matches the on-chain
+        // selector and the 10-field SwapLeg layout).
+        "c7828930",
+        "0000000000000000000000001111111111111111111111111111111111111111", // token
+        "0000000000000000000000002222222222222222222222222222222222222222", // quote
+        "0000000000000000000000000000000000000000000000000de0b6b3a7640000", // amount
+        "0000000000000000000000003333333333333333333333333333333333333333", // legA.router
+        "0000000000000000000000000000000000000000000000000000000000000000", // legA.kind(v2)+pad
+        "0000000000000000000000000000000000000000000000000000000000000000", // legA.factory(zero)
+        "0000000000000000000000000000000000000000000000000000000000000000", // legA.stable(false)+pad
+        "0000000000000000000000000000000000000000000000000000000000000384", // legA.minOut(900)
+        "0000000000000000000000000000000000000000000000000000000000000bb8", // legA.feeTier(3000)+pad
+        "0000000000000000000000000000000000000000000000000000000000000000", // legA.poolId(zeros)
+        "000000000000000000000000000000000000000000000000000000000000003c", // legA.tickSpacing(60)
+        "0000000000000000000000000000000000000000000000000000000000000000", // legA.hooks(zero)
+        "0000000000000000000000000000000000000000000000000000000000000000", // legA.zeroForOne(false)+pad
+        "0000000000000000000000004444444444444444444444444444444444444444", // legB.router
+        "0000000000000000000000000000000000000000000000000000000000000001", // legB.kind(aero)+pad
+        "0000000000000000000000005555555555555555555555555555555555555555", // legB.factory
+        "0000000000000000000000000000000000000000000000000000000000000001", // legB.stable(true)+pad
+        "00000000000000000000000000000000000000000000000000000000000003e9", // legB.minOut(1001)
+        "00000000000000000000000000000000000000000000000000000000000001f4", // legB.feeTier(500)+pad
+        "1111111111111111111111111111111111111111111111111111111111111111", // legB.poolId(0x11..)
+        "0000000000000000000000000000000000000000000000000000000000000078", // legB.tickSpacing(120)
+        "0000000000000000000000006666666666666666666666666666666666666666", // legB.hooks
+        "0000000000000000000000000000000000000000000000000000000000000001", // legB.zeroForOne(true)+pad
+        "0000000000000000000000000000000000000000000000000000000000003039", // minProfit(12345)
     );
 
     #[test]
@@ -356,6 +404,12 @@ mod tests {
         assert_eq!(params.legA.factory, Address::ZERO);
         assert!(!params.legA.stable);
         assert_eq!(params.legA.minOut, U256::from(900u64));
+        // Leg A (v2): V4 fields must decode as their zero/defaults.
+        assert_eq!(params.legA.tickSpacing, I24::try_from(60_i64).unwrap());
+        assert_eq!(
+            params.legA.feeTier,
+            alloy::primitives::Uint::<24, 1>::from(3000u32)
+        );
         assert_eq!(
             params.legB.router,
             address!("4444444444444444444444444444444444444444")
@@ -367,6 +421,21 @@ mod tests {
         );
         assert!(params.legB.stable);
         assert_eq!(params.legB.minOut, U256::from(1_001u64));
+        // Leg B (aero): V4 fields carry explicit values in the canonical bytes.
+        assert_eq!(
+            params.legB.feeTier,
+            alloy::primitives::Uint::<24, 1>::from(500u32)
+        );
+        assert_eq!(
+            params.legB.poolId,
+            alloy::primitives::FixedBytes([0x11; 32])
+        );
+        assert_eq!(params.legB.tickSpacing, I24::try_from(120_i64).unwrap());
+        assert_eq!(
+            params.legB.hooks,
+            address!("6666666666666666666666666666666666666666")
+        );
+        assert!(params.legB.zeroForOne);
         assert_eq!(params.minProfit, U256::from(12_345u64));
 
         assert_eq!(
@@ -390,6 +459,9 @@ mod tests {
             stable: false,
             fee_tier: 3000,
             pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+            zero_for_one: false,
             quoter: Address::ZERO,
         };
         let cfg = Config {
@@ -414,6 +486,7 @@ mod tests {
             dry_run: true,
             quoter_v2: Address::ZERO,
             quoter_slipstream: Address::ZERO,
+            quoter_v4: Address::ZERO,
             use_pending_state: false,
             use_flashblock_sync: false,
             use_pending_logs: false,
@@ -435,12 +508,90 @@ mod tests {
         // Leg A tolerates one slippage interval: 20000 * 0.995 = 19900.
         assert_eq!(params.legA.minOut, U256::from(19_900u64));
         assert_eq!(params.minProfit, U256::ZERO);
-        // Leg B tolerates two compounded intervals (its own input may have
-        // drifted down by the leg-A tolerance): floor(10100 * 0.995^2).
+        // Leg B tolerates two compounded intervals (its own input may drift
+        // down by the leg-A tolerance AND the second pool may move against it
+        // independently): floor(10100 * 0.995^2) = 9998.
         let expected_b = U256::from(10_100u64) * U256::from(9_950u64) / U256::from(10_000u64)
             * U256::from(9_950u64)
             / U256::from(10_000u64);
         assert_eq!(params.legB.minOut, expected_b);
+        assert_eq!(expected_b, U256::from(9_998u64));
+    }
+
+    /// The V4 direction is NOT a per-venue constant: the same pool sells the
+    /// loan token as leg A and the quote token as leg B, which the contract's
+    /// PoolKey reconstruction (currencies sorted by address) requires to
+    /// have opposite `zeroForOne` flags. Putting one V4 venue in both
+    /// positions must derive opposite directions from each leg's own input
+    /// token — never from the once-per-venue config field.
+    #[test]
+    fn build_params_derives_opposite_v4_direction_per_leg() {
+        use crate::arbitrage::Opportunity;
+        use crate::config::{Config, Venue, VenueKind};
+
+        let v4 = Venue {
+            pair: Address::ZERO,
+            router: Address::ZERO,
+            kind: VenueKind::UniswapV4,
+            fee_bps: 30,
+            factory: Address::ZERO,
+            stable: false,
+            fee_tier: 3000,
+            pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+            zero_for_one: false, // configured value must be derived away
+            quoter: Address::ZERO,
+        };
+        let cfg = Config {
+            rpc_url: String::new(),
+            wss_url: None,
+            private_key: String::new(),
+            morpho: Address::ZERO,
+            arb_contract: Address::ZERO,
+            // loan_token < quote_token numerically, so currency0 = loan_token.
+            loan_token: address!("1000000000000000000000000000000000000001"),
+            quote_token: address!("2000000000000000000000000000000000000002"),
+            wrapped_native: Address::ZERO,
+            venues: vec![v4, v4.clone()],
+            loan_amounts: vec![],
+            min_profit: U256::ZERO,
+            gas_price_wei: None,
+            slippage_bps: 50,
+            poll_interval_ms: 0,
+            state_refresh_secs: 60,
+            sweep_interval_blocks: 10,
+            use_new_heads: false,
+            min_scan_interval_ms: 0,
+            dry_run: true,
+            quoter_v2: Address::ZERO,
+            quoter_slipstream: Address::ZERO,
+            quoter_v4: Address::ZERO,
+            use_pending_state: false,
+            use_flashblock_sync: false,
+            use_pending_logs: false,
+            use_pending_sim: false,
+            use_local_sim: false,
+        };
+        let opp = Opportunity {
+            first: 0,
+            second: 1,
+            loan_amount: U256::from(10_000u64),
+            quote_out: U256::from(20_000u64),
+            amount_out: U256::from(10_100u64),
+            profit: U256::from(100u64),
+            leg1_local: false,
+            leg2_local: false,
+        };
+
+        let params = build_params(&cfg, &opp, cfg.min_profit);
+        // Leg A sells the loan token (currency0 here), leg B sells the quote
+        // token (currency1 here), so the flags must be opposite.
+        assert!(params.legA.zeroForOne, "leg A sells currency0 (loan token)");
+        assert!(
+            !params.legB.zeroForOne,
+            "leg B sells currency1 (quote token)"
+        );
     }
 
     /// The Slipstream leg kind (4) must round-trip through the alloy binding
@@ -457,6 +608,9 @@ mod tests {
             feeTier: alloy::primitives::Uint::<24, 1>::from(100u32),
             poolId: alloy::primitives::FixedBytes([0u8; 32]),
             minOut: U256::from(900u64),
+            tickSpacing: I24::try_from(60_i64).unwrap(),
+            hooks: Address::ZERO,
+            zeroForOne: false,
         };
         let encoded = venue.abi_encode();
         let decoded = SwapLeg::abi_decode(&encoded).expect("leg decodes");
@@ -464,6 +618,40 @@ mod tests {
         assert_eq!(
             decoded.feeTier,
             alloy::primitives::Uint::<24, 1>::from(100u32)
+        );
+    }
+
+    /// The V4 leg fields (kind 3) must round-trip and carry tickSpacing/hooks/
+    /// zeroForOne, matching the contract's extended SwapLeg struct.
+    #[test]
+    fn v4_leg_fields_round_trip() {
+        use crate::config::VenueKind;
+        assert_eq!(VenueKind::UniswapV4 as u8, 3);
+        let venue = SwapLeg {
+            router: address!("4444444444444444444444444444444444444444"),
+            kind: VenueKind::UniswapV4 as u8,
+            factory: Address::ZERO,
+            stable: false,
+            feeTier: alloy::primitives::Uint::<24, 1>::from(500u32),
+            poolId: alloy::primitives::FixedBytes([0xab; 32]),
+            minOut: U256::from(777u64),
+            tickSpacing: I24::try_from(120_i64).unwrap(),
+            hooks: address!("5555555555555555555555555555555555555555"),
+            zeroForOne: true,
+        };
+        let encoded = venue.abi_encode();
+        let decoded = SwapLeg::abi_decode(&encoded).expect("leg decodes");
+        assert_eq!(decoded.kind, 3);
+        assert_eq!(decoded.poolId.0, [0xab; 32]);
+        assert_eq!(decoded.tickSpacing, I24::try_from(120_i64).unwrap());
+        assert_eq!(
+            decoded.hooks,
+            address!("5555555555555555555555555555555555555555")
+        );
+        assert!(decoded.zeroForOne);
+        assert_eq!(
+            decoded.feeTier,
+            alloy::primitives::Uint::<24, 1>::from(500u32)
         );
     }
 }

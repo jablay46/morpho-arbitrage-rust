@@ -138,8 +138,18 @@ pub fn pick_best_net(
 /// True when `candidate_gross` can still beat the incumbent's net even at
 /// zero gas; used with gross-sorted candidates to stop simulating once no
 /// later candidate can win.
+///
+/// A candidate's net profit can never exceed its gross profit (net =
+/// gross − gas, and gas is non-negative), so whenever `candidate_gross <=
+/// incumbent_net` the candidate cannot displace the incumbent under
+/// `pick_best_net`'s strict `>` and its simulation can be skipped. The
+/// boundary is `candidate_gross > incumbent_net`, NOT `> incumbent_net +
+/// 1`: the config permits a zero effective gas price (GAS_PRICE_WEI), in
+/// which case a candidate whose gross is exactly one wei above the
+/// incumbent's net keeps that full gross as net and is a strict winner.
 pub fn can_still_win(candidate_gross: U256, incumbent: &(Opportunity, U256)) -> bool {
-    candidate_gross > incumbent.0.profit.saturating_sub(incumbent.1)
+    let incumbent_net = incumbent.0.profit.saturating_sub(incumbent.1);
+    candidate_gross > incumbent_net
 }
 
 /// The best two-venue round trip of a scan, ignoring `min_profit`. Unlike
@@ -491,9 +501,16 @@ mod tests {
     #[test]
     fn can_still_win_stops_when_gross_cannot_beat_incumbent_net() {
         let incumbent = (opp(0, 1, 20), U256::from(18u64)); // net 2
-        assert!(can_still_win(U256::from(3u64), &incumbent));
-        assert!(!can_still_win(U256::from(2u64), &incumbent));
-        assert!(!can_still_win(U256::from(1u64), &incumbent));
+        // A candidate's net is at most its gross, so anything at or below the
+        // incumbent's net can never strictly displace it (strict `>` net
+        // rule in pick_best_net) and the simulation is safely skipped.
+        assert!(!can_still_win(U256::from(2u64), &incumbent)); // == net
+        assert!(!can_still_win(U256::from(1u64), &incumbent)); // < net
+        // Exactly one wei above the incumbent's net remains eligible: with a
+        // zero effective gas price (GAS_PRICE_WEI=0) net == gross, so this
+        // candidate would be a strict winner under pick_best_net.
+        assert!(can_still_win(U256::from(3u64), &incumbent)); // == net+1
+        assert!(can_still_win(U256::from(4u64), &incumbent)); // > net+1
     }
 
     #[test]

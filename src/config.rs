@@ -1,4 +1,5 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{keccak256, Address, B256, U256};
+use alloy::sol_types::SolValue;
 use eyre::{eyre, Result};
 use serde::Deserialize;
 use std::env;
@@ -43,12 +44,32 @@ pub struct Venue {
     /// Uniswap V4 pool ID (bytes32) for PoolManager. Unused for V2/V3.
     #[serde(deserialize_with = "deserialize_pool_id", default = "default_pool_id")]
     pub pool_id: [u8; 32],
+    /// Uniswap V4 tick spacing (kind v4 only; the PoolKey must carry it).
+    /// Unused for other kinds.
+    #[serde(default = "default_tick_spacing")]
+    pub tick_spacing: i32,
+    /// Uniswap V4 hooks address (kind v4 only; zero = no hooks).
+    /// Unused for other kinds.
+    #[serde(default)]
+    pub hooks: Address,
+    /// Uniswap V4 swap direction (kind v4 only): true = currency0 -> currency1.
+    /// IGNORED for actual execution — the executor derives the direction per
+    /// leg from that leg's input token against the PoolKey currency ordering,
+    /// because the same pool sells the loan token as leg A and the quote
+    /// token as leg B with opposite directions. Kept only for DEX_VENUES/TOML
+    /// parity, so configs written with an explicit direction still load.
+    #[serde(default)]
+    pub zero_for_one: bool,
     /// Per-venue QuoterV2 override (V3 only). Address::ZERO = use the
     /// global `Config::quoter_v2`. Needed for V3 venues whose quotes live
     /// on a different deployment (e.g. PancakeSwap V3), since each factory
     /// has its own quoter contract.
     #[serde(default)]
     pub quoter: Address,
+}
+
+fn default_tick_spacing() -> i32 {
+    60
 }
 
 fn default_fee_bps() -> u64 {
@@ -69,6 +90,32 @@ impl Venue {
     pub fn pool_address(&self) -> Address {
         self.pair
     }
+}
+
+/// Uniswap V4 pool ID for the (loan, quote) cycle pair on `venue`:
+/// keccak256(abi.encode(PoolKey)) with the PoolKey's currencies sorted by
+/// address — exactly how the execution contract reconstructs the key inside
+/// `_v4Settle` and checks it against `leg.poolId`.
+pub fn v4_pool_id(loan: Address, quote: Address, venue: &Venue) -> B256 {
+    let (currency0, currency1) = if loan < quote {
+        (loan, quote)
+    } else {
+        (quote, loan)
+    };
+    // fee (uint24) and tick_spacing (int24) encode identically to their u32/
+    // i32 carriers for values inside the int24 range; config validation bounds
+    // tick_spacing to 1..=32767 and fee_tier to uint24.
+    keccak256(
+        (
+            currency0,
+            currency1,
+            venue.fee_tier,
+            venue.tick_spacing,
+            venue.hooks,
+        )
+            .abi_encode()
+            .as_slice(),
+    )
 }
 
 fn deserialize_pair<'de, D>(deserializer: D) -> Result<Address, D::Error>
@@ -158,6 +205,10 @@ pub struct Config {
     /// Aerodrome Slipstream Quoter used to price CL legs. Defaults to the
     /// Base deployment; set QUOTER_SLIPSTREAM explicitly for other chains.
     pub quoter_slipstream: Address,
+    /// Uniswap V4 Quoter used to price V4 legs off-chain (simulates the swap
+    /// via the PoolManager and reverts with the output). Defaults to the Base
+    /// deployment; set QUOTER_V4 explicitly for any other chain.
+    pub quoter_v4: Address,
     /// Read chain state (reserves, quotes, gas) against the `pending` block
     /// tag, i.e. the latest Flashblock preconfirmation (~200ms fresh on Base)
     /// instead of the sealed `latest` block (~2s). Requires a Flashblock-aware
@@ -221,11 +272,7 @@ impl Config {
                     "aero" => VenueKind::Aerodrome,
                     "v3" => VenueKind::UniswapV3,
                     "slipstream" | "cl" => VenueKind::Slipstream,
-                    "v4" => {
-                        return Err(eyre!(
-                            "kind 'v4' in DEX_VENUES '{entry}' is not supported yet"
-                        ));
-                    }
+                    "v4" => VenueKind::UniswapV4,
                     other => return Err(eyre!("invalid kind '{other}' in DEX_VENUES '{entry}'")),
                 };
                 let fee_bps = parts
@@ -291,6 +338,39 @@ impl Config {
                     })
                     .transpose()?
                     .unwrap_or(Address::ZERO);
+                // Whitelisted V4 pool-id override; like only valid for V4.
+                if !pool_id.iter().all(|&b| b == 0) && kind != VenueKind::UniswapV4 {
+                    return Err(eyre!(
+                        "DEX_VENUES '{entry}': pool_id is only valid for kind 'v4'"
+                    ));
+                }
+                // Uniswap V4 tick spacing (optional; applies to v4 only, ignored
+                // otherwise -- kept in the positional format for TOML parity).
+                let tick_spacing = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        s.trim()
+                            .parse::<i32>()
+                            .map_err(|e| eyre!("invalid tick_spacing in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(default_tick_spacing());
+                // Uniswap V4 hooks address (optional; v4 only).
+                let hooks = parts
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        Address::from_str(s.trim())
+                            .map_err(|e| eyre!("invalid hooks in DEX_VENUES '{entry}': {e}"))
+                    })
+                    .transpose()?
+                    .unwrap_or(Address::ZERO);
+                // Uniswap V4 swap direction (optional; v4 only).
+                let zero_for_one = parts
+                    .next()
+                    .map(|s| matches!(s.trim(), "true" | "1" | "yes"))
+                    .unwrap_or(false);
                 if parts.next().is_some() {
                     return Err(eyre!("too many fields in DEX_VENUES entry '{entry}'"));
                 }
@@ -325,6 +405,9 @@ impl Config {
                     stable,
                     fee_tier,
                     pool_id,
+                    tick_spacing,
+                    hooks,
+                    zero_for_one,
                     quoter,
                 })
             })
@@ -432,17 +515,68 @@ impl Config {
                      in {{1, 50, 100, 200, 2000}}"
                 ));
             }
-            if venue.pair.is_zero() {
-                if venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome {
-                    return Err(eyre!(
-                        "venue {idx}: 'auto' pool requires a factory address"
-                    ));
-                }
+            if venue.pair.is_zero() && venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome
+            {
+                return Err(eyre!("venue {idx}: 'auto' pool requires a factory address"));
             }
             if venue.kind == VenueKind::UniswapV4 {
-                return Err(eyre!(
-                    "venue {idx}: kind 'v4' is not supported yet"
-                ));
+                // V4 pools are addressed by poolId = keccak256(abi.encode(
+                // PoolKey)), NOT by a factory getPool(Pair) lookup, so the
+                // "auto" resolution path cannot produce one. Reject it here at
+                // validation time with a clear message instead of failing
+                // later inside resolve_pool.
+                if venue.pair.is_zero() {
+                    return Err(eyre!(
+                        "venue {idx}: kind 'v4' does not support pair=\"auto\"; \
+                         configure the explicit pool_id (keccak256(abi.encode(PoolKey)))"
+                    ));
+                }
+                // tick_spacing must be positive (type int24 on chain; the i32
+                // config keeps negatives representable for clearer errors).
+                if venue.tick_spacing <= 0 || venue.tick_spacing > i32::from(i16::MAX) {
+                    return Err(eyre!(
+                        "venue {idx}: v4 tick_spacing must be in 1..=32767, got {}",
+                        venue.tick_spacing
+                    ));
+                }
+                // pool_id must be present: the contract needs it to reconstruct
+                // and verify the PoolKey (Uniswap V4 pool ID = keccak256 of the
+                // ABI-encoded PoolKey).
+                if venue.pool_id.iter().all(|&b| b == 0) {
+                    return Err(eyre!(
+                        "venue {idx}: kind 'v4' requires a non-zero pool_id \
+                         (keccak256(abi.encode(PoolKey)))"
+                    ));
+                }
+                // fee_tier carries the V4 pool fee in hundredths of a bip
+                // (max uint24 on chain).
+                if venue.fee_tier > 0xffffff {
+                    return Err(eyre!(
+                        "venue {idx}: v4 fee_tier must fit in uint24, got {}",
+                        venue.fee_tier
+                    ));
+                }
+                if venue.fee_tier & 0x800000 != 0 {
+                    return Err(eyre!(
+                        "venue {idx}: v4 dynamic-fee pools (0x800000) are unsupported"
+                    ));
+                }
+                // The configured pool_id must match the PoolKey the scanner
+                // and the execution contract derive from the cycle pair:
+                // keccak256(abi.encode(currency0, currency1, fee,
+                // tickSpacing, hooks)) with currencies sorted by address. A
+                // nonzero typo would otherwise survive startup, produce
+                // well-formed opportunities, and only revert inside the
+                // contract's pool-id check.
+                let derived = v4_pool_id(loan_token, quote_token, venue);
+                if B256::from(venue.pool_id) != derived {
+                    return Err(eyre!(
+                        "venue {idx}: v4 pool_id does not match \
+                         keccak256(abi.encode(PoolKey)); configured {}, derived {}",
+                        B256::from(venue.pool_id),
+                        derived
+                    ));
+                }
             }
         }
 
@@ -456,6 +590,16 @@ impl Config {
         // Morpho Blue rejects zero-asset flash loans.
         if loan_amounts.iter().any(|a| a.is_zero()) {
             return Err(eyre!("LOAN_AMOUNTS must not contain zero"));
+        }
+        // The V4 Quoter's exactAmount is uint128; a configured loan above
+        // u128::MAX cannot be priced (the old silent truncation would assess
+        // a different trade from the one executed). Reject it up front.
+        if venues.iter().any(|v| v.kind == VenueKind::UniswapV4)
+            && loan_amounts.iter().any(|a| a > &U256::from(u128::MAX))
+        {
+            return Err(eyre!(
+                "LOAN_AMOUNTS entries must fit in uint128 when a v4 venue is enabled"
+            ));
         }
 
         let dry_run = env::var("DRY_RUN")
@@ -566,6 +710,19 @@ impl Config {
                     .expect("valid constant address")
             });
 
+        // Uniswap V4 Quoter on Base. Chain-specific like QUOTER_V2; a wrong or
+        // missing address makes every V4 quote revert and V4 venues are
+        // silently skipped, so QUOTER_V4 must be set for non-Base chains.
+        let quoter_v4 = env::var("QUOTER_V4")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| Address::from_str(&s).map_err(|e| eyre!("invalid QUOTER_V4: {e}")))
+            .transpose()?
+            .unwrap_or_else(|| {
+                Address::from_str("0x0d5e0f971ed27fbff6c2837bf31316121532048d")
+                    .expect("valid constant address")
+            });
+
         // Flashblock (Base 200ms preconfirmation) options. All default off so
         // a non-Flashblock endpoint behaves exactly as before; enabling them
         // only helps when the RPC/WSS endpoint streams Flashblocks.
@@ -629,11 +786,76 @@ impl Config {
             dry_run,
             quoter_v2,
             quoter_slipstream,
+            quoter_v4,
             use_pending_state,
             use_flashblock_sync,
             use_pending_logs,
             use_pending_sim,
             use_local_sim,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn venue() -> Venue {
+        Venue {
+            pair: Address::ZERO,
+            router: Address::ZERO,
+            kind: VenueKind::UniswapV4,
+            fee_bps: 30,
+            factory: Address::ZERO,
+            stable: false,
+            fee_tier: 3000,
+            pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+            zero_for_one: false,
+            quoter: Address::ZERO,
+        }
+    }
+
+    #[test]
+    fn v4_pool_id_sorts_currencies() {
+        let a = Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let b = Address::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let v = venue();
+        // Which token is loan and which is quote must not change the pool id:
+        // the PoolKey always sorts currencies by address.
+        assert_eq!(v4_pool_id(a, b, &v), v4_pool_id(b, a, &v));
+    }
+
+    #[test]
+    fn v4_pool_id_cross_references_contract_encoding() {
+        // Mirrors the Solidity `toId` in contracts/FlashArbitrage.sol via a
+        // zero-hooks PoolKey with fee 3000 / tickSpacing 60. Any drift from
+        // keccak256(abi.encode(PoolKey)) would make the scanner price a
+        // different pool than the executor swaps — the essential link the
+        // review finding protects.
+        let c0 = Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let c1 = Address::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let mut v = venue();
+        let id = v4_pool_id(c0, c1, &v);
+        assert_eq!(
+            id,
+            keccak256(
+                (c0, c1, 3000u32, 60i32, Address::ZERO)
+                    .abi_encode()
+                    .as_slice()
+            )
+        );
+        assert_ne!(id, B256::ZERO);
+        // Change any PoolKey field and the id must change.
+        let before = id;
+        v.fee_tier = 500;
+        assert_ne!(v4_pool_id(c0, c1, &v), before);
+        v.fee_tier = 3000;
+        v.tick_spacing = 200;
+        assert_ne!(v4_pool_id(c0, c1, &v), before);
+        v.tick_spacing = 60;
+        v.hooks = Address::from_str("0x0000000000000000000000000000000000000099").unwrap();
+        assert_ne!(v4_pool_id(c0, c1, &v), before);
     }
 }
