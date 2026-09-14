@@ -1,7 +1,7 @@
 use crate::arbitrage::Opportunity;
 use crate::config::{Config, Venue};
 use alloy::primitives::aliases::I24;
-use alloy::primitives::{Address, TxHash, B256, U256};
+use alloy::primitives::{Address, TxHash, B256, U256, U512};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
@@ -182,12 +182,27 @@ pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbPar
     // the quoted output is zero (defensive; valid opportunities always have a
     // positive quote) fall back to the raw amount_out — the compounded bound
     // degenerates harmlessly.
-    let leg_b_input_worst = if opp.quote_out.is_zero() {
-        opp.amount_out
+    //
+    // The whole scaling chain can overflow U256 even though every FINAL
+    // value fits: `amount_out` reaches ~2^250 for a deep-recollateralized
+    // loan, so `amount_out * leg_a_min` needs ~378 bits and the intermediate
+    // quotient (~2^250) times the 9950 tolerance still needs ~263 bits.
+    // Run the two-step scaling in U512 and only clamp to U256 at the end.
+    //
+    // The final bound is mathematically at most `amount_out` (leg_a_min <=
+    // quote_out and the tolerance is a strict discount), so the checked
+    // conversion cannot fail.
+    let leg_b_min = if opp.quote_out.is_zero() {
+        // Defensive fallback (valid opportunities always have a positive
+        // quote); the single-width tolerance can hit the same wrap only on
+        // this unreachable path.
+        with_slippage(opp.amount_out, cfg.slippage_bps)
     } else {
-        opp.amount_out * leg_a_min / opp.quote_out
+        let product = opp.amount_out.widening_mul(leg_a_min);
+        let quotient = product / U512::from(opp.quote_out);
+        let tolerance = U512::from(10_000u64 - cfg.slippage_bps);
+        (quotient * tolerance / U512::from(10_000u64)).to::<U256>()
     };
-    let leg_b_min = with_slippage(leg_b_input_worst, cfg.slippage_bps);
     ArbParams {
         token: cfg.loan_token,
         quote: cfg.quote_token,
@@ -738,6 +753,94 @@ mod tests {
         // And it must be strictly tighter when both legs move (slippage > 0
         // and both quotes positive).
         assert!(params.legB.minOut < single);
+    }
+
+    /// Regression for the review finding that `amount_out * leg_a_min /
+    /// quote_out` multiplied in U256: a deep-recollateralized loan pushes
+    /// `amount_out` (~2^250) and `leg_a_min` (~2^128) to a product needing
+    /// ~378 bits, which overflows U256 (panicking in debug, wrapping the
+    /// bound in release) even though the scaled-down quotient fits. The
+    /// multiplication must widen into U512 before the division.
+    #[test]
+    fn build_params_leg_b_scaling_handles_u512_overflow() {
+        use crate::arbitrage::Opportunity;
+        use crate::config::{Config, Venue, VenueKind};
+        use std::str::FromStr;
+
+        let venue = |kind| Venue {
+            pair: Address::ZERO,
+            router: Address::ZERO,
+            kind,
+            fee_bps: 30,
+            factory: Address::ZERO,
+            stable: false,
+            fee_tier: 3000,
+            pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+            zero_for_one: false,
+            quoter: Address::ZERO,
+        };
+        let cfg = Config {
+            rpc_url: String::new(),
+            wss_url: None,
+            private_key: String::new(),
+            morpho: Address::ZERO,
+            arb_contract: Address::ZERO,
+            loan_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            wrapped_native: Address::ZERO,
+            venues: vec![venue(VenueKind::UniswapV2), venue(VenueKind::Aerodrome)],
+            loan_amounts: vec![],
+            min_profit: U256::ZERO,
+            gas_price_wei: None,
+            slippage_bps: 50,
+            owner_refresh_secs: 60,
+            poll_interval_ms: 0,
+            state_refresh_secs: 60,
+            sweep_interval_blocks: 10,
+            use_new_heads: false,
+            min_scan_interval_ms: 0,
+            dry_run: true,
+            quoter_v2: Address::ZERO,
+            quoter_slipstream: Address::ZERO,
+            quoter_v4: Address::ZERO,
+            use_pending_state: false,
+            use_flashblock_sync: false,
+            use_pending_logs: false,
+            use_pending_sim: false,
+            use_local_sim: false,
+        };
+        let opp = Opportunity {
+            first: 0,
+            second: 1,
+            loan_amount: U256::from(10_000u64),
+            quote_out: U256::from(1u64) << 128,
+            amount_out: U256::from(1u64) << 250,
+            profit: U256::from(1u64),
+            leg1_local: false,
+            leg2_local: false,
+        };
+
+        // Premise check: the 256-bit intermediate genuinely overflows.
+        let leg_a_min = with_slippage(opp.quote_out, cfg.slippage_bps);
+        let product = opp.amount_out.widening_mul(leg_a_min);
+        assert!(
+            product > U512::from(U256::MAX),
+            "test premise: amount_out * leg_a_min must exceed U256::MAX"
+        );
+
+        // Expected bound computed independently in 512-bit space:
+        // quotient = floor(2^250 * leg_a_min / 2^128), then leg B's own
+        // tolerance applied once. Hard-coded to pin the exact floor.
+        let expected =
+            U256::from_str("0x3f5c91d14e3bcd35a858793dd97f62b680a3d70a3d70a3d70a3d70a3d70a3d7")
+                .unwrap();
+        let params = build_params(&cfg, &opp, cfg.min_profit);
+        assert_eq!(params.legB.minOut, expected);
+        // And the bound stays a strict (conservative) discount vs the
+        // nominal leg-B output.
+        assert!(params.legB.minOut < opp.amount_out);
     }
 
     /// The V4 direction is NOT a per-venue constant: the same pool sells the
