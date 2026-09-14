@@ -501,14 +501,14 @@ mod tests {
     #[test]
     fn can_still_win_stops_when_gross_cannot_beat_incumbent_net() {
         let incumbent = (opp(0, 1, 20), U256::from(18u64)); // net 2
-        // A candidate's net is at most its gross, so anything at or below the
-        // incumbent's net can never strictly displace it (strict `>` net
-        // rule in pick_best_net) and the simulation is safely skipped.
+                                                            // A candidate's net is at most its gross, so anything at or below the
+                                                            // incumbent's net can never strictly displace it (strict `>` net
+                                                            // rule in pick_best_net) and the simulation is safely skipped.
         assert!(!can_still_win(U256::from(2u64), &incumbent)); // == net
         assert!(!can_still_win(U256::from(1u64), &incumbent)); // < net
-        // Exactly one wei above the incumbent's net remains eligible: with a
-        // zero effective gas price (GAS_PRICE_WEI=0) net == gross, so this
-        // candidate would be a strict winner under pick_best_net.
+                                                               // Exactly one wei above the incumbent's net remains eligible: with a
+                                                               // zero effective gas price (GAS_PRICE_WEI=0) net == gross, so this
+                                                               // candidate would be a strict winner under pick_best_net.
         assert!(can_still_win(U256::from(3u64), &incumbent)); // == net+1
         assert!(can_still_win(U256::from(4u64), &incumbent)); // > net+1
     }

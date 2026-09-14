@@ -1,12 +1,57 @@
 use crate::arbitrage::Opportunity;
 use crate::config::{Config, Venue};
 use alloy::primitives::aliases::I24;
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, TxHash, B256, U256, U512};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
+
+/// Thin admin helpers over the alloy `Provider` trait used by the executor's
+/// explicit-fill broadcast path (`execute_sync`). Keeping them here (instead
+/// of inlining trait calls) makes the two paths' fee/gas/nonce semantics
+/// identical and unit-testable.
+pub mod admin {
+    use super::*;
+    use alloy::providers::Provider;
+    use alloy::rpc::types::eth::TransactionRequest;
+
+    /// [`Provider::estimate_eip1559_fees`] — named alias so the call site
+    /// reads as a fee ESTIMATION and stays greppable.
+    pub async fn estimate_eip1559_fees<P: Provider>(
+        provider: &P,
+    ) -> eyre::Result<alloy::eips::eip1559::Eip1559Estimation> {
+        provider
+            .estimate_eip1559_fees()
+            .await
+            .map_err(eyre::Error::from)
+    }
+
+    /// [`Provider::estimate_gas`] pinned to the network default block.
+    pub async fn estimate_gas<P: Provider>(
+        provider: &P,
+        tx: &TransactionRequest,
+    ) -> eyre::Result<u64> {
+        provider
+            .estimate_gas(tx.clone())
+            .await
+            .map_err(eyre::Error::from)
+    }
+
+    /// Current nonce of `address` against the `pending` tag — the exact count
+    /// the node would assign our soon-to-be-next tx.
+    pub async fn get_transaction_count<P: Provider>(
+        provider: &P,
+        address: Address,
+    ) -> eyre::Result<u64> {
+        provider
+            .get_transaction_count(address)
+            .block_id(alloy::eips::BlockId::pending())
+            .await
+            .map_err(eyre::Error::from)
+    }
+}
 
 /// Error carrying the account mismatch that made a trade unsafe to broadcast.
 ///
@@ -118,19 +163,46 @@ fn with_slippage(expected: U256, slippage_bps: u64) -> U256 {
 /// so the contract reverts trades that would be unprofitable after gas,
 /// instead of letting a gross-positive-but-net-negative trade broadcast
 /// and revert later (wasted gas).
+///
+/// Leg A applies the configured tolerance to its quoted output; leg B
+/// COMPOUNDS the two independent adverse moves it can experience. Leg B's
+/// input is leg A's *actual* output, which can land as low as `legA.minOut`,
+/// and then the second pool can itself move against the trade. The leg-B
+/// bound is therefore the nominal leg-B output scaled down by leg A's
+/// worst case (`leg_a_min / quote_out`) and then by leg B's own tolerance.
+/// A single flat tolerance on the nominal output would let both pools drift
+/// within their limits while the real output falls below `minOut`, reverting
+/// the second router call (`Too little received`) before the final on-chain
+/// `minProfit` check ever runs. `minProfit` stays the profitability backstop
+/// after both legs.
 pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbParams {
-    // Leg B's input is leg A's *actual* output, which may land as low as
-    // legA.minOut (= quote_out * (1 - s)). Leg B's output then scales down
-    // with it, so a single-slippage bound on `amount_out` would revert on an
-    // independent adverse move in the second pool even though every leg
-    // remains within the configured tolerance and the cycle still clears
-    // minProfit. Apply the tolerance twice on leg B so it compounds; the
-    // final `minProfit` check is the profitability backstop after both legs.
     let leg_a_min = with_slippage(opp.quote_out, cfg.slippage_bps);
-    let leg_b_min = with_slippage(
-        with_slippage(opp.amount_out, cfg.slippage_bps),
-        cfg.slippage_bps,
-    );
+    // Leg B's input is leg A's actual output; scale the nominal leg-B output
+    // down by leg A's worst case before applying leg B's own tolerance. When
+    // the quoted output is zero (defensive; valid opportunities always have a
+    // positive quote) fall back to the raw amount_out — the compounded bound
+    // degenerates harmlessly.
+    //
+    // The whole scaling chain can overflow U256 even though every FINAL
+    // value fits: `amount_out` reaches ~2^250 for a deep-recollateralized
+    // loan, so `amount_out * leg_a_min` needs ~378 bits and the intermediate
+    // quotient (~2^250) times the 9950 tolerance still needs ~263 bits.
+    // Run the two-step scaling in U512 and only clamp to U256 at the end.
+    //
+    // The final bound is mathematically at most `amount_out` (leg_a_min <=
+    // quote_out and the tolerance is a strict discount), so the checked
+    // conversion cannot fail.
+    let leg_b_min = if opp.quote_out.is_zero() {
+        // Defensive fallback (valid opportunities always have a positive
+        // quote); the single-width tolerance can hit the same wrap only on
+        // this unreachable path.
+        with_slippage(opp.amount_out, cfg.slippage_bps)
+    } else {
+        let product = opp.amount_out.widening_mul(leg_a_min);
+        let quotient = product / U512::from(opp.quote_out);
+        let tolerance = U512::from(10_000u64 - cfg.slippage_bps);
+        (quotient * tolerance / U512::from(10_000u64)).to::<U256>()
+    };
     ArbParams {
         token: cfg.loan_token,
         quote: cfg.quote_token,
@@ -273,23 +345,78 @@ where
 /// asynchronous `execute` path — which clears the flag once the tx lands or
 /// fails conclusively. The scan loop resumes immediately, but duplicate
 /// protection stays intact.
+///
+/// `expected_pending_hash`: when the caller scanned preconfirmed `pending`
+/// state, it snapshots the pending block hash the scan was priced against;
+/// this function re-reads the pending hash after the fee/gas/nonce fills
+/// and refuses to broadcast if a Flashblock advanced the state in the
+/// meantime (audit finding #5). `None` disables the check (sealed scans).
 pub async fn execute_sync<P>(
     provider: P,
     contract: Address,
     params: ArbParams,
+    signer: Address,
     inflight: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    expected_pending_hash: Option<B256>,
 ) -> Result<TxHash>
 where
     P: Provider + 'static,
 {
     use alloy::network::TransactionBuilder;
 
-    let tx =
-        TransactionRequest::default()
-            .with_to(contract)
-            .with_input(alloy::primitives::Bytes::from(
-                IFlashArbitrage::executeCall { params }.abi_encode(),
+    let calldata =
+        alloy::primitives::Bytes::from(IFlashArbitrage::executeCall { params }.abi_encode());
+    // The sync submit path must set fee, gas and nonce fields explicitly:
+    // alloy's `send_transaction` on a wallet-enabled provider performs no
+    // automatic fee/gas estimation for a bare `TransactionRequest`, and a
+    // Flashblock race means a tx that fails to include at the current
+    // basefee simply waits — the 200ms synchronous receipt then times out,
+    // the already-broadcast tx staying pending and stalling the nonce while
+    // the next scan is already allowed to broadcast a duplicate (distinct
+    // nonce) that reverts. Estimate EIP-1559 fees + gas exactly like the
+    // fire-and-forget `execute` path does, fill the nonce explicitly so a
+    // re-simulated duplicate can never double-spend, and pad the gas limit
+    // (1.33x) to cover estimation variance between scan and inclusion
+    // (audit finding #2). The L1 data fee is accounted separately in the
+    // caller's gas/profit math, not inside the gas limit.
+    let fee_est = admin::estimate_eip1559_fees(&provider).await?;
+    // The gas estimate must run `from` the signing wallet: `execute` is
+    // `onlyOwner`, so without the sender the estimation uses the RPC default
+    // and reverts `NotOwner` before the wallet-backed broadcast can happen.
+    // Keep the sender on the final transaction so `eth_estimateGas` and
+    // `send_transaction` agree on the caller.
+    let est_tx = TransactionRequest::default()
+        .with_to(contract)
+        .with_input(calldata.clone())
+        .with_from(signer)
+        .with_max_fee_per_gas(fee_est.max_fee_per_gas)
+        .with_max_priority_fee_per_gas(fee_est.max_priority_fee_per_gas);
+    let gas_limit = admin::estimate_gas(&provider, &est_tx).await?;
+    let nonce = admin::get_transaction_count(&provider, signer).await?;
+    // Pre-submit state-advancement guard inside the submit path itself (audit
+    // finding #5). The scan's final guard runs before building the tx, but
+    // fee/gas/nonce estimation between that guard and `.send()` is itself
+    // three RPC round-trips — on a Flashblock endpoint the pending state can
+    // advance within them, and the priced legs would land against a state
+    // they were not priced against. Re-check the pending hash right before
+    // sending and refuse to broadcast when a new Flashblock landed. This
+    // closes the remaining window (guard→submit) that the scan-side guards
+    // cannot see.
+    if let Some(expected) = expected_pending_hash {
+        let current = provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Pending)
+            .await?
+            .map(|b| b.header.hash);
+        if matches!(current, Some(h) if h != expected) {
+            return Err(eyre::eyre!(
+                "pending state advanced during execute_sync fee/gas/nonce fill; \
+                 refusing to broadcast against stale legs"
             ));
+        }
+    }
+    let tx = est_tx
+        .with_gas_limit((gas_limit as f64 * 1.33) as u64)
+        .with_nonce(nonce);
     let pending = provider.send_transaction(tx).await?;
     let tx_hash = *pending.tx_hash();
     tracing::debug!(tx = %tx_hash, "execute_sync: broadcast, awaiting flash receipt");
@@ -479,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn build_params_compounds_slippage_on_leg_b() {
+    fn build_params_compounds_leg_b_slippage() {
         use crate::arbitrage::Opportunity;
         use crate::config::{Config, Venue, VenueKind};
 
@@ -542,14 +669,178 @@ mod tests {
         // Leg A tolerates one slippage interval: 20000 * 0.995 = 19900.
         assert_eq!(params.legA.minOut, U256::from(19_900u64));
         assert_eq!(params.minProfit, U256::ZERO);
-        // Leg B tolerates two compounded intervals (its own input may drift
-        // down by the leg-A tolerance AND the second pool may move against it
-        // independently): floor(10100 * 0.995^2) = 9998.
-        let expected_b = U256::from(10_100u64) * U256::from(9_950u64) / U256::from(10_000u64)
+        // Leg B compounds BOTH independent adverse moves: its input is leg
+        // A's actual output (worst case leg_a_min = 19900, i.e. * 0.995) and
+        // the second pool can itself drift by one interval (* 0.995). Bound
+        // = 10_100 * (19900 / 20000) * 0.995, floored by integer math.
+        let leg_b_worst_case = U256::from(10_100u64) * U256::from(19_900u64)
+            / U256::from(20_000u64)
             * U256::from(9_950u64)
             / U256::from(10_000u64);
-        assert_eq!(params.legB.minOut, expected_b);
-        assert_eq!(expected_b, U256::from(9_998u64));
+        assert_eq!(leg_b_worst_case, U256::from(9_998u64));
+        assert_eq!(params.legB.minOut, leg_b_worst_case);
+    }
+
+    /// The same adverse move in both legs (leg A priced leg B's input at the
+    /// nominal output, leg B executed against leg A's actual, lower output)
+    /// must not let the compounded bound fall below a single-tolerance
+    /// bound — the review regression that dropped the second leg's guard.
+    #[test]
+    fn build_params_leg_b_min_out_never_below_single_tolerance() {
+        use crate::arbitrage::Opportunity;
+        use crate::config::{Config, Venue, VenueKind};
+
+        let venue = |kind| Venue {
+            pair: Address::ZERO,
+            router: Address::ZERO,
+            kind,
+            fee_bps: 30,
+            factory: Address::ZERO,
+            stable: false,
+            fee_tier: 3000,
+            pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+            zero_for_one: false,
+            quoter: Address::ZERO,
+        };
+        let cfg = Config {
+            rpc_url: String::new(),
+            wss_url: None,
+            private_key: String::new(),
+            morpho: Address::ZERO,
+            arb_contract: Address::ZERO,
+            loan_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            wrapped_native: Address::ZERO,
+            venues: vec![venue(VenueKind::UniswapV2), venue(VenueKind::Aerodrome)],
+            loan_amounts: vec![],
+            min_profit: U256::ZERO,
+            gas_price_wei: None,
+            slippage_bps: 50,
+            owner_refresh_secs: 60,
+            poll_interval_ms: 0,
+            state_refresh_secs: 60,
+            sweep_interval_blocks: 10,
+            use_new_heads: false,
+            min_scan_interval_ms: 0,
+            dry_run: true,
+            quoter_v2: Address::ZERO,
+            quoter_slipstream: Address::ZERO,
+            quoter_v4: Address::ZERO,
+            use_pending_state: false,
+            use_flashblock_sync: false,
+            use_pending_logs: false,
+            use_pending_sim: false,
+            use_local_sim: false,
+        };
+        let opp = Opportunity {
+            first: 0,
+            second: 1,
+            loan_amount: U256::from(10_000u64),
+            quote_out: U256::from(20_000u64),
+            amount_out: U256::from(10_100u64),
+            profit: U256::from(100u64),
+            leg1_local: false,
+            leg2_local: false,
+        };
+
+        let params = build_params(&cfg, &opp, cfg.min_profit);
+        // The compounded bound must always be at or below the single
+        // tolerance bound for the same legs.
+        let single = opp.amount_out * U256::from(9_950u64) / U256::from(10_000u64);
+        assert!(params.legB.minOut <= single, "compounded bound is tighter");
+        // And it must be strictly tighter when both legs move (slippage > 0
+        // and both quotes positive).
+        assert!(params.legB.minOut < single);
+    }
+
+    /// Regression for the review finding that `amount_out * leg_a_min /
+    /// quote_out` multiplied in U256: a deep-recollateralized loan pushes
+    /// `amount_out` (~2^250) and `leg_a_min` (~2^128) to a product needing
+    /// ~378 bits, which overflows U256 (panicking in debug, wrapping the
+    /// bound in release) even though the scaled-down quotient fits. The
+    /// multiplication must widen into U512 before the division.
+    #[test]
+    fn build_params_leg_b_scaling_handles_u512_overflow() {
+        use crate::arbitrage::Opportunity;
+        use crate::config::{Config, Venue, VenueKind};
+        use std::str::FromStr;
+
+        let venue = |kind| Venue {
+            pair: Address::ZERO,
+            router: Address::ZERO,
+            kind,
+            fee_bps: 30,
+            factory: Address::ZERO,
+            stable: false,
+            fee_tier: 3000,
+            pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+            zero_for_one: false,
+            quoter: Address::ZERO,
+        };
+        let cfg = Config {
+            rpc_url: String::new(),
+            wss_url: None,
+            private_key: String::new(),
+            morpho: Address::ZERO,
+            arb_contract: Address::ZERO,
+            loan_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            wrapped_native: Address::ZERO,
+            venues: vec![venue(VenueKind::UniswapV2), venue(VenueKind::Aerodrome)],
+            loan_amounts: vec![],
+            min_profit: U256::ZERO,
+            gas_price_wei: None,
+            slippage_bps: 50,
+            owner_refresh_secs: 60,
+            poll_interval_ms: 0,
+            state_refresh_secs: 60,
+            sweep_interval_blocks: 10,
+            use_new_heads: false,
+            min_scan_interval_ms: 0,
+            dry_run: true,
+            quoter_v2: Address::ZERO,
+            quoter_slipstream: Address::ZERO,
+            quoter_v4: Address::ZERO,
+            use_pending_state: false,
+            use_flashblock_sync: false,
+            use_pending_logs: false,
+            use_pending_sim: false,
+            use_local_sim: false,
+        };
+        let opp = Opportunity {
+            first: 0,
+            second: 1,
+            loan_amount: U256::from(10_000u64),
+            quote_out: U256::from(1u64) << 128,
+            amount_out: U256::from(1u64) << 250,
+            profit: U256::from(1u64),
+            leg1_local: false,
+            leg2_local: false,
+        };
+
+        // Premise check: the 256-bit intermediate genuinely overflows.
+        let leg_a_min = with_slippage(opp.quote_out, cfg.slippage_bps);
+        let product = opp.amount_out.widening_mul(leg_a_min);
+        assert!(
+            product > U512::from(U256::MAX),
+            "test premise: amount_out * leg_a_min must exceed U256::MAX"
+        );
+
+        // Expected bound computed independently in 512-bit space:
+        // quotient = floor(2^250 * leg_a_min / 2^128), then leg B's own
+        // tolerance applied once. Hard-coded to pin the exact floor.
+        let expected =
+            U256::from_str("0x3f5c91d14e3bcd35a858793dd97f62b680a3d70a3d70a3d70a3d70a3d70a3d7")
+                .unwrap();
+        let params = build_params(&cfg, &opp, cfg.min_profit);
+        assert_eq!(params.legB.minOut, expected);
+        // And the bound stays a strict (conservative) discount vs the
+        // nominal leg-B output.
+        assert!(params.legB.minOut < opp.amount_out);
     }
 
     /// The V4 direction is NOT a per-venue constant: the same pool sells the
@@ -587,7 +878,7 @@ mod tests {
             loan_token: address!("1000000000000000000000000000000000000001"),
             quote_token: address!("2000000000000000000000000000000000000002"),
             wrapped_native: Address::ZERO,
-            venues: vec![v4, v4.clone()],
+            venues: vec![v4, v4],
             loan_amounts: vec![],
             min_profit: U256::ZERO,
             gas_price_wei: None,
