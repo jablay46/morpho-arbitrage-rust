@@ -11,14 +11,19 @@
 //!    conservative bound. `getL1FeeUpperBound` must be used instead and
 //!    must price at least as high as a representative real transaction.
 //!
-//! `#[ignore]` by default; run with:
+//! The representative transaction is encoded with Alloy's canonical
+//! EIP-1559 encoder (`TxEip1559`), which implements the long RLP length
+//! prefixes a 772-byte calldata and its enclosing transaction list require —
+//! the previous hand-written helpers only implemented the short forms and
+//! produced malformed bytes. `#[ignore]` by default; run with:
 //!
 //! ```sh
 //! cargo test --test chain_l1fee -- --ignored
 //! ```
 
-use alloy::eips::BlockId;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::consensus::{SignableTransaction, TxEip1559};
+use alloy::eips::{eip2930::AccessList, BlockId};
+use alloy::primitives::{Address, Bytes, TxKind, U256};
 use alloy::providers::ProviderBuilder;
 use morpho_arbitrage_bot::dex::{fetch_scan_snapshot, unsigned_tx_rlp_len};
 use std::str::FromStr;
@@ -34,55 +39,26 @@ alloy::sol! {
     }
 }
 
-/// RLP-encode a minimal EIP-1559 unsigned transaction whose `data` is
-/// `calldata`; used to price a *representative real* tx with `getL1Fee`.
-fn rlp_int(v: u64) -> Vec<u8> {
-    if v == 0 {
-        return vec![0x80];
-    }
-    let b = v.to_be_bytes();
-    let start = b.iter().position(|&x| x != 0).unwrap_or(8);
-    let out = &b[start..];
-    if out.len() == 1 && out[0] < 0x80 {
-        out.to_vec()
-    } else {
-        let mut r = vec![0x80 + out.len() as u8];
-        r.extend_from_slice(out);
-        r
-    }
-}
-
-fn rlp_bytes(b: &[u8]) -> Vec<u8> {
-    if b.len() == 1 && b[0] < 0x80 {
-        return b.to_vec();
-    }
-    let mut r = vec![0x80 + b.len() as u8];
-    r.extend_from_slice(b);
-    r
-}
-
-fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
-    let payload: Vec<u8> = items.iter().flatten().copied().collect();
-    let mut r = vec![0xc0 + payload.len() as u8];
-    r.extend_from_slice(&payload);
-    r
-}
-
+/// Encode the canonical unsigned EIP-1559 transaction this bot broadcasts
+/// for `execute` (chain id 8453) whose `data` is `calldata`. Uses Alloy's
+/// `TxEip1559` + `encode_for_signing`, which emits the full unsigned
+/// transaction (type byte + RLP list) with correct short *and* long RLP
+/// length prefixes.
 fn eip1559_unsigned_tx(calldata: &[u8]) -> Vec<u8> {
-    let items = [
-        rlp_int(8453),                                            // chainId (Base)
-        rlp_int(0),                                               // nonce
-        rlp_int(1_000_000),                                       // maxPriorityFeePerGas
-        rlp_int(50_000_000),                                      // maxFeePerGas
-        rlp_int(400_000),                                         // gasLimit
-        rlp_bytes(Address::from_str(CONTRACT).unwrap().as_ref()), // to
-        rlp_int(0),                                               // value
-        rlp_bytes(calldata),                                      // data
-        rlp_list(&[]),                                            // accessList
-    ];
-    let mut tx = vec![0x02]; // EIP-1559 enveloped
-    tx.extend_from_slice(&rlp_list(&items));
-    tx
+    let tx = TxEip1559 {
+        chain_id: 8453,
+        nonce: 0,
+        gas_limit: 400_000,
+        max_fee_per_gas: 50_000_000,
+        max_priority_fee_per_gas: 1_000_000,
+        to: TxKind::Call(Address::from_str(CONTRACT).unwrap()),
+        value: U256::ZERO,
+        access_list: AccessList::default(),
+        input: Bytes::from(calldata.to_vec()),
+    };
+    let mut buf = Vec::new();
+    tx.encode_for_signing(&mut buf);
+    buf
 }
 
 #[tokio::test]
@@ -95,9 +71,17 @@ async fn l1_fee_snapshot_is_priced_on_base_mainnet() {
     // Empty venue/quote lists still exercise the full snapshot path: the
     // L1 oracle calls ride the same Multicall3 batch that failed when the
     // getter-based reads reverted on Base mainnet.
-    let snapshot = fetch_scan_snapshot(&provider, &[], &[], &[], BlockId::latest(), 4 + 24 * 32)
-        .await
-        .expect("snapshot with oracle reads succeeds");
+    let snapshot = fetch_scan_snapshot(
+        &provider,
+        &[],
+        &[],
+        &[],
+        BlockId::latest(),
+        8453, // Base mainnet
+        4 + 24 * 32,
+    )
+    .await
+    .expect("snapshot with oracle reads succeeds");
 
     let l1 = snapshot
         .l1_fee
@@ -139,6 +123,24 @@ async fn upper_bound_prices_above_compressible_and_representative_txs() {
         *b = (x & 0xff) as u8;
     }
     let real_tx = eip1559_unsigned_tx(&calldata);
+    // The canonical encoding must be well formed: it carries the long RLP
+    // length prefixes a 772-byte calldata and its enclosing transaction list
+    // require (the previous hand-written short-only prefix helper produced
+    // malformed bytes here), and exactly matches what `getL1Fee` sees.
+    assert!(
+        real_tx.len() > 772,
+        "full unsigned tx must include the envelope; got {}",
+        real_tx.len()
+    );
+    // The size handed to `getL1FeeUpperBound` must be a true upper bound on
+    // the real tx size, not just its calldata: it accounts for the non-data
+    // fields at their widest, so it must cover the canonical encoding.
+    let sized = unsigned_tx_rlp_len(8453, calldata_len);
+    assert!(
+        sized >= real_tx.len(),
+        "tx-size estimate ({sized}) must cover the canonical tx size ({})",
+        real_tx.len()
+    );
     let real_fee = oracle
         .getL1Fee(Bytes::from(real_tx))
         .call()
@@ -146,9 +148,9 @@ async fn upper_bound_prices_above_compressible_and_representative_txs() {
         .expect("getL1Fee(real tx) succeeds");
 
     // The bound uses the full unsigned tx size (envelope included), not the
-    // bare calldata length.
+    // bare calldata length, and the same chain id the bot runs on.
     let bound_fee = oracle
-        .getL1FeeUpperBound(U256::from(unsigned_tx_rlp_len(calldata_len)))
+        .getL1FeeUpperBound(U256::from(unsigned_tx_rlp_len(8453, calldata_len)))
         .call()
         .await
         .expect("getL1FeeUpperBound succeeds");

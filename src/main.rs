@@ -92,6 +92,12 @@ struct VenueCache {
     /// extra RPC calls. When `false`, all Flashblock layers fall back to
     /// sealed-block behavior regardless of the requested env flags.
     flashblocks_available: bool,
+    /// Chain ID of the connected provider, resolved once at startup. Feeds
+    /// the L1 fee's unsigned-transaction-size estimate (its minimal RLP
+    /// width depends on the chain: Base mainnet 8453 → 2 bytes, Base
+    /// Sepolia 84532 → 3 bytes), so deployments on non-Base chains still
+    /// price the larger transaction instead of assuming a 2-byte ID.
+    chain_id: u64,
 }
 
 impl VenueCache {
@@ -218,6 +224,7 @@ impl VenueCache {
                 }
             }
         }
+        let chain_id = provider.get_chain_id().await?;
         Ok(Self {
             pair_tokens,
             v2_idx,
@@ -232,6 +239,7 @@ impl VenueCache {
             signer,
             owner_checked_at: std::time::Instant::now(),
             flashblocks_available,
+            chain_id,
             pending: StateStore::new(),
         })
     }
@@ -1239,6 +1247,7 @@ where
         &leg1_requests,
         &leg1_v4_requests,
         block,
+        cache.chain_id,
         EXECUTE_CALLDATA_LEN,
     )
     .await?;
@@ -2020,6 +2029,7 @@ mod pool_event_tests {
             signer: Address::ZERO,
             owner_checked_at: std::time::Instant::now(),
             flashblocks_available: false,
+            chain_id: 8453,
         }
     }
 

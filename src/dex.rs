@@ -565,8 +565,8 @@ fn rlp_list_len(payload_len: usize) -> usize {
 }
 
 /// Conservative full size (bytes) of the unsigned EIP-1559 transaction the
-/// bot broadcasts for `execute(...)` when the contract calldata is
-/// `calldata_len` bytes.
+/// bot broadcasts for `execute(...)` on `chain_id`, when the contract
+/// calldata is `calldata_len` bytes.
 ///
 /// The GasPriceOracle's `getL1FeeUpperBound(uint256)` prices a *complete*
 /// unsigned RLP-encoded transaction (it adds the 68-byte frame itself), so
@@ -583,22 +583,25 @@ fn rlp_list_len(payload_len: usize) -> usize {
 /// upper bound on the actual transaction; `getL1FeeUpperBound` then applies
 /// its own FastLZ worst-case (≈99.99% of transactions). Together these keep
 /// the net-profit gate honest without depending on knowing the signed
-/// payload ahead of broadcast.
-pub fn unsigned_tx_rlp_len(calldata_len: usize) -> usize {
+/// payload ahead of broadcast. The chain ID's *minimal* encoded width is
+/// derived from the actual `chain_id` (Base mainnet 8453 → 2 bytes, Base
+/// Sepolia 84532 → 3 bytes, Ethereum 1 → 1 byte), so deployments on wider
+/// chain IDs still price the larger transaction.
+pub fn unsigned_tx_rlp_len(chain_id: u64, calldata_len: usize) -> usize {
     // EIP-1559 unsigned fields (nine), in order. Widths are upper bounds:
-    // Base chain id 8453 → 2 bytes; nonce/tip/fee/gas/value are priced at
-    // their 8-byte ceiling; `to` is a 20-byte address; access list is empty
-    // (`0xc0`, 1 byte).
+    // the chain ID uses its minimal big-endian width (computed below);
+    // nonce/tip/fee/gas/value are priced at their 8-byte ceiling; `to` is a
+    // 20-byte address; access list is empty (`0xc0`, 1 byte).
     let fields = [
-        rlp_string_len(2),            // chainId  (8453)
-        rlp_string_len(8),            // nonce
-        rlp_string_len(8),            // maxPriorityFeePerGas
-        rlp_string_len(8),            // maxFeePerGas
-        rlp_string_len(8),            // gasLimit
-        rlp_string_len(20),           // to
-        rlp_string_len(8),            // value
-        rlp_string_len(calldata_len), // data
-        rlp_string_len(1),            // accessList (empty → 0xc0)
+        rlp_string_len(rlp_width(chain_id as usize)), // chainId (minimal width)
+        rlp_string_len(8),                            // nonce
+        rlp_string_len(8),                            // maxPriorityFeePerGas
+        rlp_string_len(8),                            // maxFeePerGas
+        rlp_string_len(8),                            // gasLimit
+        rlp_string_len(20),                           // to
+        rlp_string_len(8),                            // value
+        rlp_string_len(calldata_len),                 // data
+        rlp_string_len(1),                            // accessList (empty → 0xc0)
     ];
     let payload: usize = fields.iter().sum();
     1 /* EIP-1559 type byte 0x02 */ + rlp_list_len(payload)
@@ -665,7 +668,8 @@ pub struct QuoteRequest {
 
 /// Per-scan bundle of everything the bot needs from the chain, fetched in
 /// ONE JSON-RPC batch: getReserves per V2/Aero venue, one QuoterV2 call per
-/// requested V3 quote, and the current gas price.
+/// requested V3 quote, the current gas price, and (via the Oracle) the L1
+/// data fee priced over the full unsigned execute transaction.
 pub struct ScanSnapshot {
     /// Raw (reserve0, reserve1) per V2/Aero venue, aligned with the
     /// `v2_venues` slice passed to `fetch_scan_snapshot`. None when that
@@ -794,12 +798,17 @@ fn decode_quote(raw: &Bytes) -> Option<U256> {
 /// carries an explicit block id (Chainstack rejects batch calls without
 /// one); the caller pins the block so this snapshot and any follow-up
 /// quote batch are consistent with each other.
+///
+/// `chain_id` is the connected chain, obtained once by the caller at
+/// startup: its minimal RLP width feeds the L1 fee's unsigned-tx-size
+/// estimate, so the per-scan batch never pays a `eth_chainId` round-trip.
 pub async fn fetch_scan_snapshot<P: Provider>(
     provider: &P,
-    v2_venues: &[Address],      // pair addresses
-    quotes: &[QuoteRequest],    // V3/Slipstream leg-1 quotes
-    v4_quotes: &[QuoteRequest], // V4 leg-1 quotes (separate quoter ABI)
+    v2_venues: &[Address],   // pair addresses
+    quotes: &[QuoteRequest], // V3/Slipstream leg-1 quotes
+    v4_quotes: &[QuoteRequest],
     block: alloy::eips::BlockId,
+    chain_id: u64,
     execute_calldata_len: usize, // worst-case `execute` calldata length; the L1 fee is priced over the full unsigned tx
 ) -> Result<ScanSnapshot> {
     // Reserves + leg quotes ride one Multicall3 aggregate3 (a single RPC
@@ -842,7 +851,7 @@ pub async fn fetch_scan_snapshot<P: Provider>(
     let oracle_addr =
         Address::from_str(unwrap_l1_oracle_addr()).expect("constant L1 oracle address");
     let oracle = IGasPriceOracle::new(oracle_addr, provider);
-    let unsigned_tx_size = unsigned_tx_rlp_len(execute_calldata_len);
+    let unsigned_tx_size = unsigned_tx_rlp_len(chain_id, execute_calldata_len);
     let l1_oracle_calls = [
         (
             oracle_addr,
@@ -1052,8 +1061,9 @@ mod tests {
 
     #[test]
     fn unsigned_tx_rlp_len_is_monotonic_in_calldata() {
-        assert!(unsigned_tx_rlp_len(4) < unsigned_tx_rlp_len(386));
-        assert!(unsigned_tx_rlp_len(386) < unsigned_tx_rlp_len(772));
+        let base = 8453;
+        assert!(unsigned_tx_rlp_len(base, 4) < unsigned_tx_rlp_len(base, 386));
+        assert!(unsigned_tx_rlp_len(base, 386) < unsigned_tx_rlp_len(base, 772));
     }
 
     #[test]
@@ -1062,13 +1072,31 @@ mod tests {
         // nine EIP-1559 fields, and the RLP list wrapper. A bare calldata
         // figure would under-size it by roughly the non-data field/payload
         // overhead (~110 bytes for the 772-byte execute tx).
-        let full = unsigned_tx_rlp_len(0);
-        let with_calldata = unsigned_tx_rlp_len(772);
+        let base = 8453;
+        let full = unsigned_tx_rlp_len(base, 0);
+        let with_calldata = unsigned_tx_rlp_len(base, 772);
         // The empty-calldata size already covers the envelope + fixed
         // fields; adding 772 calldata bytes must move the total by more
         // than the raw bytes alone (the RLP data field prefix grows too).
         assert!(full >= 50, "envelope alone should be non-trivial: {full}");
         assert!(with_calldata > full + 772);
+    }
+
+    #[test]
+    fn unsigned_tx_rlp_len_reflects_chain_id_width() {
+        // The chain ID contributes its minimal big-endian width: 8453 fits
+        // in 2 bytes, 84532 (Base Sepolia) needs 3, 1 (Ethereum) needs 1.
+        // A hardcoded two-byte assumption must not under-price the tx on
+        // chains with wider IDs.
+        let one_byte = unsigned_tx_rlp_len(1, 772);
+        let two_byte = unsigned_tx_rlp_len(8453, 772);
+        let three_byte = unsigned_tx_rlp_len(84532, 772);
+        assert!(one_byte < two_byte, "{one_byte} < {two_byte}");
+        assert!(two_byte < three_byte, "{two_byte} < {three_byte}");
+        // Each extra chain-ID byte enlarges the payload by exactly the RLP
+        // string prefix + the byte itself.
+        assert_eq!(two_byte - one_byte, 1);
+        assert_eq!(three_byte - two_byte, 1);
     }
 
     #[test]
