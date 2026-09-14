@@ -1239,6 +1239,7 @@ where
         &leg1_requests,
         &leg1_v4_requests,
         block,
+        EXECUTE_CALLDATA_LEN,
     )
     .await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
@@ -1246,11 +1247,11 @@ where
     // L1 data-fee term (audit #1): Base is a rollup, so the REAL per-tx cost
     // is `gas_used * gas_price` (L2 execution, what eth_gasPrice and
     // eth_estimateGas report) PLUS an L1 data fee for publishing the calldata
-    // to Ethereum. The snapshot read all four oracle inputs (`l1BaseFee`,
-    // `l1BlobBaseFee`, both scalars) in the same batch; estimate the L1 term
-    // from the size of an `execute` payload. Gas is paid in ETH and config
-    // enforces loan_token == wrapped_native, so the wei value is directly
-    // comparable to profit in loan-token units.
+    // to Ethereum. The snapshot asks the GasPriceOracle's `getL1Fee(bytes)`
+    // directly for a worst-case `execute` payload, so the snapshot's
+    // `l1_fee_wei` is the priced fee (no off-chain formula). Gas is paid in
+    // ETH and config enforces loan_token == wrapped_native, so the wei value
+    // is directly comparable to profit in loan-token units.
     //
     // A missing oracle read (transient RPC error, unsupported predeploy) is
     // NOT silently priced as zero: every broadcast tx still incurs the L1
@@ -1258,10 +1259,7 @@ where
     // input is unavailable and let unprofitable trades through or build a
     // minProfit that does not clear the real L1 charge. The block is skipped
     // instead (the scan backoff path handles the resulting error).
-    let Some(l1_fee) = snapshot
-        .l1_fee
-        .map(|o| morpho_arbitrage_bot::dex::l1_data_fee_estimate(&o, EXECUTE_CALLDATA_LEN))
-    else {
+    let Some(l1_fee) = snapshot.l1_fee.map(|o| o.l1_fee_wei) else {
         warn!(
             block = ?block,
             "L1 data-fee oracle snapshot unavailable; skipping scan block"
