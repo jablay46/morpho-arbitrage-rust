@@ -380,6 +380,10 @@ where
     // (audit finding #2). The L1 data fee is accounted separately in the
     // caller's gas/profit math, not inside the gas limit.
     let fee_est = admin::estimate_eip1559_fees(&provider).await?;
+    // Alloy's estimator and `TransactionRequest` fee fields are `u128`, so
+    // the broadcast tx can carry fees wider than eight bytes; the L1 oracle
+    // size estimate (`unsigned_tx_rlp_len`) reserves 16 payload bytes for
+    // each fee field to stay a true upper bound on that tx.
     // The gas estimate must run `from` the signing wallet: `execute` is
     // `onlyOwner`, so without the sender the estimation uses the RPC default
     // and reverts `NotOwner` before the wallet-backed broadcast can happen.

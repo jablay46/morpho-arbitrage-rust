@@ -45,12 +45,19 @@ alloy::sol! {
 /// transaction (type byte + RLP list) with correct short *and* long RLP
 /// length prefixes.
 fn eip1559_unsigned_tx(calldata: &[u8]) -> Vec<u8> {
+    eip1559_unsigned_tx_with_fees(calldata, 1_000_000, 50_000_000)
+}
+
+/// Like [`eip1559_unsigned_tx`] but with explicit fee fields, so the
+/// test can probe fee values wider than eight bytes (u128 fees in Alloy's
+/// estimator/`TransactionRequest`).
+fn eip1559_unsigned_tx_with_fees(calldata: &[u8], tip: u128, fee: u128) -> Vec<u8> {
     let tx = TxEip1559 {
         chain_id: 8453,
         nonce: 0,
         gas_limit: 400_000,
-        max_fee_per_gas: 50_000_000,
-        max_priority_fee_per_gas: 1_000_000,
+        max_fee_per_gas: fee,
+        max_priority_fee_per_gas: tip,
         to: TxKind::Call(Address::from_str(CONTRACT).unwrap()),
         value: U256::ZERO,
         access_list: AccessList::default(),
@@ -140,6 +147,14 @@ async fn upper_bound_prices_above_compressible_and_representative_txs() {
         sized >= real_tx.len(),
         "tx-size estimate ({sized}) must cover the canonical tx size ({})",
         real_tx.len()
+    );
+    // Alloy fees are u128: a canonical tx with both fee fields wider than
+    // eight bytes must still be covered (per-field 16-byte ceiling).
+    let wide_fee_tx = eip1559_unsigned_tx_with_fees(&calldata, u128::MAX, u128::MAX);
+    assert!(
+        sized >= wide_fee_tx.len(),
+        "tx-size estimate ({sized}) must cover a u128-fee tx ({})",
+        wide_fee_tx.len()
     );
     let real_fee = oracle
         .getL1Fee(Bytes::from(real_tx))

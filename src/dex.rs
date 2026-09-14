@@ -578,26 +578,30 @@ fn rlp_list_len(payload_len: usize) -> usize {
 /// representative random tx priced 6.8× higher than the 0xFF probe on live
 /// Base.
 ///
-/// Scalar fields use their maximal reasonable width (8 bytes each) instead
-/// of today's small nonce/priority fee/gas, so the returned size is an
-/// upper bound on the actual transaction; `getL1FeeUpperBound` then applies
-/// its own FastLZ worst-case (≈99.99% of transactions). Together these keep
-/// the net-profit gate honest without depending on knowing the signed
-/// payload ahead of broadcast. The chain ID's *minimal* encoded width is
-/// derived from the actual `chain_id` (Base mainnet 8453 → 2 bytes, Base
-/// Sepolia 84532 → 3 bytes, Ethereum 1 → 1 byte), so deployments on wider
-/// chain IDs still price the larger transaction.
+/// Scalar fields use their maximal reasonable width instead of today's small
+/// nonce/priority fee/gas values, so the returned size is an upper bound on
+/// the actual transaction: the EIP-1559 fee fields are `u128` in Alloy's
+/// estimator and `TransactionRequest` (so up to 16 payload bytes), while the
+/// `u64` nonce and gas limit stay at their 8-byte ceiling. Calling
+/// `getL1FeeUpperBound` then applies its own FastLZ worst-case (≈99.99% of
+/// transactions). Together these keep the net-profit gate honest without
+/// depending on knowing the signed payload ahead of broadcast. The chain
+/// ID's *minimal* encoded width is derived from the actual `chain_id` (Base
+/// mainnet 8453 → 2 bytes, Base Sepolia 84532 → 3 bytes, Ethereum 1 → 1
+/// byte), so deployments on wider chain IDs still price the larger
+/// transaction.
 pub fn unsigned_tx_rlp_len(chain_id: u64, calldata_len: usize) -> usize {
     // EIP-1559 unsigned fields (nine), in order. Widths are upper bounds:
     // the chain ID uses its minimal big-endian width (computed below);
-    // nonce/tip/fee/gas/value are priced at their 8-byte ceiling; `to` is a
-    // 20-byte address; access list is empty (`0xc0`, 1 byte).
+    // maxPriorityFeePerGas/maxFeePerGas are u128 in Alloy, so priced at
+    // their 16-byte ceiling; nonce and gasLimit are u64 → 8 bytes; `to` is
+    // a 20-byte address; access list is empty (`0xc0`, 1 byte).
     let fields = [
         rlp_string_len(rlp_width(chain_id as usize)), // chainId (minimal width)
-        rlp_string_len(8),                            // nonce
-        rlp_string_len(8),                            // maxPriorityFeePerGas
-        rlp_string_len(8),                            // maxFeePerGas
-        rlp_string_len(8),                            // gasLimit
+        rlp_string_len(8),                            // nonce (u64)
+        rlp_string_len(16),                           // maxPriorityFeePerGas (u128)
+        rlp_string_len(16),                           // maxFeePerGas (u128)
+        rlp_string_len(8),                            // gasLimit (u64)
         rlp_string_len(20),                           // to
         rlp_string_len(8),                            // value
         rlp_string_len(calldata_len),                 // data
@@ -1097,6 +1101,38 @@ mod tests {
         // string prefix + the byte itself.
         assert_eq!(two_byte - one_byte, 1);
         assert_eq!(three_byte - two_byte, 1);
+    }
+
+    #[test]
+    fn unsigned_tx_rlp_len_covers_wide_fee_fields() {
+        use alloy::consensus::{SignableTransaction, TxEip1559};
+        use alloy::eips::eip2930::AccessList;
+        use alloy::primitives::{Bytes, TxKind};
+
+        // Alloy's estimator and TransactionRequest carry u128 fees, so a fee
+        // above u64::MAX needs 9+ RLP payload bytes — more than an 8-byte
+        // reservation would price. The size estimate must still cover the
+        // canonical encoding of a tx with both fee fields at u128::MAX.
+        let max_fee = u128::MAX;
+        let tx = TxEip1559 {
+            chain_id: 8453,
+            nonce: 0,
+            gas_limit: 400_000,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: max_fee,
+            to: TxKind::Call(Address::from([0x11u8; 20])),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::from(vec![0xABu8; 4]),
+        };
+        let mut buf = Vec::new();
+        tx.encode_for_signing(&mut buf);
+        let sized = unsigned_tx_rlp_len(8453, 4);
+        assert!(
+            sized >= buf.len(),
+            "tx-size estimate ({sized}) must cover a u128-fee tx ({})",
+            buf.len()
+        );
     }
 
     #[test]
