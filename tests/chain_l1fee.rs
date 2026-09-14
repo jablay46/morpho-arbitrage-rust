@@ -52,14 +52,36 @@ fn eip1559_unsigned_tx(calldata: &[u8]) -> Vec<u8> {
 /// test can probe fee values wider than eight bytes (u128 fees in Alloy's
 /// estimator/`TransactionRequest`).
 fn eip1559_unsigned_tx_with_fees(calldata: &[u8], tip: u128, fee: u128) -> Vec<u8> {
+    eip1559_unsigned_tx_with_fields(calldata, tip, fee, 0, 400_000, U256::ZERO)
+}
+
+fn eip1559_unsigned_tx_with_max_fields(calldata: &[u8], tip: u128, fee: u128) -> Vec<u8> {
+    eip1559_unsigned_tx_with_fields(
+        calldata,
+        tip,
+        fee,
+        u64::MAX,
+        u64::MAX,
+        U256::from(u64::MAX),
+    )
+}
+
+fn eip1559_unsigned_tx_with_fields(
+    calldata: &[u8],
+    tip: u128,
+    fee: u128,
+    nonce: u64,
+    gas_limit: u64,
+    value: U256,
+) -> Vec<u8> {
     let tx = TxEip1559 {
         chain_id: 8453,
-        nonce: 0,
-        gas_limit: 400_000,
+        nonce,
+        gas_limit,
         max_fee_per_gas: fee,
         max_priority_fee_per_gas: tip,
         to: TxKind::Call(Address::from_str(CONTRACT).unwrap()),
-        value: U256::ZERO,
+        value,
         access_list: AccessList::default(),
         input: Bytes::from(calldata.to_vec()),
     };
@@ -150,7 +172,7 @@ async fn upper_bound_prices_above_compressible_and_representative_txs() {
     );
     // Alloy fees are u128: a canonical tx with both fee fields wider than
     // eight bytes must still be covered (per-field 16-byte ceiling).
-    let wide_fee_tx = eip1559_unsigned_tx_with_fees(&calldata, u128::MAX, u128::MAX);
+    let wide_fee_tx = eip1559_unsigned_tx_with_max_fields(&calldata, u128::MAX, u128::MAX);
     assert!(
         sized >= wide_fee_tx.len(),
         "tx-size estimate ({sized}) must cover a u128-fee tx ({})",

@@ -1116,12 +1116,12 @@ mod tests {
         let max_fee = u128::MAX;
         let tx = TxEip1559 {
             chain_id: 8453,
-            nonce: 0,
-            gas_limit: 400_000,
+            nonce: u64::MAX,
+            gas_limit: u64::MAX,
             max_fee_per_gas: max_fee,
             max_priority_fee_per_gas: max_fee,
             to: TxKind::Call(Address::from([0x11u8; 20])),
-            value: U256::ZERO,
+            value: U256::from(u64::MAX),
             access_list: AccessList::default(),
             input: Bytes::from(vec![0xABu8; 4]),
         };
