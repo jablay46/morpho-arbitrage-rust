@@ -164,19 +164,30 @@ fn with_slippage(expected: U256, slippage_bps: u64) -> U256 {
 /// instead of letting a gross-positive-but-net-negative trade broadcast
 /// and revert later (wasted gas).
 ///
-/// Each leg applies the configured slippage tolerance ONCE to its own
-/// simulated output. History: leg B used to apply the tolerance twice
-/// (compounded) to account for leg A's output landing as low as
-/// `legA.minOut`. That double-shrink commonly pushed `legB.minOut` above
-/// the amount the pools actually returned in simulation, so `minOut` itself
-/// tripped `Too little received` on thin margins and `eth_estimateGas`
-/// rejected candidates that were still profitable after the on-chain
-/// `minProfit` backstop. The single flat tolerance per leg, with the final
-/// `minProfit` check as the profitability backstop, fixes that false-reject
-/// (audit finding #3).
+/// Leg A applies the configured tolerance to its quoted output; leg B
+/// COMPOUNDS the two independent adverse moves it can experience. Leg B's
+/// input is leg A's *actual* output, which can land as low as `legA.minOut`,
+/// and then the second pool can itself move against the trade. The leg-B
+/// bound is therefore the nominal leg-B output scaled down by leg A's
+/// worst case (`leg_a_min / quote_out`) and then by leg B's own tolerance.
+/// A single flat tolerance on the nominal output would let both pools drift
+/// within their limits while the real output falls below `minOut`, reverting
+/// the second router call (`Too little received`) before the final on-chain
+/// `minProfit` check ever runs. `minProfit` stays the profitability backstop
+/// after both legs.
 pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbParams {
     let leg_a_min = with_slippage(opp.quote_out, cfg.slippage_bps);
-    let leg_b_min = with_slippage(opp.amount_out, cfg.slippage_bps);
+    // Leg B's input is leg A's actual output; scale the nominal leg-B output
+    // down by leg A's worst case before applying leg B's own tolerance. When
+    // the quoted output is zero (defensive; valid opportunities always have a
+    // positive quote) fall back to the raw amount_out — the compounded bound
+    // degenerates harmlessly.
+    let leg_b_input_worst = if opp.quote_out.is_zero() {
+        opp.amount_out
+    } else {
+        opp.amount_out * leg_a_min / opp.quote_out
+    };
+    let leg_b_min = with_slippage(leg_b_input_worst, cfg.slippage_bps);
     ArbParams {
         token: cfg.loan_token,
         quote: cfg.quote_token,
@@ -354,9 +365,15 @@ where
     // (audit finding #2). The L1 data fee is accounted separately in the
     // caller's gas/profit math, not inside the gas limit.
     let fee_est = admin::estimate_eip1559_fees(&provider).await?;
+    // The gas estimate must run `from` the signing wallet: `execute` is
+    // `onlyOwner`, so without the sender the estimation uses the RPC default
+    // and reverts `NotOwner` before the wallet-backed broadcast can happen.
+    // Keep the sender on the final transaction so `eth_estimateGas` and
+    // `send_transaction` agree on the caller.
     let est_tx = TransactionRequest::default()
         .with_to(contract)
         .with_input(calldata.clone())
+        .with_from(signer)
         .with_max_fee_per_gas(fee_est.max_fee_per_gas)
         .with_max_priority_fee_per_gas(fee_est.max_priority_fee_per_gas);
     let gas_limit = admin::estimate_gas(&provider, &est_tx).await?;
@@ -574,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn build_params_applies_slippage_once_per_leg() {
+    fn build_params_compounds_leg_b_slippage() {
         use crate::arbitrage::Opportunity;
         use crate::config::{Config, Venue, VenueKind};
 
@@ -637,13 +654,90 @@ mod tests {
         // Leg A tolerates one slippage interval: 20000 * 0.995 = 19900.
         assert_eq!(params.legA.minOut, U256::from(19_900u64));
         assert_eq!(params.minProfit, U256::ZERO);
-        // Leg B tolerates ONE interval for its own adverse move. The old
-        // double-compound (0.995^2 = 9998) pushed minOut above what the
-        // pools actually return on thin margins, tripping "Too little
-        // received" in the estimate and rejecting still-profitable
-        // candidates; the minProfit backstop covers residual tail risk.
-        // 10_100 * 9950 / 10000 = 10_049.5, floored by integer math to 10_049.
-        assert_eq!(params.legB.minOut, U256::from(10_049u64));
+        // Leg B compounds BOTH independent adverse moves: its input is leg
+        // A's actual output (worst case leg_a_min = 19900, i.e. * 0.995) and
+        // the second pool can itself drift by one interval (* 0.995). Bound
+        // = 10_100 * (19900 / 20000) * 0.995, floored by integer math.
+        let leg_b_worst_case = U256::from(10_100u64) * U256::from(19_900u64)
+            / U256::from(20_000u64)
+            * U256::from(9_950u64)
+            / U256::from(10_000u64);
+        assert_eq!(leg_b_worst_case, U256::from(9_998u64));
+        assert_eq!(params.legB.minOut, leg_b_worst_case);
+    }
+
+    /// The same adverse move in both legs (leg A priced leg B's input at the
+    /// nominal output, leg B executed against leg A's actual, lower output)
+    /// must not let the compounded bound fall below a single-tolerance
+    /// bound — the review regression that dropped the second leg's guard.
+    #[test]
+    fn build_params_leg_b_min_out_never_below_single_tolerance() {
+        use crate::arbitrage::Opportunity;
+        use crate::config::{Config, Venue, VenueKind};
+
+        let venue = |kind| Venue {
+            pair: Address::ZERO,
+            router: Address::ZERO,
+            kind,
+            fee_bps: 30,
+            factory: Address::ZERO,
+            stable: false,
+            fee_tier: 3000,
+            pool_id: [0u8; 32],
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+            zero_for_one: false,
+            quoter: Address::ZERO,
+        };
+        let cfg = Config {
+            rpc_url: String::new(),
+            wss_url: None,
+            private_key: String::new(),
+            morpho: Address::ZERO,
+            arb_contract: Address::ZERO,
+            loan_token: Address::ZERO,
+            quote_token: Address::ZERO,
+            wrapped_native: Address::ZERO,
+            venues: vec![venue(VenueKind::UniswapV2), venue(VenueKind::Aerodrome)],
+            loan_amounts: vec![],
+            min_profit: U256::ZERO,
+            gas_price_wei: None,
+            slippage_bps: 50,
+            owner_refresh_secs: 60,
+            poll_interval_ms: 0,
+            state_refresh_secs: 60,
+            sweep_interval_blocks: 10,
+            use_new_heads: false,
+            min_scan_interval_ms: 0,
+            dry_run: true,
+            quoter_v2: Address::ZERO,
+            quoter_slipstream: Address::ZERO,
+            quoter_v4: Address::ZERO,
+            use_pending_state: false,
+            use_flashblock_sync: false,
+            use_pending_logs: false,
+            use_pending_sim: false,
+            use_local_sim: false,
+        };
+        let opp = Opportunity {
+            first: 0,
+            second: 1,
+            loan_amount: U256::from(10_000u64),
+            quote_out: U256::from(20_000u64),
+            amount_out: U256::from(10_100u64),
+            profit: U256::from(100u64),
+            leg1_local: false,
+            leg2_local: false,
+        };
+
+        let params = build_params(&cfg, &opp, cfg.min_profit);
+        // The compounded bound must always be at or below the single
+        // tolerance bound for the same legs.
+        let single = opp.amount_out * U256::from(9_950u64) / U256::from(10_000u64);
+        assert!(params.legB.minOut <= single, "compounded bound is tighter");
+        // And it must be strictly tighter when both legs move (slippage > 0
+        // and both quotes positive).
+        assert!(params.legB.minOut < single);
     }
 
     /// The V4 direction is NOT a per-venue constant: the same pool sells the

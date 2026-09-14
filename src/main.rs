@@ -1246,19 +1246,31 @@ where
     // L1 data-fee term (audit #1): Base is a rollup, so the REAL per-tx cost
     // is `gas_used * gas_price` (L2 execution, what eth_gasPrice and
     // eth_estimateGas report) PLUS an L1 data fee for publishing the calldata
-    // to Ethereum. The snapshot read `l1BaseFee()` from the OP GasPriceOracle
-    // in the same batch; estimate the L1 term from the size of an `execute`
-    // payload. Gas is paid in ETH and config enforces loan_token ==
-    // wrapped_native, so the wei value is directly comparable to profit in
-    // loan-token units. When the oracle read failed the term is zero and the
-    // accounting degrades to L2-only (documented under-estimate).
-    let l1_fee_loan = snapshot
-        .l1_base_fee
-        .map(|l1| morpho_arbitrage_bot::dex::l1_data_fee_estimate(l1, EXECUTE_CALLDATA_LEN));
-    let l1_fee_loan = l1_fee_loan.unwrap_or(U256::ZERO);
+    // to Ethereum. The snapshot read all four oracle inputs (`l1BaseFee`,
+    // `l1BlobBaseFee`, both scalars) in the same batch; estimate the L1 term
+    // from the size of an `execute` payload. Gas is paid in ETH and config
+    // enforces loan_token == wrapped_native, so the wei value is directly
+    // comparable to profit in loan-token units.
+    //
+    // A missing oracle read (transient RPC error, unsupported predeploy) is
+    // NOT silently priced as zero: every broadcast tx still incurs the L1
+    // data fee, so an absent term would understate cost exactly when the fee
+    // input is unavailable and let unprofitable trades through or build a
+    // minProfit that does not clear the real L1 charge. The block is skipped
+    // instead (the scan backoff path handles the resulting error).
+    let Some(l1_fee) = snapshot
+        .l1_fee
+        .map(|o| morpho_arbitrage_bot::dex::l1_data_fee_estimate(&o, EXECUTE_CALLDATA_LEN))
+    else {
+        warn!(
+            block = ?block,
+            "L1 data-fee oracle snapshot unavailable; skipping scan block"
+        );
+        return Ok(block_number);
+    };
     debug!(
-        l1_base_fee = ?snapshot.l1_base_fee,
-        l1_fee_loan = %l1_fee_loan,
+        l1_base_fee = ?snapshot.l1_fee.map(|o| o.l1_base_fee),
+        l1_fee = %l1_fee,
         "L1 data-fee term for execute calldata"
     );
 
@@ -1601,7 +1613,7 @@ where
         let outcome = if cfg.dry_run {
             const DRY_RUN_GAS_UNITS: u64 = 400_000;
             let l2 = U256::from(DRY_RUN_GAS_UNITS) * gas_price;
-            GasOutcome::Priced(l2 + l1_fee_loan)
+            GasOutcome::Priced(l2 + l1_fee)
         } else {
             // Two-stage build: estimate gas with a provisional params
             // (minProfit barely affects calldata size/gas), then rebuild below
@@ -1677,11 +1689,11 @@ where
                 }
             } {
                 Ok(gas_estimate) => {
-                    let gas_cost = gas_estimate * gas_price + l1_fee_loan;
+                    let gas_cost = gas_estimate * gas_price + l1_fee;
                     debug!(
                         gas_units = ?gas_estimate,
                         gas_price = %gas_price,
-                        l1_fee = %l1_fee_loan,
+                        l1_fee = %l1_fee,
                         gas_cost = %gas_cost,
                         sim_block = ?sim_block,
                         "gas estimate for candidate"
@@ -1722,7 +1734,7 @@ where
     // data fee (audit #4): the contract only sees loan-token balances, so a
     // `minProfit` that covers L2 gas but not the L1 term lets a
     // gross-positive-but-net-negative trade broadcast and revert later
-    // (wasted gas). `gas_cost_loan` already includes `l1_fee_loan`, so the
+    // (wasted gas). `gas_cost_loan` already includes `l1_fee`, so the
     // combined backstop is `min_profit + gas_cost_loan`.
     let onchain_min_profit = cfg.min_profit + gas_cost_loan;
 
@@ -1732,7 +1744,7 @@ where
         loan = %opp.loan_amount,
         gross = %opp.profit,
         gas = %gas_cost_loan,
-        l1_fee = %l1_fee_loan,
+        l1_fee = %l1_fee,
         net = %net_profit,
         "opportunity found"
     );
