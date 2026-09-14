@@ -92,6 +92,12 @@ struct VenueCache {
     /// extra RPC calls. When `false`, all Flashblock layers fall back to
     /// sealed-block behavior regardless of the requested env flags.
     flashblocks_available: bool,
+    /// Chain ID of the connected provider, resolved once at startup. Feeds
+    /// the L1 fee's unsigned-transaction-size estimate (its minimal RLP
+    /// width depends on the chain: Base mainnet 8453 → 2 bytes, Base
+    /// Sepolia 84532 → 3 bytes), so deployments on non-Base chains still
+    /// price the larger transaction instead of assuming a 2-byte ID.
+    chain_id: u64,
 }
 
 impl VenueCache {
@@ -218,6 +224,7 @@ impl VenueCache {
                 }
             }
         }
+        let chain_id = provider.get_chain_id().await?;
         Ok(Self {
             pair_tokens,
             v2_idx,
@@ -232,6 +239,7 @@ impl VenueCache {
             signer,
             owner_checked_at: std::time::Instant::now(),
             flashblocks_available,
+            chain_id,
             pending: StateStore::new(),
         })
     }
@@ -865,10 +873,10 @@ const CL_AUTH_QUOTE_TOLERANCE_BPS: u64 = 25;
 
 /// Upper bound of `execute(ArbParams)` calldata size (selector + 24 ABI
 /// slots). Every candidate's payload is a fixed shape (two SwapLeg, amounts
-/// and addresses), so the L1 data-fee estimate uses this constant instead of
-/// encoding + measuring per candidate — a byte or two of drift in the
-/// dynamic fields changes the L1 term by far less than the estimate's own
-/// conservative margin.
+/// and addresses), so the L1 data-fee snapshot computes the full unsigned
+/// transaction size from this constant instead of encoding + measuring per
+/// candidate — a byte or two of drift in the dynamic fields changes the L1
+/// term by far less than the estimate's own conservative margin.
 const EXECUTE_CALLDATA_LEN: usize = 4 + 24 * 32;
 
 /// True when the preconfirmed `pending` state advanced since the scan
@@ -1239,6 +1247,8 @@ where
         &leg1_requests,
         &leg1_v4_requests,
         block,
+        cache.chain_id,
+        EXECUTE_CALLDATA_LEN,
     )
     .await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
@@ -1246,11 +1256,13 @@ where
     // L1 data-fee term (audit #1): Base is a rollup, so the REAL per-tx cost
     // is `gas_used * gas_price` (L2 execution, what eth_gasPrice and
     // eth_estimateGas report) PLUS an L1 data fee for publishing the calldata
-    // to Ethereum. The snapshot read all four oracle inputs (`l1BaseFee`,
-    // `l1BlobBaseFee`, both scalars) in the same batch; estimate the L1 term
-    // from the size of an `execute` payload. Gas is paid in ETH and config
-    // enforces loan_token == wrapped_native, so the wei value is directly
-    // comparable to profit in loan-token units.
+    // to Ethereum. The snapshot asks the GasPriceOracle's
+    // `getL1FeeUpperBound(unsignedTxSize)` with the conservative full
+    // unsigned `execute` transaction (envelope + calldata), so the
+    // snapshot's `l1_fee_wei` is the priced upper bound (no off-chain
+    // formula). Gas is paid in ETH and config enforces loan_token ==
+    // wrapped_native, so the wei value is directly comparable to profit in
+    // loan-token units.
     //
     // A missing oracle read (transient RPC error, unsupported predeploy) is
     // NOT silently priced as zero: every broadcast tx still incurs the L1
@@ -1258,10 +1270,7 @@ where
     // input is unavailable and let unprofitable trades through or build a
     // minProfit that does not clear the real L1 charge. The block is skipped
     // instead (the scan backoff path handles the resulting error).
-    let Some(l1_fee) = snapshot
-        .l1_fee
-        .map(|o| morpho_arbitrage_bot::dex::l1_data_fee_estimate(&o, EXECUTE_CALLDATA_LEN))
-    else {
+    let Some(l1_fee) = snapshot.l1_fee.map(|o| o.l1_fee_wei) else {
         warn!(
             block = ?block,
             "L1 data-fee oracle snapshot unavailable; skipping scan block"
@@ -2020,6 +2029,7 @@ mod pool_event_tests {
             signer: Address::ZERO,
             owner_checked_at: std::time::Instant::now(),
             flashblocks_available: false,
+            chain_id: 8453,
         }
     }
 
