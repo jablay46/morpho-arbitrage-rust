@@ -523,43 +523,100 @@ pub async fn fetch_reserves<P: Provider>(
 }
 
 /// Live L1 data-fee snapshot read from the GasPriceOracle predeploy at scan
-/// time. The fee itself comes from the oracle's own `getL1Fee(bytes)` with a
-/// conservative worst-case payload (see [`worst_case_l1_payload`]); the
-/// predeploy applies the current chain's scalar(s), blob-fee blending, and
-/// the transaction frame, so an off-chain re-implementation of the formula
-/// is neither needed nor fork-safe.
+/// time. The fee is priced by the predeploy's own `getL1FeeUpperBound` with a
+/// conservative full unsigned-transaction size (see [`unsigned_tx_rlp_len`]);
+/// the predeploy applies the current chain's scalar(s), the Fjord linear
+/// regression, and the FastLZ upper-bound, so an off-chain re-implementation
+/// of the formula is neither needed nor fork-safe.
 #[derive(Debug, Clone, Copy)]
 pub struct L1FeeOracle {
-    /// L1 data fee (wei) for the worst-case execute payload.
+    /// L1 data fee (wei) for the worst-case execute transaction.
     pub l1_fee_wei: U256,
     /// `l1BaseFee()` — L1 base fee of the latest L1 origin (wei). Logged for
     /// diagnostics; the priced fee is `l1_fee_wei`.
     pub l1_base_fee: U256,
 }
 
-/// Build the conservative worst-case calldata for `getL1Fee`: every byte
-/// non-zero (`0xFF`). GasPriceOracle prices zero calldata bytes at 4 gas
-/// each and non-zero bytes at 16 gas each, so an all-non-zero payload of the
-/// execute upper bound is the maximum the fee can be for that size; the
-/// predeploy adds the 68-byte unsigned-tx frame itself. Pricing the ceiling
-/// keeps the net-profit gate honest when the exact signed payload is not yet
-/// known (signature, nonce, … increase only the frame, which the oracle
-/// already accounts for).
-pub fn worst_case_l1_payload(payload_len: usize) -> Bytes {
-    Bytes::from(vec![0xFF; payload_len])
+/// Number of bytes needed to store `v` in minimal big-endian form.
+fn rlp_width(v: usize) -> usize {
+    let bits = usize::BITS - v.leading_zeros();
+    (bits as usize).div_ceil(8)
+}
+
+/// RLP length of a byte string holding `len` bytes, encoded as an RLP
+/// string. A 1-byte value is conservatively priced as `0x81 || byte` (2
+/// bytes) even when the byte is < 0x80 and could be encoded in a single
+/// byte; this only over-estimates the size, which is the safe direction.
+fn rlp_string_len(len: usize) -> usize {
+    match len {
+        0 => 1,                    // 0x80
+        1 => 2,                    // 0x81 || byte
+        n if n <= 55 => 1 + n,     // 0x80+n || bytes
+        n => 1 + rlp_width(n) + n, // long string prefix
+    }
+}
+
+/// RLP length of a list whose payload is `payload_len` bytes.
+fn rlp_list_len(payload_len: usize) -> usize {
+    match payload_len {
+        n if n <= 55 => 1 + n,     // 0xc0+n || payload
+        n => 1 + rlp_width(n) + n, // long list prefix
+    }
+}
+
+/// Conservative full size (bytes) of the unsigned EIP-1559 transaction the
+/// bot broadcasts for `execute(...)` when the contract calldata is
+/// `calldata_len` bytes.
+///
+/// The GasPriceOracle's `getL1FeeUpperBound(uint256)` prices a *complete*
+/// unsigned RLP-encoded transaction (it adds the 68-byte frame itself), so
+/// the size passed in must be the full transaction — the type byte plus the
+/// RLP list of the nine EIP-1559 fields — not just the calldata. Feeding it
+/// a plain calldata length would price ~110 bytes too few, and feeding it
+/// repeated bytes (the old `getL1Fee(0xFF…)` probe) is *not* an upper bound
+/// under Fjord pricing because FastLZ compresses repeated bytes: a
+/// representative random tx priced 6.8× higher than the 0xFF probe on live
+/// Base.
+///
+/// Scalar fields use their maximal reasonable width (8 bytes each) instead
+/// of today's small nonce/priority fee/gas, so the returned size is an
+/// upper bound on the actual transaction; `getL1FeeUpperBound` then applies
+/// its own FastLZ worst-case (≈99.99% of transactions). Together these keep
+/// the net-profit gate honest without depending on knowing the signed
+/// payload ahead of broadcast.
+pub fn unsigned_tx_rlp_len(calldata_len: usize) -> usize {
+    // EIP-1559 unsigned fields (nine), in order. Widths are upper bounds:
+    // Base chain id 8453 → 2 bytes; nonce/tip/fee/gas/value are priced at
+    // their 8-byte ceiling; `to` is a 20-byte address; access list is empty
+    // (`0xc0`, 1 byte).
+    let fields = [
+        rlp_string_len(2),            // chainId  (8453)
+        rlp_string_len(8),            // nonce
+        rlp_string_len(8),            // maxPriorityFeePerGas
+        rlp_string_len(8),            // maxFeePerGas
+        rlp_string_len(8),            // gasLimit
+        rlp_string_len(20),           // to
+        rlp_string_len(8),            // value
+        rlp_string_len(calldata_len), // data
+        rlp_string_len(1),            // accessList (empty → 0xc0)
+    ];
+    let payload: usize = fields.iter().sum();
+    1 /* EIP-1559 type byte 0x02 */ + rlp_list_len(payload)
 }
 
 sol! {
-    /// OP-Stack GasPriceOracle predeploy: `getL1Fee(bytes)` prices an
-    /// unsigned tx's calldata end-to-end (returns the L1 data fee in wei),
-    /// and `l1BaseFee()` exposes the current L1 base fee for diagnostics.
-    /// The scalar/blob getters reverted on Base mainnet (they are only
+    /// OP-Stack GasPriceOracle predeploy: `getL1FeeUpperBound(uint256)`
+    /// prices a complete unsigned RLP-encoded transaction by size (Fjord;
+    /// assumes the FastLZ worst case, so it is a true upper bound), and
+    /// `l1BaseFee()` exposes the current L1 base fee for diagnostics. The
+    /// scalar/blob getters reverted on Base mainnet (they are only
     /// implemented in the Bedrock-era `l1BaseFeeScalar`/`l1BlobBaseFeeScalar`
     /// forms on *other* OP-Stack chains), so they are NOT read here —
-    /// `getL1Fee` is the single, universally-deployed pricing entry point.
+    /// `getL1FeeUpperBound` is the single pricing entry point on any Fjord
+    /// chain.
     #[sol(rpc)]
     interface IGasPriceOracle {
-        function getL1Fee(bytes calldata _data) external view returns (uint256);
+        function getL1FeeUpperBound(uint256 _unsignedTxSize) external view returns (uint256);
         function l1BaseFee() external view returns (uint256);
     }
 }
@@ -630,12 +687,12 @@ pub struct ScanSnapshot {
     /// exact same chain state.
     pub pinned_block: Option<u64>,
     /// L1 data-fee snapshot read from the GasPriceOracle at the same block:
-    /// `l1_fee_wei` is the priced fee for the worst-case execute payload and
-    /// `l1_base_fee` is the diagnostic base fee. `None` when the oracle call
-    /// reverted/failed (or the predeploy is absent): a missing L1 term could
-    /// understate cost, so the whole snapshot is `None` and callers
-    /// conservatively skip the block instead of silently degrading to
-    /// L2-only accounting.
+    /// `l1_fee_wei` is the priced fee for the worst-case (largest) unsigned
+    /// execute transaction and `l1_base_fee` is the diagnostic base fee.
+    /// `None` when the oracle call reverted/failed (or the predeploy is
+    /// absent): a missing L1 term could understate cost, so the whole
+    /// snapshot is `None` and callers conservatively skip the block instead
+    /// of silently degrading to L2-only accounting.
     pub l1_fee: Option<L1FeeOracle>,
 }
 
@@ -743,7 +800,7 @@ pub async fn fetch_scan_snapshot<P: Provider>(
     quotes: &[QuoteRequest],    // V3/Slipstream leg-1 quotes
     v4_quotes: &[QuoteRequest], // V4 leg-1 quotes (separate quoter ABI)
     block: alloy::eips::BlockId,
-    execute_payload_len: usize, // worst-case `execute` calldata length for the L1 fee probe
+    execute_calldata_len: usize, // worst-case `execute` calldata length; the L1 fee is priced over the full unsigned tx
 ) -> Result<ScanSnapshot> {
     // Reserves + leg quotes ride one Multicall3 aggregate3 (a single RPC
     // request regardless of venue/size count); eth_gasPrice is not an
@@ -773,23 +830,26 @@ pub async fn fetch_scan_snapshot<P: Provider>(
     }
     // The L1 oracle lives on the same chain the bot runs on (Base: 0x420000
     // ...0x0F prefixed contract). Price the fee through the predeploy's
-    // `getL1Fee(bytes)` with the worst-case execute payload inside the SAME
-    // aggregate3 batch, so the fee snapshot costs zero extra round-trips on
-    // a Flashblock latency budget. The scalar/blob getters are deliberately
-    // NOT read: on Base mainnet they revert, forcing the fee snapshot to
-    // `None` and skipping every scan (see the `IGasPriceOracle` comment).
-    // Counting per-call: only sent requests consume a result slot (a V4
-    // request skipped for out-of-range uint128 is not sent), so the two
-    // oracle calls — appended last — decode from the tail of `results` after
+    // `getL1FeeUpperBound(unsignedTxSize)` inside the SAME aggregate3 batch,
+    // so the fee snapshot costs zero extra round-trips on a Flashblock
+    // latency budget. The scalar/blob getters are deliberately NOT read: on
+    // Base mainnet they revert, forcing the fee snapshot to `None` and
+    // skipping every scan (see the `IGasPriceOracle` comment). Counting
+    // per-call: only sent requests consume a result slot (a V4 request
+    // skipped for out-of-range uint128 is not sent), so the two oracle calls
+    // — appended last — decode from the tail of `results` after
     // reserves/quotes.
     let oracle_addr =
         Address::from_str(unwrap_l1_oracle_addr()).expect("constant L1 oracle address");
     let oracle = IGasPriceOracle::new(oracle_addr, provider);
-    let worst_case_payload = worst_case_l1_payload(execute_payload_len);
+    let unsigned_tx_size = unsigned_tx_rlp_len(execute_calldata_len);
     let l1_oracle_calls = [
         (
             oracle_addr,
-            oracle.getL1Fee(worst_case_payload).calldata().clone(),
+            oracle
+                .getL1FeeUpperBound(U256::from(unsigned_tx_size))
+                .calldata()
+                .clone(),
         ),
         (oracle_addr, oracle.l1BaseFee().calldata().clone()),
     ];
@@ -895,15 +955,15 @@ pub async fn fetch_scan_snapshot<P: Provider>(
     }
 
     // The last two result slots are the L1 oracle reads. aggregate3 lets a
-    // sub-call revert independently; the priced fee (`getL1Fee`) is
-    // mandatory — silently degrading to L2-only accounting (zero L1 fee)
+    // sub-call revert independently; the priced fee (`getL1FeeUpperBound`)
+    // is mandatory — silently degrading to L2-only accounting (zero L1 fee)
     // would let candidates through at understated cost exactly when fee
     // data is unavailable, so any failure makes the whole L1 snapshot None.
     // `l1BaseFee` is diagnostic; its loss alone does not fail the snapshot.
     let mut l1_fee = None;
     match (outcomes.next(), outcomes.next()) {
         (Some(Ok(fee_raw)), base_raw) => {
-            if let Ok(fee) = IGasPriceOracle::getL1FeeCall::abi_decode_returns(&fee_raw) {
+            if let Ok(fee) = IGasPriceOracle::getL1FeeUpperBoundCall::abi_decode_returns(&fee_raw) {
                 let l1_base_fee = match base_raw {
                     Some(Ok(raw)) => IGasPriceOracle::l1BaseFeeCall::abi_decode_returns(&raw)
                         .unwrap_or(U256::ZERO),
@@ -987,16 +1047,28 @@ pub async fn fetch_cl_pair_tokens<P: Provider>(provider: &P, pool: Address) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{n128, quote_calldata, worst_case_l1_payload, L1FeeOracle};
+    use super::{n128, quote_calldata, unsigned_tx_rlp_len, L1FeeOracle};
     use alloy::primitives::{Address, U256};
 
     #[test]
-    fn worst_case_l1_payload_is_all_nonzero_of_requested_len() {
-        let p = worst_case_l1_payload(4);
-        assert_eq!(p.len(), 4);
-        assert!(p.iter().all(|&b| b == 0xFF));
-        let p0 = worst_case_l1_payload(0);
-        assert!(p0.is_empty());
+    fn unsigned_tx_rlp_len_is_monotonic_in_calldata() {
+        assert!(unsigned_tx_rlp_len(4) < unsigned_tx_rlp_len(386));
+        assert!(unsigned_tx_rlp_len(386) < unsigned_tx_rlp_len(772));
+    }
+
+    #[test]
+    fn unsigned_tx_rlp_len_counts_the_full_tx_not_just_calldata() {
+        // The oracle input is the FULL unsigned RLP tx: the type byte, the
+        // nine EIP-1559 fields, and the RLP list wrapper. A bare calldata
+        // figure would under-size it by roughly the non-data field/payload
+        // overhead (~110 bytes for the 772-byte execute tx).
+        let full = unsigned_tx_rlp_len(0);
+        let with_calldata = unsigned_tx_rlp_len(772);
+        // The empty-calldata size already covers the envelope + fixed
+        // fields; adding 772 calldata bytes must move the total by more
+        // than the raw bytes alone (the RLP data field prefix grows too).
+        assert!(full >= 50, "envelope alone should be non-trivial: {full}");
+        assert!(with_calldata > full + 772);
     }
 
     #[test]

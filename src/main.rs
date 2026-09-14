@@ -865,10 +865,10 @@ const CL_AUTH_QUOTE_TOLERANCE_BPS: u64 = 25;
 
 /// Upper bound of `execute(ArbParams)` calldata size (selector + 24 ABI
 /// slots). Every candidate's payload is a fixed shape (two SwapLeg, amounts
-/// and addresses), so the L1 data-fee estimate uses this constant instead of
-/// encoding + measuring per candidate — a byte or two of drift in the
-/// dynamic fields changes the L1 term by far less than the estimate's own
-/// conservative margin.
+/// and addresses), so the L1 data-fee snapshot computes the full unsigned
+/// transaction size from this constant instead of encoding + measuring per
+/// candidate — a byte or two of drift in the dynamic fields changes the L1
+/// term by far less than the estimate's own conservative margin.
 const EXECUTE_CALLDATA_LEN: usize = 4 + 24 * 32;
 
 /// True when the preconfirmed `pending` state advanced since the scan
@@ -1247,11 +1247,13 @@ where
     // L1 data-fee term (audit #1): Base is a rollup, so the REAL per-tx cost
     // is `gas_used * gas_price` (L2 execution, what eth_gasPrice and
     // eth_estimateGas report) PLUS an L1 data fee for publishing the calldata
-    // to Ethereum. The snapshot asks the GasPriceOracle's `getL1Fee(bytes)`
-    // directly for a worst-case `execute` payload, so the snapshot's
-    // `l1_fee_wei` is the priced fee (no off-chain formula). Gas is paid in
-    // ETH and config enforces loan_token == wrapped_native, so the wei value
-    // is directly comparable to profit in loan-token units.
+    // to Ethereum. The snapshot asks the GasPriceOracle's
+    // `getL1FeeUpperBound(unsignedTxSize)` with the conservative full
+    // unsigned `execute` transaction (envelope + calldata), so the
+    // snapshot's `l1_fee_wei` is the priced upper bound (no off-chain
+    // formula). Gas is paid in ETH and config enforces loan_token ==
+    // wrapped_native, so the wei value is directly comparable to profit in
+    // loan-token units.
     //
     // A missing oracle read (transient RPC error, unsupported predeploy) is
     // NOT silently priced as zero: every broadcast tx still incurs the L1
