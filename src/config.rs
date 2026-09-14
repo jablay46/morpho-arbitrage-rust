@@ -438,6 +438,105 @@ impl Config {
         Ok(venues)
     }
 
+    /// Validate one venue; `loan_token`/`quote_token` are the cycle's pair
+    /// (needed for the V4 pool-id cross-check). Shared by `from_env` so the
+    /// same rejections apply to every config source and are unit-testable.
+    fn validate_venue(
+        loan_token: Address,
+        quote_token: Address,
+        idx: usize,
+        venue: &Venue,
+    ) -> Result<()> {
+        if venue.fee_bps >= 10_000 {
+            return Err(eyre!("venue {idx}: fee_bps {} too high", venue.fee_bps));
+        }
+        if venue.kind == VenueKind::Slipstream
+            && !matches!(venue.fee_tier, 1 | 50 | 100 | 200 | 2000)
+        {
+            return Err(eyre!(
+                "venue {idx}: slipstream fee_tier must be a tickSpacing \
+                 in {{1, 50, 100, 200, 2000}}"
+            ));
+        }
+        if venue.pair.is_zero() && venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome {
+            return Err(eyre!("venue {idx}: 'auto' pool requires a factory address"));
+        }
+        // Audit finding #6: Aerodrome stable pools use the x³y+y³x curve,
+        // not the constant-product x·y the bot's off-chain pricing and
+        // local `get_amount_out` replay implement. A stable pool priced
+        // with a constant-product formula diverges from the on-chain price,
+        // minOut ends up too high, and the swap reverts on-chain. The bot
+        // never claims stable-pool support, so reject the configuration up
+        // front rather than letting a wrong price silently produce reverting
+        // opportunities.
+        if venue.kind == VenueKind::Aerodrome && venue.stable {
+            return Err(eyre!(
+                "venue {idx}: Aerodrome stable pools (stable = true) are unsupported; \
+                 the bot only prices constant-product (x*y) pools"
+            ));
+        }
+        if venue.kind == VenueKind::UniswapV4 {
+            // V4 pools are addressed by poolId = keccak256(abi.encode(
+            // PoolKey)), NOT by a factory getPool(Pair) lookup, so the
+            // "auto" resolution path cannot produce one. Reject it here at
+            // validation time with a clear message instead of failing
+            // later inside resolve_pool.
+            if venue.pair.is_zero() {
+                return Err(eyre!(
+                    "venue {idx}: kind 'v4' does not support pair=\"auto\"; \
+                     configure the explicit pool_id (keccak256(abi.encode(PoolKey)))"
+                ));
+            }
+            // tick_spacing must be positive (type int24 on chain; the i32
+            // config keeps negatives representable for clearer errors).
+            if venue.tick_spacing <= 0 || venue.tick_spacing > i32::from(i16::MAX) {
+                return Err(eyre!(
+                    "venue {idx}: v4 tick_spacing must be in 1..=32767, got {}",
+                    venue.tick_spacing
+                ));
+            }
+            // pool_id must be present: the contract needs it to reconstruct
+            // and verify the PoolKey (Uniswap V4 pool ID = keccak256 of the
+            // ABI-encoded PoolKey).
+            if venue.pool_id.iter().all(|&b| b == 0) {
+                return Err(eyre!(
+                    "venue {idx}: kind 'v4' requires a non-zero pool_id \
+                     (keccak256(abi.encode(PoolKey)))"
+                ));
+            }
+            // fee_tier carries the V4 pool fee in hundredths of a bip
+            // (max uint24 on chain).
+            if venue.fee_tier > 0xffffff {
+                return Err(eyre!(
+                    "venue {idx}: v4 fee_tier must fit in uint24, got {}",
+                    venue.fee_tier
+                ));
+            }
+            if venue.fee_tier & 0x800000 != 0 {
+                return Err(eyre!(
+                    "venue {idx}: v4 dynamic-fee pools (0x800000) are unsupported"
+                ));
+            }
+            // The configured pool_id must match the PoolKey the scanner
+            // and the execution contract derive from the cycle pair:
+            // keccak256(abi.encode(currency0, currency1, fee,
+            // tickSpacing, hooks)) with currencies sorted by address. A
+            // nonzero typo would otherwise survive startup, produce
+            // well-formed opportunities, and only revert inside the
+            // contract's pool-id check.
+            let derived = v4_pool_id(loan_token, quote_token, venue);
+            if B256::from(venue.pool_id) != derived {
+                return Err(eyre!(
+                    "venue {idx}: v4 pool_id does not match \
+                     keccak256(abi.encode(PoolKey)); configured {}, derived {}",
+                    B256::from(venue.pool_id),
+                    derived
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_env() -> Result<Self> {
         // ENV_FILE selects an alternate dotenv file (e.g. .env.virtual);
         // unset = default .env lookup, missing file = hard error since the
@@ -524,80 +623,7 @@ impl Config {
             return Err(eyre!("at least two venues required"));
         }
         for (idx, venue) in venues.iter().enumerate() {
-            if venue.fee_bps >= 10_000 {
-                return Err(eyre!("venue {idx}: fee_bps {} too high", venue.fee_bps));
-            }
-            if venue.kind == VenueKind::Slipstream
-                && !matches!(venue.fee_tier, 1 | 50 | 100 | 200 | 2000)
-            {
-                return Err(eyre!(
-                    "venue {idx}: slipstream fee_tier must be a tickSpacing \
-                     in {{1, 50, 100, 200, 2000}}"
-                ));
-            }
-            if venue.pair.is_zero() && venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome
-            {
-                return Err(eyre!("venue {idx}: 'auto' pool requires a factory address"));
-            }
-            if venue.kind == VenueKind::UniswapV4 {
-                // V4 pools are addressed by poolId = keccak256(abi.encode(
-                // PoolKey)), NOT by a factory getPool(Pair) lookup, so the
-                // "auto" resolution path cannot produce one. Reject it here at
-                // validation time with a clear message instead of failing
-                // later inside resolve_pool.
-                if venue.pair.is_zero() {
-                    return Err(eyre!(
-                        "venue {idx}: kind 'v4' does not support pair=\"auto\"; \
-                         configure the explicit pool_id (keccak256(abi.encode(PoolKey)))"
-                    ));
-                }
-                // tick_spacing must be positive (type int24 on chain; the i32
-                // config keeps negatives representable for clearer errors).
-                if venue.tick_spacing <= 0 || venue.tick_spacing > i32::from(i16::MAX) {
-                    return Err(eyre!(
-                        "venue {idx}: v4 tick_spacing must be in 1..=32767, got {}",
-                        venue.tick_spacing
-                    ));
-                }
-                // pool_id must be present: the contract needs it to reconstruct
-                // and verify the PoolKey (Uniswap V4 pool ID = keccak256 of the
-                // ABI-encoded PoolKey).
-                if venue.pool_id.iter().all(|&b| b == 0) {
-                    return Err(eyre!(
-                        "venue {idx}: kind 'v4' requires a non-zero pool_id \
-                         (keccak256(abi.encode(PoolKey)))"
-                    ));
-                }
-                // fee_tier carries the V4 pool fee in hundredths of a bip
-                // (max uint24 on chain).
-                if venue.fee_tier > 0xffffff {
-                    return Err(eyre!(
-                        "venue {idx}: v4 fee_tier must fit in uint24, got {}",
-                        venue.fee_tier
-                    ));
-                }
-                if venue.fee_tier & 0x800000 != 0 {
-                    return Err(eyre!(
-                        "venue {idx}: v4 dynamic-fee pools (0x800000) are unsupported"
-                    ));
-                }
-                // The configured pool_id must match the PoolKey the scanner
-                // and the execution contract derive from the cycle pair:
-                // keccak256(abi.encode(currency0, currency1, fee,
-                // tickSpacing, hooks)) with currencies sorted by address. A
-                // nonzero typo would otherwise survive startup, produce
-                // well-formed opportunities, and only revert inside the
-                // contract's pool-id check.
-                let derived = v4_pool_id(loan_token, quote_token, venue);
-                if B256::from(venue.pool_id) != derived {
-                    return Err(eyre!(
-                        "venue {idx}: v4 pool_id does not match \
-                         keccak256(abi.encode(PoolKey)); configured {}, derived {}",
-                        B256::from(venue.pool_id),
-                        derived
-                    ));
-                }
-            }
+            Self::validate_venue(loan_token, quote_token, idx, venue)?;
         }
 
         let loan_amounts = env::var("LOAN_AMOUNTS")
@@ -659,7 +685,8 @@ impl Config {
             return Err(eyre!("SLIPPAGE_BPS {slippage_bps} too high"));
         }
 
-        let owner_refresh_secs = parse_owner_refresh_secs(env::var("OWNER_REFRESH_SECS").ok().as_deref())?;
+        let owner_refresh_secs =
+            parse_owner_refresh_secs(env::var("OWNER_REFRESH_SECS").ok().as_deref())?;
 
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .ok()
@@ -854,13 +881,39 @@ mod tests {
 
     #[test]
     fn owner_refresh_secs_rejects_malformed_value() {
-        for bad in ["abc", "", "-1", "1.5", " 60", "60 ", "99999999999999999999999"] {
+        for bad in [
+            "abc",
+            "",
+            "-1",
+            "1.5",
+            " 60",
+            "60 ",
+            "99999999999999999999999",
+        ] {
             let err = parse_owner_refresh_secs(Some(bad)).unwrap_err();
             assert!(
                 err.to_string().starts_with("invalid OWNER_REFRESH_SECS"),
                 "unexpected error for {bad:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_aerodrome_stable_pools() {
+        let loan = Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let quote = Address::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        let mut v = venue();
+        v.kind = VenueKind::Aerodrome;
+        v.stable = true;
+        v.factory = Address::from_str("0x420DD381b31aEf6683db6B902084cB0FFECe40Da").unwrap();
+        let err = Config::validate_venue(loan, quote, 0, &v).unwrap_err();
+        assert!(
+            err.to_string().contains("stable pools"),
+            "unexpected error: {err}"
+        );
+        // The same venue with stable=false must validate.
+        v.stable = false;
+        assert!(Config::validate_venue(loan, quote, 0, &v).is_ok());
     }
 
     #[test]

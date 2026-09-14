@@ -262,7 +262,11 @@ impl VenueCache {
             self.owner = onchain_owner;
         }
         if self.owner != self.signer {
-            return Err(OwnershipMismatch { owner: self.owner, signer: self.signer }.into());
+            return Err(OwnershipMismatch {
+                owner: self.owner,
+                signer: self.signer,
+            }
+            .into());
         }
         Ok(())
     }
@@ -790,8 +794,8 @@ where
         }
         last_scan_at = std::time::Instant::now();
         info!(block, reason, "scanning");
-        let outcome = run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight))
-            .await;
+        let outcome =
+            run_once_with_provider(cfg, cache, &provider, broadcaster, Some(inflight)).await;
         if let Err(e) = &outcome {
             if is_ownership_mismatch(e) {
                 // A transferred contract pointed at a foreign key must stop
@@ -858,6 +862,14 @@ fn rpc_backoff_secs(failures: u32) -> u64 {
 /// over bootstrapped tick state; small differences from rounding direction
 /// are normal, but anything past this signals stale/corrupt local state.
 const CL_AUTH_QUOTE_TOLERANCE_BPS: u64 = 25;
+
+/// Upper bound of `execute(ArbParams)` calldata size (selector + 24 ABI
+/// slots). Every candidate's payload is a fixed shape (two SwapLeg, amounts
+/// and addresses), so the L1 data-fee estimate uses this constant instead of
+/// encoding + measuring per candidate — a byte or two of drift in the
+/// dynamic fields changes the L1 term by far less than the estimate's own
+/// conservative margin.
+const EXECUTE_CALLDATA_LEN: usize = 4 + 24 * 32;
 
 /// True when the preconfirmed `pending` state advanced since the scan
 /// snapshotted it. Compares the pending block's HASH (not the sealed block
@@ -1231,6 +1243,25 @@ where
     .await?;
     let gas_price = cfg.gas_price_wei.unwrap_or(snapshot.gas_price);
 
+    // L1 data-fee term (audit #1): Base is a rollup, so the REAL per-tx cost
+    // is `gas_used * gas_price` (L2 execution, what eth_gasPrice and
+    // eth_estimateGas report) PLUS an L1 data fee for publishing the calldata
+    // to Ethereum. The snapshot read `l1BaseFee()` from the OP GasPriceOracle
+    // in the same batch; estimate the L1 term from the size of an `execute`
+    // payload. Gas is paid in ETH and config enforces loan_token ==
+    // wrapped_native, so the wei value is directly comparable to profit in
+    // loan-token units. When the oracle read failed the term is zero and the
+    // accounting degrades to L2-only (documented under-estimate).
+    let l1_fee_loan = snapshot
+        .l1_base_fee
+        .map(|l1| morpho_arbitrage_bot::dex::l1_data_fee_estimate(l1, EXECUTE_CALLDATA_LEN));
+    let l1_fee_loan = l1_fee_loan.unwrap_or(U256::ZERO);
+    debug!(
+        l1_base_fee = ?snapshot.l1_base_fee,
+        l1_fee_loan = %l1_fee_loan,
+        "L1 data-fee term for execute calldata"
+    );
+
     // Assemble leg-1 outputs per venue; V3 quotes come straight from the
     // snapshot, V2 outputs are exact constant-product math on reserves.
     // Each entry keeps its reserves for the local leg-2 computation below.
@@ -1534,16 +1565,6 @@ where
         return Ok(block_number);
     }
 
-    // Pre-broadcast state-advancement guard (second check). Even after the
-    // phase-1→phase-2 check above, a Flashblock may land between then and the
-    // broadcast, so the priced state no longer matches what we'd submit
-    // against. Re-check via the pending block hash; if it advanced, discard
-    // and rescan.
-    if want_pending && pending_state_advanced(provider, scan_pending_hash).await? {
-        info!("pending state advanced during scan; discarding to avoid mixed-state legs");
-        return Ok(block_number);
-    }
-
     // Evaluate candidates top-down by gross, estimating gas for each, then
     // pick the best NET outcome instead of committing to the top-gross one.
     // The old flow locked onto the single max-gross candidate and dropped the
@@ -1579,7 +1600,8 @@ where
         // Morpho flashloan + two router swaps path.
         let outcome = if cfg.dry_run {
             const DRY_RUN_GAS_UNITS: u64 = 400_000;
-            GasOutcome::Priced(U256::from(DRY_RUN_GAS_UNITS) * gas_price)
+            let l2 = U256::from(DRY_RUN_GAS_UNITS) * gas_price;
+            GasOutcome::Priced(l2 + l1_fee_loan)
         } else {
             // Two-stage build: estimate gas with a provisional params
             // (minProfit barely affects calldata size/gas), then rebuild below
@@ -1655,10 +1677,11 @@ where
                 }
             } {
                 Ok(gas_estimate) => {
-                    let gas_cost = gas_estimate * gas_price;
+                    let gas_cost = gas_estimate * gas_price + l1_fee_loan;
                     debug!(
                         gas_units = ?gas_estimate,
                         gas_price = %gas_price,
+                        l1_fee = %l1_fee_loan,
                         gas_cost = %gas_cost,
                         sim_block = ?sim_block,
                         "gas estimate for candidate"
@@ -1695,6 +1718,12 @@ where
         return Ok(block_number);
     };
     let net_profit = opp.profit.saturating_sub(gas_cost_loan);
+    // The on-chain backstop must clear BOTH the L2 execution fee and the L1
+    // data fee (audit #4): the contract only sees loan-token balances, so a
+    // `minProfit` that covers L2 gas but not the L1 term lets a
+    // gross-positive-but-net-negative trade broadcast and revert later
+    // (wasted gas). `gas_cost_loan` already includes `l1_fee_loan`, so the
+    // combined backstop is `min_profit + gas_cost_loan`.
     let onchain_min_profit = cfg.min_profit + gas_cost_loan;
 
     info!(
@@ -1703,6 +1732,7 @@ where
         loan = %opp.loan_amount,
         gross = %opp.profit,
         gas = %gas_cost_loan,
+        l1_fee = %l1_fee_loan,
         net = %net_profit,
         "opportunity found"
     );
@@ -1870,7 +1900,9 @@ where
             broadcaster.clone(),
             cfg.arb_contract,
             params,
+            cache.signer,
             inflight.cloned(),
+            scan_pending_hash,
         )
         .await
     } else {
@@ -2000,9 +2032,15 @@ mod pool_event_tests {
         let pid_b = B256::from([0xbb; 32]);
         let cache = v4_cache(pid_a);
         // Matches the configured venue's pool id.
-        assert!(is_watched_log(&cache, &rpc_log(vec![v4_swap_hash(), pid_a])));
+        assert!(is_watched_log(
+            &cache,
+            &rpc_log(vec![v4_swap_hash(), pid_a])
+        ));
         // A PoolManager Swap for a pool we do NOT watch must NOT fire a scan.
-        assert!(!is_watched_log(&cache, &rpc_log(vec![v4_swap_hash(), pid_b])));
+        assert!(!is_watched_log(
+            &cache,
+            &rpc_log(vec![v4_swap_hash(), pid_b])
+        ));
         // Non-V4 topics (e.g. a V2 Sync on a watched pool address) count.
         let v2_sync = b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
         assert!(is_watched_log(&cache, &rpc_log(vec![v2_sync])));

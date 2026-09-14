@@ -4,6 +4,7 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
+use std::str::FromStr;
 use tracing::{debug, warn};
 
 /// Whether the RPC endpoint exposes Flashblock preconfirmed state via the
@@ -521,6 +522,50 @@ pub async fn fetch_reserves<P: Provider>(
     })
 }
 
+/// Conservative L1 data-fee estimate (in wei) from the oracle's `l1BaseFee`
+/// and the broadcast calldata length. Base is a rollup: a tx's total cost is
+/// `gas_used * gas_price` (L2 execution) PLUS an L1 data fee for publishing
+/// the calldata to Ethereum, derived from `l1BaseFee()`. `eth_gasPrice` /
+/// `eth_estimateGas` see only the L2 part, so any cost accounting that omits
+/// the L1 term understates the real per-tx expense.
+///
+/// Calibration (Base mainnet, GasPriceOracle v1.6.0, Ecotone): a realistic
+/// 772-byte `execute(ArbParams)` tx quoted `getL1Fee` = 551,308,720 wei with
+/// `l1BaseFee` = 43,518,574 wei — 12.7x the base fee total, i.e. ~0.0164x per
+/// calldata byte. We use 0.050x per byte (3x conservative) because the L1
+/// term rides both the L1 base fee and the chain's variation-relative scalar,
+/// and an over-estimate is the safe direction for a net-profit gate. Note
+/// the magnitude: today that is ~1.7 gwei against an L2 execution cost of
+/// 400k×6M ≈ 2.4M gwei — 0.07% — so this only becomes material if L1 blob
+/// fees spike by two orders of magnitude. `getL1Fee(bytes)` is available on
+/// the oracle for an exact quote when one is ever needed.
+pub const L1_FEE_PER_BYTE_PERMILLE: u64 = 50;
+
+/// L1 data-fee estimate in wei for a tx with `calldata_len` payload bytes,
+/// from the snapshot's `l1_base_fee` (in wei). Zero when the oracle read
+/// failed (`l1_base_fee` None) — callers then fall back to L2-only
+/// accounting, a documented under-estimate.
+pub fn l1_data_fee_estimate(l1_base_fee: U256, calldata_len: usize) -> U256 {
+    l1_base_fee * U256::from(calldata_len as u64) * U256::from(L1_FEE_PER_BYTE_PERMILLE)
+        / U256::from(1000)
+}
+
+sol! {
+    /// OP-Stack GasPriceOracle: `l1BaseFee()` returns the current L1 base
+    /// fee in wei (the blob-scaled base fee used to price L1 data).
+    #[sol(rpc)]
+    interface IGasPriceOracle {
+        function l1BaseFee() external view returns (uint256);
+    }
+}
+
+/// Address of the OP-Stack GasPriceOracle (predeploy at 0x420000...0F on
+/// Base and every OP-Stack chain). Returned as a &str so it can be parsed
+/// with `Address::from_str` at the (single) call site.
+fn unwrap_l1_oracle_addr() -> &'static str {
+    "0x420000000000000000000000000000000000000F"
+}
+
 /// One `quoteExactInputSingle` request. The fee tier must be the venue's
 /// actual pool fee — quoting with a different tier prices a different pool.
 /// For Slipstream venues the field carries tickSpacing and the call goes
@@ -579,6 +624,11 @@ pub struct ScanSnapshot {
     /// refreshes are pinned to the same block so every leg prices off the
     /// exact same chain state.
     pub pinned_block: Option<u64>,
+    /// OP-Stack L1 base fee (`l1BaseFee()`) read at the same block, used to
+    /// materialize the L1 data fee a broadcast tx pays on top of its L2
+    /// execution fee. `None` when the oracle call reverts/fails — callers
+    /// then fall back to an L2-only cost (documented under-estimate).
+    pub l1_base_fee: Option<U256>,
 }
 
 /// Checked conversion of a U256 to the V4 Quoter's `exactAmount` uint128.
@@ -681,14 +731,16 @@ fn decode_quote(raw: &Bytes) -> Option<U256> {
 /// quote batch are consistent with each other.
 pub async fn fetch_scan_snapshot<P: Provider>(
     provider: &P,
-    v2_venues: &[Address], // pair addresses
-    quotes: &[QuoteRequest], // V3/Slipstream leg-1 quotes
+    v2_venues: &[Address],      // pair addresses
+    quotes: &[QuoteRequest],    // V3/Slipstream leg-1 quotes
     v4_quotes: &[QuoteRequest], // V4 leg-1 quotes (separate quoter ABI)
     block: alloy::eips::BlockId,
 ) -> Result<ScanSnapshot> {
     // Reserves + leg quotes ride one Multicall3 aggregate3 (a single RPC
     // request regardless of venue/size count); eth_gasPrice is not an
-    // eth_call and goes alongside as its own request.
+    // eth_call and goes alongside as its own request. The L1 data-fee oracle
+    // read is a second eth_call (static) run concurrently so the whole batch
+    // stays one round-trip.
     let v4_calls: Vec<Option<(Address, Bytes)>> = v4_quotes
         .iter()
         .map(|req| quote_calldata(req).map(|cd| (req.quoter, cd)))
@@ -707,14 +759,29 @@ pub async fn fetch_scan_snapshot<P: Provider>(
             quote_calldata(req).expect("v3/slipstream quote encodable"),
         ));
     }
-    for opt in &v4_calls {
-        if let Some((addr, cd)) = opt {
-            calls.push((*addr, cd.clone()));
-        }
+    for (addr, cd) in v4_calls.iter().flatten() {
+        calls.push((*addr, cd.clone()));
     }
-    let (results, gas_price) = futures::join!(
+    // The L1 oracle lives on the same chain the bot runs on (Base: 0x420000
+    // ...0x0F prefixed contract). A failed read is not fatal — callers fall
+    // back to L2-only accounting.
+    let oracle = IGasPriceOracle::new(
+        Address::from_str(unwrap_l1_oracle_addr()).expect("constant L1 oracle address"),
+        provider,
+    );
+    let l1_fee_fut = async {
+        oracle
+            .l1BaseFee()
+            .block(block)
+            .call()
+            .await
+            .ok()
+            .map(U256::from)
+    };
+    let (results, gas_price, l1_base_fee) = futures::join!(
         run_eth_calls(provider, &calls, block),
-        provider.get_gas_price()
+        provider.get_gas_price(),
+        l1_fee_fut,
     );
     let results = results?;
     let gas_price = U256::from(gas_price.map_err(eyre::Error::from)?);
@@ -816,6 +883,7 @@ pub async fn fetch_scan_snapshot<P: Provider>(
         v4_quotes: v4_out,
         gas_price,
         pinned_block: block.as_u64(),
+        l1_base_fee,
     })
 }
 
@@ -874,8 +942,25 @@ pub async fn fetch_cl_pair_tokens<P: Provider>(provider: &P, pool: Address) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{n128, quote_calldata};
+    use super::{l1_data_fee_estimate, n128, quote_calldata};
     use alloy::primitives::{Address, U256};
+
+    #[test]
+    fn l1_fee_estimate_scales_with_basefee_and_length() {
+        // Zero base fee => zero L1 data fee (won't underflow or panic).
+        assert_eq!(l1_data_fee_estimate(U256::ZERO, 0), U256::ZERO);
+        assert_eq!(l1_data_fee_estimate(U256::ZERO, 772), U256::ZERO);
+        // A realistic scan: 772-byte payload, l1BaseFee ≈ 43.5M wei
+        // (Base mainnet, Sep 2026). Estimate = basefee * len * 50/1000.
+        let l1 = U256::from(43_518_574u64);
+        let fee = l1_data_fee_estimate(l1, 772);
+        // 43_518_574 * 772 * 50 / 1000 = 1_679_816_956
+        assert_eq!(fee, U256::from(1_679_816_956u64));
+        // And it must grow linearly with calldata length...
+        assert_eq!(l1_data_fee_estimate(l1, 386), fee / U256::from(2u64));
+        // ...and monotonically with the base fee.
+        assert!(l1_data_fee_estimate(l1 * U256::from(2u64), 772) > fee);
+    }
 
     fn v4_request(amount_in: U256) -> super::QuoteRequest {
         super::QuoteRequest {

@@ -1,12 +1,57 @@
 use crate::arbitrage::Opportunity;
 use crate::config::{Config, Venue};
 use alloy::primitives::aliases::I24;
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, TxHash, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
+
+/// Thin admin helpers over the alloy `Provider` trait used by the executor's
+/// explicit-fill broadcast path (`execute_sync`). Keeping them here (instead
+/// of inlining trait calls) makes the two paths' fee/gas/nonce semantics
+/// identical and unit-testable.
+pub mod admin {
+    use super::*;
+    use alloy::providers::Provider;
+    use alloy::rpc::types::eth::TransactionRequest;
+
+    /// [`Provider::estimate_eip1559_fees`] — named alias so the call site
+    /// reads as a fee ESTIMATION and stays greppable.
+    pub async fn estimate_eip1559_fees<P: Provider>(
+        provider: &P,
+    ) -> eyre::Result<alloy::eips::eip1559::Eip1559Estimation> {
+        provider
+            .estimate_eip1559_fees()
+            .await
+            .map_err(eyre::Error::from)
+    }
+
+    /// [`Provider::estimate_gas`] pinned to the network default block.
+    pub async fn estimate_gas<P: Provider>(
+        provider: &P,
+        tx: &TransactionRequest,
+    ) -> eyre::Result<u64> {
+        provider
+            .estimate_gas(tx.clone())
+            .await
+            .map_err(eyre::Error::from)
+    }
+
+    /// Current nonce of `address` against the `pending` tag — the exact count
+    /// the node would assign our soon-to-be-next tx.
+    pub async fn get_transaction_count<P: Provider>(
+        provider: &P,
+        address: Address,
+    ) -> eyre::Result<u64> {
+        provider
+            .get_transaction_count(address)
+            .block_id(alloy::eips::BlockId::pending())
+            .await
+            .map_err(eyre::Error::from)
+    }
+}
 
 /// Error carrying the account mismatch that made a trade unsafe to broadcast.
 ///
@@ -118,19 +163,20 @@ fn with_slippage(expected: U256, slippage_bps: u64) -> U256 {
 /// so the contract reverts trades that would be unprofitable after gas,
 /// instead of letting a gross-positive-but-net-negative trade broadcast
 /// and revert later (wasted gas).
+///
+/// Each leg applies the configured slippage tolerance ONCE to its own
+/// simulated output. History: leg B used to apply the tolerance twice
+/// (compounded) to account for leg A's output landing as low as
+/// `legA.minOut`. That double-shrink commonly pushed `legB.minOut` above
+/// the amount the pools actually returned in simulation, so `minOut` itself
+/// tripped `Too little received` on thin margins and `eth_estimateGas`
+/// rejected candidates that were still profitable after the on-chain
+/// `minProfit` backstop. The single flat tolerance per leg, with the final
+/// `minProfit` check as the profitability backstop, fixes that false-reject
+/// (audit finding #3).
 pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbParams {
-    // Leg B's input is leg A's *actual* output, which may land as low as
-    // legA.minOut (= quote_out * (1 - s)). Leg B's output then scales down
-    // with it, so a single-slippage bound on `amount_out` would revert on an
-    // independent adverse move in the second pool even though every leg
-    // remains within the configured tolerance and the cycle still clears
-    // minProfit. Apply the tolerance twice on leg B so it compounds; the
-    // final `minProfit` check is the profitability backstop after both legs.
     let leg_a_min = with_slippage(opp.quote_out, cfg.slippage_bps);
-    let leg_b_min = with_slippage(
-        with_slippage(opp.amount_out, cfg.slippage_bps),
-        cfg.slippage_bps,
-    );
+    let leg_b_min = with_slippage(opp.amount_out, cfg.slippage_bps);
     ArbParams {
         token: cfg.loan_token,
         quote: cfg.quote_token,
@@ -273,23 +319,72 @@ where
 /// asynchronous `execute` path — which clears the flag once the tx lands or
 /// fails conclusively. The scan loop resumes immediately, but duplicate
 /// protection stays intact.
+///
+/// `expected_pending_hash`: when the caller scanned preconfirmed `pending`
+/// state, it snapshots the pending block hash the scan was priced against;
+/// this function re-reads the pending hash after the fee/gas/nonce fills
+/// and refuses to broadcast if a Flashblock advanced the state in the
+/// meantime (audit finding #5). `None` disables the check (sealed scans).
 pub async fn execute_sync<P>(
     provider: P,
     contract: Address,
     params: ArbParams,
+    signer: Address,
     inflight: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    expected_pending_hash: Option<B256>,
 ) -> Result<TxHash>
 where
     P: Provider + 'static,
 {
     use alloy::network::TransactionBuilder;
 
-    let tx =
-        TransactionRequest::default()
-            .with_to(contract)
-            .with_input(alloy::primitives::Bytes::from(
-                IFlashArbitrage::executeCall { params }.abi_encode(),
+    let calldata =
+        alloy::primitives::Bytes::from(IFlashArbitrage::executeCall { params }.abi_encode());
+    // The sync submit path must set fee, gas and nonce fields explicitly:
+    // alloy's `send_transaction` on a wallet-enabled provider performs no
+    // automatic fee/gas estimation for a bare `TransactionRequest`, and a
+    // Flashblock race means a tx that fails to include at the current
+    // basefee simply waits — the 200ms synchronous receipt then times out,
+    // the already-broadcast tx staying pending and stalling the nonce while
+    // the next scan is already allowed to broadcast a duplicate (distinct
+    // nonce) that reverts. Estimate EIP-1559 fees + gas exactly like the
+    // fire-and-forget `execute` path does, fill the nonce explicitly so a
+    // re-simulated duplicate can never double-spend, and pad the gas limit
+    // (1.33x) to cover estimation variance between scan and inclusion
+    // (audit finding #2). The L1 data fee is accounted separately in the
+    // caller's gas/profit math, not inside the gas limit.
+    let fee_est = admin::estimate_eip1559_fees(&provider).await?;
+    let est_tx = TransactionRequest::default()
+        .with_to(contract)
+        .with_input(calldata.clone())
+        .with_max_fee_per_gas(fee_est.max_fee_per_gas)
+        .with_max_priority_fee_per_gas(fee_est.max_priority_fee_per_gas);
+    let gas_limit = admin::estimate_gas(&provider, &est_tx).await?;
+    let nonce = admin::get_transaction_count(&provider, signer).await?;
+    // Pre-submit state-advancement guard inside the submit path itself (audit
+    // finding #5). The scan's final guard runs before building the tx, but
+    // fee/gas/nonce estimation between that guard and `.send()` is itself
+    // three RPC round-trips — on a Flashblock endpoint the pending state can
+    // advance within them, and the priced legs would land against a state
+    // they were not priced against. Re-check the pending hash right before
+    // sending and refuse to broadcast when a new Flashblock landed. This
+    // closes the remaining window (guard→submit) that the scan-side guards
+    // cannot see.
+    if let Some(expected) = expected_pending_hash {
+        let current = provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Pending)
+            .await?
+            .map(|b| b.header.hash);
+        if matches!(current, Some(h) if h != expected) {
+            return Err(eyre::eyre!(
+                "pending state advanced during execute_sync fee/gas/nonce fill; \
+                 refusing to broadcast against stale legs"
             ));
+        }
+    }
+    let tx = est_tx
+        .with_gas_limit((gas_limit as f64 * 1.33) as u64)
+        .with_nonce(nonce);
     let pending = provider.send_transaction(tx).await?;
     let tx_hash = *pending.tx_hash();
     tracing::debug!(tx = %tx_hash, "execute_sync: broadcast, awaiting flash receipt");
@@ -479,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn build_params_compounds_slippage_on_leg_b() {
+    fn build_params_applies_slippage_once_per_leg() {
         use crate::arbitrage::Opportunity;
         use crate::config::{Config, Venue, VenueKind};
 
@@ -542,14 +637,13 @@ mod tests {
         // Leg A tolerates one slippage interval: 20000 * 0.995 = 19900.
         assert_eq!(params.legA.minOut, U256::from(19_900u64));
         assert_eq!(params.minProfit, U256::ZERO);
-        // Leg B tolerates two compounded intervals (its own input may drift
-        // down by the leg-A tolerance AND the second pool may move against it
-        // independently): floor(10100 * 0.995^2) = 9998.
-        let expected_b = U256::from(10_100u64) * U256::from(9_950u64) / U256::from(10_000u64)
-            * U256::from(9_950u64)
-            / U256::from(10_000u64);
-        assert_eq!(params.legB.minOut, expected_b);
-        assert_eq!(expected_b, U256::from(9_998u64));
+        // Leg B tolerates ONE interval for its own adverse move. The old
+        // double-compound (0.995^2 = 9998) pushed minOut above what the
+        // pools actually return on thin margins, tripping "Too little
+        // received" in the estimate and rejecting still-profitable
+        // candidates; the minProfit backstop covers residual tail risk.
+        // 10_100 * 9950 / 10000 = 10_049.5, floored by integer math to 10_049.
+        assert_eq!(params.legB.minOut, U256::from(10_049u64));
     }
 
     /// The V4 direction is NOT a per-venue constant: the same pool sells the
@@ -587,7 +681,7 @@ mod tests {
             loan_token: address!("1000000000000000000000000000000000000001"),
             quote_token: address!("2000000000000000000000000000000000000002"),
             wrapped_native: Address::ZERO,
-            venues: vec![v4, v4.clone()],
+            venues: vec![v4, v4],
             loan_amounts: vec![],
             min_profit: U256::ZERO,
             gas_price_wei: None,
