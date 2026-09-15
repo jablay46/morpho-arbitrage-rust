@@ -39,13 +39,17 @@ interface IAerodromeRouter {
     ) external returns (uint256[] memory amounts);
 }
 
+/// Uniswap V3 router on Base is SwapRouter02 (0x2626664c...), NOT the
+/// original SwapRouter: its `ExactInputSingleParams` has SEVEN fields and no
+/// `deadline`. The original eight-field struct (with `deadline`) hashes to
+/// selector 0x414bf389, which the deployed Base router does not implement —
+/// every V3 leg reverted. SwapRouter02's selector is 0x04e45aaf.
 interface IUniswapV3Router {
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24 fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -250,7 +254,9 @@ contract FlashArbitrage {
         _swap(params.legB, params.quote, params.token, quoteOut);
 
         uint256 balAfter = IERC20(params.token).balanceOf(address(this));
-        uint256 profit = balAfter - balBefore;
+        // Saturating subtraction: if trade lost money (balAfter < balBefore),
+        // profit = 0 instead of underflowing (panic 0x11).
+        uint256 profit = balAfter >= balBefore ? balAfter - balBefore : 0;
         if (profit < params.minProfit) revert Unprofitable(profit, params.minProfit);
 
         // Repay: Morpho pulls `assets` back via transferFrom after the callback.
@@ -317,12 +323,14 @@ contract FlashArbitrage {
             return amounts[amounts.length - 1];
         }
         if (leg.kind == KIND_UNISWAP_V3) {
+            // SwapRouter02 params: NO `deadline` field. Adding one changes the
+            // struct hash and selects a function the Base router never
+            // deployed (see IUniswapV3Router).
             IUniswapV3Router.ExactInputSingleParams memory params = IUniswapV3Router.ExactInputSingleParams({
                 tokenIn: from,
                 tokenOut: to,
                 fee: leg.feeTier,
                 recipient: address(this),
-                deadline: block.timestamp,
                 amountIn: amountIn,
                 amountOutMinimum: leg.minOut,
                 sqrtPriceLimitX96: 0
