@@ -328,6 +328,54 @@ contract HardeningTest {
         }
     }
 
+    /// A losing cycle must revert on its own, independent of `minProfit`.
+    /// Clamping the shortfall to zero profit would let `minProfit == 0` pass
+    /// and Morpho would then pull the difference from tokens the contract
+    /// already held.
+    function testLosingCycleRevertsEvenWithZeroMinProfit() public {
+        MintableToken token = new MintableToken();
+        MintableToken quote = new MintableToken();
+        MockV2Router routerA = new MockV2Router();
+        MockV2Router routerB = new MockV2Router();
+        MockMorpho morpho = new MockMorpho();
+        FlashArbitrage arb = new FlashArbitrage(address(morpho));
+        morpho.setArb(address(arb));
+
+        uint256 assets = 1_000_000;
+        uint256 preexisting = 500_000;
+
+        // legB pays back 900,000 for a 1,000,000 loan: a 100,000 loss.
+        routerA.setOutput(1_000_000);
+        routerB.setOutput(900_000);
+        token.mint(address(morpho), assets);
+        token.mint(address(routerB), 900_000);
+        quote.mint(address(routerA), 1_000_000);
+        // Pre-fund the contract so a clamped-to-zero loss would be covered
+        // out of these tokens.
+        token.mint(address(arb), preexisting);
+
+        FlashArbitrage.SwapLeg memory legA = buildLeg(0, address(routerA));
+        FlashArbitrage.SwapLeg memory legB = buildLeg(0, address(routerB));
+
+        vm.expectRevert(
+            abi.encodeWithSignature("LosingTrade(uint256,uint256)", assets + preexisting, assets + preexisting - 100_000)
+        );
+        arb.execute(
+            FlashArbitrage.ArbParams({
+                token: address(token),
+                quote: address(quote),
+                amount: assets,
+                legA: legA,
+                legB: legB,
+                minProfit: 0
+            })
+        );
+
+        // The pre-funded balance is untouched and the loan is still owed.
+        assert(token.balanceOf(address(arb)) == preexisting);
+        assert(token.balanceOf(address(morpho)) == assets);
+    }
+
     // --- Slipstream tickSpacing bounds ---
 
     function testSlipstreamOutOfRangeReverts() public {

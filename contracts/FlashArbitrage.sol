@@ -197,6 +197,7 @@ contract FlashArbitrage {
     error Reentrant();
     error UnknownLegKind(uint8 kind);
     error Unprofitable(uint256 profit, uint256 minProfit);
+    error LosingTrade(uint256 balBefore, uint256 balAfter);
     error ApproveFailed(address token, address spender);
     error TransferFailed(address token, address to);
     error TickSpacingOutOfRange(uint24 feeTier);
@@ -254,9 +255,12 @@ contract FlashArbitrage {
         _swap(params.legB, params.quote, params.token, quoteOut);
 
         uint256 balAfter = IERC20(params.token).balanceOf(address(this));
-        // Saturating subtraction: if trade lost money (balAfter < balBefore),
-        // profit = 0 instead of underflowing (panic 0x11).
-        uint256 profit = balAfter >= balBefore ? balAfter - balBefore : 0;
+        // A cycle that ends below `balBefore` lost money. Revert explicitly
+        // instead of clamping to zero profit: with `minProfit == 0` a clamped
+        // loss would sail past the floor below and Morpho would pull the
+        // shortfall out of tokens the contract already held.
+        if (balAfter < balBefore) revert LosingTrade(balBefore, balAfter);
+        uint256 profit = balAfter - balBefore;
         if (profit < params.minProfit) revert Unprofitable(profit, params.minProfit);
 
         // Repay: Morpho pulls `assets` back via transferFrom after the callback.
