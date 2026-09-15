@@ -132,6 +132,11 @@ library PoolIdLibrary {
  *        a successful trade.
  *      - Added `sweepETH` (native ETH had no recovery path) and a
  *        `ZeroAddress` check on the immutable `morpho` constructor argument.
+ *      - Added a payable `receive()` and a native branch in `_v4Settle`:
+ *        Uniswap V4's `address(0)` currency is native, so a native-output leg
+ *        needs a payable receiver for the manager's ETH `take`, and a
+ *        native-input leg must settle with `settle{value: actualIn}()` rather
+ *        than an ERC20 transfer to `address(0)`.
  */
 contract FlashArbitrage {
     uint8 internal constant KIND_UNISWAP_V2 = 0;
@@ -308,6 +313,12 @@ contract FlashArbitrage {
         _safeTransfer(token, owner, amount);
         emit Swept(token, owner, amount);
     }
+
+    /// Accept native ETH. Uniswap V4's `address(0)` currency is native, so a
+    /// V4 leg's output reaches this contract through the PoolManager's ETH
+    /// `call` and fails without a payable receiver. ETH sent here outside a
+    /// swap (a router value refund) is recoverable via `sweepETH`.
+    receive() external payable {}
 
     /// Rescue native ETH. `sweep` cannot: it always issues an ERC20
     /// `transfer`, so ETH reaching this contract (a Uniswap V4 leg whose
@@ -535,12 +546,24 @@ contract FlashArbitrage {
             address(this),
             amountOut
         );
-        // Settle the input debt: sync snapshots the manager's balance, then
-        // transfer the EXACT input consumed (from the delta, not amountIn — a
-        // price limit or hook may have consumed less) and settle.
-        IUniswapV4PoolManager(manager).sync(zeroForOne ? key.currency0 : key.currency1);
-        IERC20(zeroForOne ? key.currency0 : key.currency1).transfer(manager, actualIn);
-        IUniswapV4PoolManager(manager).settle();
+        // Settle the input debt with the EXACT input consumed (from the
+        // delta, not amountIn — a price limit or hook may have consumed
+        // less). Uniswap V4 identifies native currency as address(0):
+        // the manager credits call value directly, so `sync` is
+        // meaningless there and an ERC20 `transfer` to address(0) reverts.
+        // The native branch therefore requires the contract to already hold
+        // at least `actualIn` ETH (e.g. left over from a native-output leg);
+        // the call reverts otherwise rather than settling short.
+        address inputCurrency = zeroForOne ? key.currency0 : key.currency1;
+        if (inputCurrency == address(0)) {
+            IUniswapV4PoolManager(manager).settle{value: actualIn}();
+        } else {
+            // sync snapshots the manager's balance, then the input is
+            // transferred and `settle` credits the observed difference.
+            IUniswapV4PoolManager(manager).sync(inputCurrency);
+            IERC20(inputCurrency).transfer(manager, actualIn);
+            IUniswapV4PoolManager(manager).settle();
+        }
     }
 
     function _approve(address token, address spender, uint256 amount) internal {

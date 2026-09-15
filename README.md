@@ -585,7 +585,11 @@ Tips produksi:
   setter — deployment salah hanya bisa diperbaiki dengan redeploy).
 - ETH native (mis. dari leg Uniswap V4 yang currency-nya native, atau refund
   value router) bisa ditarik owner dengan `sweepETH()`; `sweep(address)` tidak
-  bisa menanganinya karena selalu memanggil ERC20 `transfer`.
+  bisa menanganinya karena selalu memanggil ERC20 `transfer`. Leg V4 dengan
+  currency native juga benar-benar bisa jalan: kontrak punya `receive()`
+  payable untuk menerima output native dari PoolManager, dan `_v4Settle`
+  melunasi debt native dengan `settle{value: actualIn}()` (bukan transfer
+  ERC20 ke `address(0)`).
 - Pertahanan berlapis: `minOut` per leg → `minProfit` on-chain →
   `eth_estimateGas` sebagai gate simulasi. Kegagalan terburuk adalah rugi gas,
   bukan kehilangan principal (flash loan yang gagal otomatis revert).

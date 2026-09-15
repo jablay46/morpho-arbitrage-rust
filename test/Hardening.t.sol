@@ -105,7 +105,7 @@ contract MockSlipstreamRouter {
 contract MockMorpho {
     FlashArbitrage public arb;
 
-    function setArb(address a) external {
+    function setArb(address payable a) external {
         arb = FlashArbitrage(a);
     }
 
@@ -251,7 +251,7 @@ contract HardeningTest {
         MockV2Router routerB = new MockV2Router();
         MockMorpho morpho = new MockMorpho();
         FlashArbitrage arb = new FlashArbitrage(address(morpho));
-        morpho.setArb(address(arb));
+        morpho.setArb(payable(address(arb)));
 
         uint256 assets = 1_000_000;
 
@@ -308,7 +308,7 @@ contract HardeningTest {
         MockV2Router routerB = new MockV2Router();
         MockMorpho morpho = new MockMorpho();
         FlashArbitrage arb = new FlashArbitrage(address(morpho));
-        morpho.setArb(address(arb));
+        morpho.setArb(payable(address(arb)));
 
         uint256 assets = 1_000_000;
         router.setOutput(1_000_000);
@@ -351,7 +351,7 @@ contract HardeningTest {
         MockV2Router routerB = new MockV2Router();
         MockMorpho morpho = new MockMorpho();
         FlashArbitrage arb = new FlashArbitrage(address(morpho));
-        morpho.setArb(address(arb));
+        morpho.setArb(payable(address(arb)));
 
         uint256 assets = 1_000_000;
         uint256 preexisting = 500_000;
@@ -515,7 +515,7 @@ contract HardeningTest {
         MockV2Router routerB = new MockV2Router();
         MockMorpho morpho = new MockMorpho();
         FlashArbitrage arb = new FlashArbitrage(address(morpho));
-        morpho.setArb(address(arb));
+        morpho.setArb(payable(address(arb)));
 
         routerA.setOutput(1_000_000);
         routerB.setOutput(1_000_000);
