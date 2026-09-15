@@ -39,13 +39,17 @@ interface IAerodromeRouter {
     ) external returns (uint256[] memory amounts);
 }
 
+/// Uniswap V3 router on Base is SwapRouter02 (0x2626664c...), NOT the
+/// original SwapRouter: its `ExactInputSingleParams` has SEVEN fields and no
+/// `deadline`. The original eight-field struct (with `deadline`) hashes to
+/// selector 0x414bf389, which the deployed Base router does not implement —
+/// every V3 leg reverted. SwapRouter02's selector is 0x04e45aaf.
 interface IUniswapV3Router {
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24 fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -193,6 +197,7 @@ contract FlashArbitrage {
     error Reentrant();
     error UnknownLegKind(uint8 kind);
     error Unprofitable(uint256 profit, uint256 minProfit);
+    error LosingTrade(uint256 balBefore, uint256 balAfter);
     error ApproveFailed(address token, address spender);
     error TransferFailed(address token, address to);
     error TickSpacingOutOfRange(uint24 feeTier);
@@ -250,6 +255,11 @@ contract FlashArbitrage {
         _swap(params.legB, params.quote, params.token, quoteOut);
 
         uint256 balAfter = IERC20(params.token).balanceOf(address(this));
+        // A cycle that ends below `balBefore` lost money. Revert explicitly
+        // instead of clamping to zero profit: with `minProfit == 0` a clamped
+        // loss would sail past the floor below and Morpho would pull the
+        // shortfall out of tokens the contract already held.
+        if (balAfter < balBefore) revert LosingTrade(balBefore, balAfter);
         uint256 profit = balAfter - balBefore;
         if (profit < params.minProfit) revert Unprofitable(profit, params.minProfit);
 
@@ -317,12 +327,14 @@ contract FlashArbitrage {
             return amounts[amounts.length - 1];
         }
         if (leg.kind == KIND_UNISWAP_V3) {
+            // SwapRouter02 params: NO `deadline` field. Adding one changes the
+            // struct hash and selects a function the Base router never
+            // deployed (see IUniswapV3Router).
             IUniswapV3Router.ExactInputSingleParams memory params = IUniswapV3Router.ExactInputSingleParams({
                 tokenIn: from,
                 tokenOut: to,
                 fee: leg.feeTier,
                 recipient: address(this),
-                deadline: block.timestamp,
                 amountIn: amountIn,
                 amountOutMinimum: leg.minOut,
                 sqrtPriceLimitX96: 0
