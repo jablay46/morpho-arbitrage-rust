@@ -13,6 +13,7 @@ interface Vm {
 
     function addr(uint256) external returns (address);
     function prank(address) external;
+    function deal(address, uint256) external;
     function expectRevert(bytes calldata) external;
     function recordLogs() external;
     function getRecordedLogs() external returns (Log[] memory);
@@ -115,6 +116,13 @@ contract MockMorpho {
     }
 }
 
+/// A *contract* at the `morpho` address that accepts `flashLoan` but never
+/// calls back. The compiler's extcodesize check passes (it has code), so
+/// without the `CallbackNotInvoked` guard `execute` would be a silent no-op.
+contract SilentMorpho {
+    fallback() external {}
+}
+
 /// Exposes the internal `_swap` so Slipstream bounds behaviour can be tested
 /// without the full Morpho flash-loan flow.
 contract FlashArbitrageHarness is FlashArbitrage {
@@ -132,6 +140,10 @@ contract FlashArbitrageHarness is FlashArbitrage {
 
 contract HardeningTest {
     Vm constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
+
+    /// `sweepETH` pays this test contract (the owner), so it must be able to
+    /// receive native ETH.
+    receive() external payable {}
 
     address constant MOCK_MORPHO = address(0x0000000000000000000000000000000000000a11);
 
@@ -426,5 +438,153 @@ contract HardeningTest {
             if (logs[i].topics[0] == sweepTopic) saw = true;
         }
         assert(saw);
+    }
+
+    // --- Unknown leg kind ---
+
+    /// A `kind` outside 0..4 has no dispatch branch. Without a terminal
+    /// revert the leg returned 0 with the approval already granted, so the
+    /// whole cycle looked like a zero-profit success. It must revert instead.
+    function testUnknownLegKindReverts() public {
+        FlashArbitrageHarness harness = new FlashArbitrageHarness(MOCK_MORPHO);
+        MintableToken token = new MintableToken();
+        MintableToken quote = new MintableToken();
+
+        FlashArbitrage.SwapLeg memory leg = buildLeg(7, address(0x9999));
+
+        vm.expectRevert(abi.encodeWithSignature("UnknownLegKind(uint8)", uint8(7)));
+        harness.harnessSwap(leg, address(token), address(quote), 1_000);
+        // No allowance may be left behind for the abandoned leg.
+        assert(token.allowance(address(harness), address(0x9999)) == 0);
+    }
+
+    /// Every mapped kind must NOT hit the new terminal revert.
+    function testKnownLegKindsDoNotRevertWithUnknownKind() public {
+        FlashArbitrageHarness harness = new FlashArbitrageHarness(MOCK_MORPHO);
+        MockSlipstreamRouter router = new MockSlipstreamRouter();
+        MintableToken token = new MintableToken();
+        MintableToken quote = new MintableToken();
+        token.mint(address(harness), 5_000);
+
+        FlashArbitrage.SwapLeg memory leg = buildLeg(4, address(router));
+        leg.feeTier = 200;
+        // Reverts only if the new tail revert fires; this returns cleanly.
+        assert(harness.harnessSwap(leg, address(token), address(quote), 5_000) == 5_000);
+    }
+
+    // --- Constructor validation ---
+
+    /// `morpho` is immutable and has no setter, so a zero address can never
+    /// be repaired after deployment: reject it at construction.
+    function testConstructorRejectsZeroMorpho() public {
+        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
+        new FlashArbitrage(address(0));
+    }
+
+    // --- Callback verification ---
+
+    /// A `morpho` that has code but never calls back used to make `execute` a
+    /// silent success no-op (no loan, no swap, no revert, gas burned). The
+    /// missing callback must now surface as a revert.
+    function testExecuteRevertsWhenCallbackNeverRuns() public {
+        SilentMorpho silent = new SilentMorpho();
+        FlashArbitrage arb = new FlashArbitrage(address(silent));
+        MintableToken token = new MintableToken();
+
+        FlashArbitrage.SwapLeg memory legA = buildLeg(0, address(0x1111));
+        FlashArbitrage.SwapLeg memory legB = buildLeg(0, address(0x2222));
+
+        vm.expectRevert(abi.encodeWithSignature("CallbackNotInvoked()"));
+        arb.execute(
+            FlashArbitrage.ArbParams({
+                token: address(token),
+                quote: address(token),
+                amount: 1 ether,
+                legA: legA,
+                legB: legB,
+                minProfit: 0
+            })
+        );
+    }
+
+    /// And the real callback path must still clear the flag and complete.
+    function testExecuteSucceedsWhenCallbackRuns() public {
+        MintableToken token = new MintableToken();
+        MintableToken quote = new MintableToken();
+        MockV2Router routerA = new MockV2Router();
+        MockV2Router routerB = new MockV2Router();
+        MockMorpho morpho = new MockMorpho();
+        FlashArbitrage arb = new FlashArbitrage(address(morpho));
+        morpho.setArb(address(arb));
+
+        routerA.setOutput(1_000_000);
+        routerB.setOutput(1_000_000);
+        token.mint(address(morpho), 1_000_000);
+        quote.mint(address(routerA), 1_000_000);
+        token.mint(address(routerB), 1_000_000);
+
+        vm.recordLogs();
+        arb.execute(
+            FlashArbitrage.ArbParams({
+                token: address(token),
+                quote: address(quote),
+                amount: 1_000_000,
+                legA: buildLeg(0, address(routerA)),
+                legB: buildLeg(0, address(routerB)),
+                minProfit: 0
+            })
+        );
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 arbExecuted = keccak256("ArbExecuted(address,address,uint256,uint256)");
+        bool saw;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == arbExecuted) saw = true;
+        }
+        assert(saw);
+    }
+
+    // --- Native ETH recovery ---
+
+    /// ETH can reach the contract (a V4 leg whose currency is native, a router
+    /// value refund) but `sweep` always issues an ERC20 `transfer`, so without
+    /// `sweepETH` native balance was locked forever.
+    function testSweepETHSendsBalanceToOwner() public {
+        FlashArbitrage arb = new FlashArbitrage(MOCK_MORPHO);
+        vm.deal(address(arb), 1 ether);
+
+        uint256 ownerBefore = address(this).balance;
+        vm.recordLogs();
+        arb.sweepETH();
+
+        assert(address(arb).balance == 0);
+        assert(address(this).balance == ownerBefore + 1 ether);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sweepTopic = keccak256("Swept(address,address,uint256)");
+        bool saw;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == sweepTopic) {
+                assert(logs[i].topics[1] == bytes32(0));
+                saw = true;
+            }
+        }
+        assert(saw);
+    }
+
+    function testSweepETHIsOwnerOnly() public {
+        FlashArbitrage arb = new FlashArbitrage(MOCK_MORPHO);
+        vm.deal(address(arb), 1 ether);
+
+        vm.prank(vm.addr(0xbad));
+        vm.expectRevert(abi.encodeWithSignature("NotOwner()"));
+        arb.sweepETH();
+        assert(address(arb).balance == 1 ether);
+    }
+
+    function testSweepETHWithZeroBalanceIsHarmless() public {
+        FlashArbitrage arb = new FlashArbitrage(MOCK_MORPHO);
+        arb.sweepETH();
+        assert(address(arb).balance == 0);
     }
 }
