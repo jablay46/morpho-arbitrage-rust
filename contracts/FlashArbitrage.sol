@@ -214,6 +214,7 @@ contract FlashArbitrage {
     error NotPendingOwner();
     error NotMorpho();
     error Reentrant();
+    error ZeroAddress();
     error UnknownLegKind(uint8 kind);
     error Unprofitable(uint256 profit, uint256 minProfit);
     error LosingTrade(uint256 balBefore, uint256 balAfter);
@@ -226,7 +227,6 @@ contract FlashArbitrage {
     error V4MinOutput(uint256 out, uint256 minOut);
     error V4AmountTooLarge(uint256 amountIn);
     error CallbackNotInvoked();
-    error ZeroAddress();
 
     /// Canonical TickMath bounds, identical for Uniswap V3 and V4. Used as the
     /// unrestricted sqrt price limit in `unlockCallback` (the exact values the
@@ -332,7 +332,15 @@ contract FlashArbitrage {
 
     /// Step 1 of ownership transfer: current owner nominates a successor.
     /// Two-step so a typo'd address can't permanently brick control.
+    ///
+    /// A zero nomination is rejected instead of accepted: it matches the
+    /// OpenZeppelin behaviour every operator expects, catches a typo that
+    /// would otherwise silently clear a legitimate pending transfer, and
+    /// reserves `pendingOwner == address(0)` as the unambiguous "no
+    /// nomination in flight" state shared with the constructor and
+    /// [`acceptOwnership`].
     function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
         pendingOwner = newOwner;
         emit OwnershipTransferStarted(owner, newOwner);
     }
@@ -548,20 +556,28 @@ contract FlashArbitrage {
         );
         // Settle the input debt with the EXACT input consumed (from the
         // delta, not amountIn — a price limit or hook may have consumed
-        // less). Uniswap V4 identifies native currency as address(0):
-        // the manager credits call value directly, so `sync` is
-        // meaningless there and an ERC20 `transfer` to address(0) reverts.
-        // The native branch therefore requires the contract to already hold
-        // at least `actualIn` ETH (e.g. left over from a native-output leg);
-        // the call reverts otherwise rather than settling short.
+        // less). Uniswap V4 identifies native currency as address(0): the
+        // manager credits call value directly, so `sync` is meaningless
+        // there and an ERC20 transfer to address(0) reverts. The native
+        // branch therefore requires the contract to already hold at least
+        // `actualIn` ETH (e.g. left over from a native-output leg); the call
+        // reverts otherwise rather than settling short.
         address inputCurrency = zeroForOne ? key.currency0 : key.currency1;
         if (inputCurrency == address(0)) {
             IUniswapV4PoolManager(manager).settle{value: actualIn}();
         } else {
             // sync snapshots the manager's balance, then the input is
             // transferred and `settle` credits the observed difference.
+            //
+            // `_safeTransfer` (not a bare `transfer`) so a token that fails
+            // without reverting is caught here. A raw `transfer` discards the
+            // returned bool, so a `false`/no-op transfer would leave the debt
+            // unsettled while this function reported a successful swap; the
+            // failure would then surface only if the manager happened to
+            // revert in `settle()`, which is not a guarantee this contract
+            // can lean on.
             IUniswapV4PoolManager(manager).sync(inputCurrency);
-            IERC20(inputCurrency).transfer(manager, actualIn);
+            _safeTransfer(inputCurrency, manager, actualIn);
             IUniswapV4PoolManager(manager).settle();
         }
     }

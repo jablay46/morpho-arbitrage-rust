@@ -5,6 +5,7 @@ import {FlashArbitrage} from "../contracts/FlashArbitrage.sol";
 
 /// Minimal cheatcode interface (no forge-std dependency).
 interface Vm {
+    function expectRevert(bytes calldata) external;
     function deal(address, uint256) external;
 }
 
@@ -314,6 +315,39 @@ contract V4SettlementTest {
         assert(mgr.lastAmountSpecified() == -int256(2_000_000));
     }
 
+    /// Regression test for the unchecked-transfer finding. `_v4Settle` used a
+    /// bare `IERC20.transfer` whose returned bool was discarded, so an input
+    /// token that fails without reverting produced a swap that *looked*
+    /// settled while the manager's debt went unpaid. With `_safeTransfer` the
+    /// failure is raised at the transfer itself, as `TransferFailed`.
+    function testV4SettleRejectsFalseReturningInputTransfer() public {
+        FalseReturnToken a = new FalseReturnToken();
+        FalseReturnToken b = new FalseReturnToken();
+        MockPoolManager mgr = new MockPoolManager();
+        FlashArbitrageHarness arb = new FlashArbitrageHarness(MOCK_MORPHO);
+        mgr.setArbitrage(address(arb));
+
+        // currency0 is whoever sorts lower; the input currency is the token
+        // whose transfer lies about succeeding.
+        (address currency0, address currency1) =
+            address(a) < address(b) ? (address(a), address(b)) : (address(b), address(a));
+        FalseReturnToken inTok = FalseReturnToken(currency0);
+        inTok.mint(address(arb), 1_000_000);
+
+        IPoolManagerLike.PoolKey memory key = poolKey(currency0, currency1);
+        bytes32 pid =
+            PoolKeyChecksum.checksum(key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks);
+        FlashArbitrage.SwapLeg memory leg = buildLeg(address(mgr), true);
+        leg.poolId = pid;
+
+        mgr.setSwapDelta(packZ1(-int256(1_000_000), int256(990_000)));
+
+        vm.expectRevert(
+            abi.encodeWithSignature("TransferFailed(address,address)", currency0, address(mgr))
+        );
+        arb.harnessSwap(leg, currency0, currency1, 1_000_000);
+    }
+
     // --- Native ETH currency (address(0)) ---
     //
     // Regression tests for the review finding: native V4 legs could not run,
@@ -410,5 +444,18 @@ contract V4SettlementTest {
         assert(mgr.lastSettleValue() == 0);
         assert(mgr.lastSettleWasErc20());
         assert(mgr.lastSyncCurrency() == tokenAddr);
+    }
+}
+
+/// ERC20 whose `transfer` returns `false` without reverting and moves nothing.
+contract FalseReturnToken {
+    mapping(address => uint256) public balanceOf;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address, uint256) external pure returns (bool) {
+        return false;
     }
 }

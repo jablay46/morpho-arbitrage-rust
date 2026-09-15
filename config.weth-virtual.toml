@@ -21,11 +21,16 @@ pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
 quoter = "0x0000000000000000000000000000000000000000"
 
 [[venues]]
-# Aerodrome classic volatile pool (WETH/VIRTUAL, ~0.30% fee)
+# Aerodrome classic volatile pool (WETH/VIRTUAL). The factory's volatileFee
+# default is 30 bps, but THIS pool carries 100 bps: AerodromeFactory.getFee(
+# 0x21594b99..., false) returns 100 (verified on-chain). Configuring 30 here
+# overstated every quote from this venue by ~0.7% of notional and manufactured
+# phantom arbitrage against the other WETH/VIRTUAL venues. The bot now verifies
+# this against getFee at startup, so a stale value fails fast instead.
 pair = "0x21594b992f68495dd28d605834b58889d0a727c7"
 router = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874e43"
 kind = "aero"
-fee_bps = 30
+fee_bps = 100
 factory = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
 stable = false
 fee_tier = 3000
