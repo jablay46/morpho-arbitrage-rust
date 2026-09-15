@@ -6,6 +6,7 @@ import {FlashArbitrage} from "../contracts/FlashArbitrage.sol";
 /// Minimal cheatcode interface (no forge-std dependency).
 interface Vm {
     function expectRevert(bytes calldata) external;
+    function deal(address, uint256) external;
 }
 
 /// File-scope mirror of the PoolManager interface in FlashArbitrage.sol so
@@ -80,7 +81,7 @@ contract MintableToken {
 /// records every `take`, and routes `unlock` back into the arbitrage
 /// contract's `unlockCallback` (exactly how the real manager behaves).
 contract MockPoolManager {
-    address public arbitrage;
+    address payable public arbitrage;
 
     int256 public swapDelta;
     bool public lastZeroForOne;
@@ -89,16 +90,26 @@ contract MockPoolManager {
     address public lastTakeCurrency;
     address public lastTakeTo;
     uint256 public lastTakeAmount;
+    /// ETH the manager paid out for a native-currency `take`.
+    uint256 public nativeTaken;
+    /// `msg.value` carried by the last `settle`: native debt is settled with
+    /// call value, so this is how the manager observes a native input.
+    uint256 public lastSettleValue;
+    /// `true` when the last `settle` settled an ERC20 (sync-then-transfer)
+    /// rather than native currency.
+    bool public lastSettleWasErc20;
 
     address public lastSyncCurrency;
 
     function setArbitrage(address arb) external {
-        arbitrage = arb;
+        arbitrage = payable(arb);
     }
 
     function setSwapDelta(int256 d) external {
         swapDelta = d;
     }
+
+    receive() external payable {}
 
     function unlock(bytes calldata data) external returns (bytes memory) {
         // Delegates back into the arbitrage contract; `msg.sender` becomes
@@ -121,9 +132,25 @@ contract MockPoolManager {
         lastTakeCurrency = currency;
         lastTakeTo = to;
         lastTakeAmount = amount;
+        // PoolManager.transfer for the native currency sends ETH via `call`,
+        // which is exactly the path that needs a payable receiver on the
+        // arbitrage contract.
+        if (currency == address(0)) {
+            nativeTaken += amount;
+            (bool ok,) = to.call{value: amount}("");
+            require(ok, "native take failed");
+        }
     }
 
     function settle() external payable returns (uint256) {
+        lastSettleValue = msg.value;
+        // Mirrors PoolManager._settle: the synced currency is address(0) for
+        // the native path (sync resets it) and is paid with msg.value.
+        if (lastSyncCurrency == address(0)) {
+            lastSettleWasErc20 = false;
+            return msg.value;
+        }
+        lastSettleWasErc20 = true;
         return 0;
     }
 
@@ -319,6 +346,104 @@ contract V4SettlementTest {
             abi.encodeWithSignature("TransferFailed(address,address)", currency0, address(mgr))
         );
         arb.harnessSwap(leg, currency0, currency1, 1_000_000);
+    }
+
+    // --- Native ETH currency (address(0)) ---
+    //
+    // Regression tests for the review finding: native V4 legs could not run,
+    // because the contract had no payable receiver for the native `take` and
+    // `_v4Settle` settled every input as an ERC20 (`IERC20(address(0))`
+    // transfer plus a zero-value `settle()`). address(0) always sorts first,
+    // so a native-currency pool makes native the currency0:
+    //   zeroForOne = true  -> native in, token out
+    //   zeroForOne = false -> token in, native out
+
+    /// Native input settled with call value. The manager must receive exactly
+    /// the input the swap consumed, and must not see an ERC20 settlement.
+    function testV4SettleSendsNativeInputAsCallValue() public {
+        // address(0) always sorts first, so a native-currency pool makes the
+        // native coin currency0 and any non-zero address currency1.
+        address native = address(0);
+        address tokenAddr = address(0xBEEF);
+        MockPoolManager mgr = new MockPoolManager();
+        FlashArbitrageHarness arb = new FlashArbitrageHarness(MOCK_MORPHO);
+        mgr.setArbitrage(address(arb));
+        assert(native < tokenAddr);
+
+        IPoolManagerLike.PoolKey memory key = IPoolManagerLike.PoolKey({
+            currency0: native,
+            currency1: tokenAddr,
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: address(0)
+        });
+        bytes32 pid =
+            PoolKeyChecksum.checksum(key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks);
+        FlashArbitrage.SwapLeg memory leg = buildLeg(address(mgr), true);
+        leg.poolId = pid;
+        leg.minOut = 500_000;
+
+        // zeroForOne: amount0 is the native input (negative), amount1 the
+        // token output (positive).
+        mgr.setSwapDelta(packZ1(-int256(1_000_000), int256(990_000)));
+        vm.deal(address(arb), 1_000_000);
+
+        uint256 amountOut = arb.harnessSwap(leg, native, tokenAddr, 1_000_000);
+
+        assert(amountOut == 990_000);
+        assert(mgr.lastTakeCurrency() == tokenAddr);
+        assert(mgr.lastTakeAmount() == 990_000);
+        assert(mgr.lastSettleValue() == 1_000_000);
+        assert(!mgr.lastSettleWasErc20());
+        // No ERC20 sync for a native currency, and no ETH left stranded.
+        assert(mgr.lastSyncCurrency() == address(0));
+        assert(address(arb).balance == 0);
+    }
+
+    /// Native output arrives through the PoolManager's ETH transfer, which
+    /// requires a payable receiver on the arbitrage contract.
+    function testV4SettleReceivesNativeOutput() public {
+        MintableToken token = new MintableToken();
+        address native = address(0);
+        address tokenAddr = address(token);
+        MockPoolManager mgr = new MockPoolManager();
+        FlashArbitrageHarness arb = new FlashArbitrageHarness(MOCK_MORPHO);
+        mgr.setArbitrage(address(arb));
+
+        // tokenAddr sorts above address(0), so the pool ordering holds.
+        assert(native < tokenAddr);
+        token.mint(address(arb), 2_000_000);
+        vm.deal(address(mgr), 3_000_000);
+
+        IPoolManagerLike.PoolKey memory key = IPoolManagerLike.PoolKey({
+            currency0: native,
+            currency1: tokenAddr,
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: address(0)
+        });
+        bytes32 pid =
+            PoolKeyChecksum.checksum(key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks);
+        FlashArbitrage.SwapLeg memory leg = buildLeg(address(mgr), false);
+        leg.poolId = pid;
+        leg.minOut = 1_000_000;
+
+        // zeroForOne=false: currency1 (token) is the input (negative, lower
+        // bits), currency0 (native) the output (positive, upper bits).
+        mgr.setSwapDelta(packZ0(int256(1_990_000), -int256(2_000_000)));
+
+        uint256 amountOut = arb.harnessSwap(leg, tokenAddr, native, 2_000_000);
+
+        assert(amountOut == 1_990_000);
+        assert(mgr.lastTakeCurrency() == native);
+        assert(mgr.lastTakeTo() == address(arb));
+        assert(mgr.nativeTaken() == 1_990_000);
+        // The ETH actually landed on the contract (the payable receiver ran).
+        assert(address(arb).balance == 1_990_000);
+        // The ERC20 input leg still settles through sync + transfer.
+        assert(mgr.lastSettleValue() == 0);
+        assert(mgr.lastSettleWasErc20());
+        assert(mgr.lastSyncCurrency() == tokenAddr);
     }
 }
 

@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use std::str::FromStr;
 use tracing::{debug, warn};
 
@@ -378,6 +378,22 @@ pub struct PoolQuery {
     pub fee_tier: u32,
 }
 
+/// What the Aerodrome factory reports for a pool's fee, if the pool's own
+/// rate could be read at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AerodromeFee {
+    /// The factory reports this per-pool rate in basis points. The caller
+    /// compares it against the configured `fee_bps` and refuses to start on
+    /// a mismatch.
+    OnChain(u64),
+    /// The factory cannot be asked: the call returned empty data, i.e. the
+    /// address is not a `getFee`-implementing Aerodrome factory (a legacy
+    /// fork, or a factory address that is not a contract at all). The
+    /// configured `fee_bps` is unverifiable on this deployment and is kept
+    /// with a warning.
+    Unsupported,
+}
+
 /// The swap fee (in basis points) the Aerodrome factory charges on `pool`.
 ///
 /// V2/V3/CL venues get their fee from the pool key or the pool's own state,
@@ -389,16 +405,21 @@ pub struct PoolQuery {
 /// factory's `volatileFee` (30) is only the default, and individual pools
 /// can carry 100 bps (seen on WETH/VIRTUAL on Base).
 ///
-/// `getFee` is the factory's canonical per-pool getter. A factory that does
-/// not implement it (older forks) is a non-fatal `Ok(None)`: the caller
-/// keeps the configured value and warns, rather than refusing to start.
+/// `getFee` is the factory's canonical per-pool getter. Only an *empty
+/// return* counts as "factory has no `getFee`" ([`AerodromeFee::Unsupported`]);
+/// every other failure — RPC/transport errors, a reverted call, an
+/// undecodable return — is propagated with `?` so startup fails closed
+/// instead of falling through to an unvalidated `fee_bps`. Treating those as
+/// "unsupported" is what previously let a transient provider failure, a
+/// wrong factory, or a contract-call error silently validate the configured
+/// fee and reach both Aerodrome quote directions with a stale value.
 pub async fn fetch_aerodrome_fee_bps<P: Provider>(
     provider: &P,
     factory: Address,
     router: Address,
     pool: Address,
     stable: bool,
-) -> Result<Option<u64>> {
+) -> Result<AerodromeFee> {
     let factory = if factory == Address::ZERO {
         IAerodromeRouter::new(router, provider)
             .defaultFactory()
@@ -407,27 +428,75 @@ pub async fn fetch_aerodrome_fee_bps<P: Provider>(
     } else {
         factory
     };
-    match IAerodromeFactory::new(factory, provider)
+    let raw = match IAerodromeFactory::new(factory, provider)
         .getFee(pool, stable)
         .call()
         .await
     {
-        Ok(raw) => {
-            // `getFee` already reports basis points, NOT the 1e6 units the
-            // pool stores internally. Verified against Base mainnet: for the
-            // WETH/VIRTUAL volatile pool it returns 100, and the canonical
-            // Aerodrome router's `getAmountsOut` for 1 WETH yields exactly
-            // the `get_amount_out` result for fee_bps = 100 (4012811088698330580287),
-            // not the 0.03% result (4041148427538663142175). A fee the local
-            // math cannot accept is dropped (None) so the caller keeps the
-            // configured value instead of adopting an unusable one.
-            let bps = raw.saturating_to::<u64>();
-            if bps >= 10_000 {
-                return Ok(None);
-            }
-            Ok(Some(bps))
+        Ok(raw) => raw,
+        Err(e) if is_missing_getter(&e) => return Ok(AerodromeFee::Unsupported),
+        Err(e) => {
+            return Err(e).wrap_err_with(|| {
+                format!(
+                    "reading getFee({pool}, {stable}) from Aerodrome factory {factory} failed; \
+                     refusing to start with an unvalidated fee_bps (a transient RPC failure is \
+                     not evidence the factory lacks the getter)"
+                )
+            })
         }
-        Err(_) => Ok(None),
+    };
+    // `getFee` already reports basis points, NOT the 1e6 units the pool
+    // stores internally. Verified against Base mainnet: for the
+    // WETH/VIRTUAL volatile pool it returns 100, and the canonical Aerodrome
+    // router's `getAmountsOut` for 1 WETH yields exactly the
+    // `get_amount_out` result for fee_bps = 100 (4012811088698330580287),
+    // not the 0.03% result (4041148427538663142175). A rate this bot cannot
+    // price is an error, not something to paper over: 10_000 bps (or more)
+    // would mean the pool keeps the entire input, and a value that does not
+    // fit `u64` cannot be a fee at all.
+    let bps = raw.try_into().map_err(|_| {
+        eyre::eyre!(
+            "Aerodrome factory {factory} reports getFee({pool}, {stable}) = {raw}, \
+             which is not a usable basis-point fee (>= 10_000 or unrepresentable); \
+             refusing to start"
+        )
+    })?;
+    if bps >= 10_000 {
+        return Err(eyre::eyre!(
+            "Aerodrome factory {factory} reports getFee({pool}, {stable}) = {raw} bps, \
+             which is not a usable basis-point fee (>= 10_000); refusing to start"
+        ));
+    }
+    Ok(AerodromeFee::OnChain(bps))
+}
+
+/// True only when the call reached an address that cannot answer, and not
+/// when the provider failed. Two things qualify, both verified against
+/// Base mainnet:
+///
+/// * `ZeroData` — the address returned `0x` (an EOA, or a contract whose
+///   fallback returns nothing).
+/// * an error response with no revert data — a contract whose ABI has no
+///   `getFee`, which the transport reports as a bare "execution reverted"
+///   (observed calling `getFee` on the Aerodrome *router*, which is a
+///   contract but not a factory).
+///
+/// Every transport/provider failure and every *decoded* revert (a real
+/// factory erroring) is deliberately excluded, so the caller fails closed
+/// on them instead of trusting an unvalidated fee. Anything misclassified
+/// as unsupported is still reported: `main` logs the address and the
+/// configured fee it is trusting.
+fn is_missing_getter(e: &alloy::contract::Error) -> bool {
+    match e {
+        // The address returned "0x" (no code, or a fallback that returns
+        // nothing): there is no factory here to ask.
+        alloy::contract::Error::ZeroData(..) => true,
+        // A contract whose ABI has no `getFee`, as lowered by the transport:
+        // an error response carrying no revert data.
+        alloy::contract::Error::TransportError(t) => t
+            .as_error_resp()
+            .is_some_and(|r| r.as_revert_data().is_none()),
+        _ => false,
     }
 }
 
