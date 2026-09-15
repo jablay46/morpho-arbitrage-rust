@@ -208,6 +208,8 @@ sol! {
     #[sol(rpc)]
     interface IAerodromeFactory {
         function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
+        /// Per-pool swap fee, already in basis points (100 = 1%).
+        function getFee(address pool, bool stable) external view returns (uint256);
     }
 
     #[sol(rpc)]
@@ -374,6 +376,59 @@ pub struct PoolQuery {
     pub token_b: Address,
     pub stable: bool,
     pub fee_tier: u32,
+}
+
+/// The swap fee (in basis points) the Aerodrome factory charges on `pool`.
+///
+/// V2/V3/CL venues get their fee from the pool key or the pool's own state,
+/// so a wrong config fee fails loudly (a V3 fee tier selects a different
+/// pool; a Slipstream/V3 pool reports its `fee()`). Aerodrome is the odd one
+/// out: `getPool(tokenA, tokenB, stable)` ignores the fee entirely, so
+/// `fee_bps` is purely an operator-supplied number that silently misprices
+/// the venue when wrong. Volatile pools are NOT uniformly 30 bps — the
+/// factory's `volatileFee` (30) is only the default, and individual pools
+/// can carry 100 bps (seen on WETH/VIRTUAL on Base).
+///
+/// `getFee` is the factory's canonical per-pool getter. A factory that does
+/// not implement it (older forks) is a non-fatal `Ok(None)`: the caller
+/// keeps the configured value and warns, rather than refusing to start.
+pub async fn fetch_aerodrome_fee_bps<P: Provider>(
+    provider: &P,
+    factory: Address,
+    router: Address,
+    pool: Address,
+    stable: bool,
+) -> Result<Option<u64>> {
+    let factory = if factory == Address::ZERO {
+        IAerodromeRouter::new(router, provider)
+            .defaultFactory()
+            .call()
+            .await?
+    } else {
+        factory
+    };
+    match IAerodromeFactory::new(factory, provider)
+        .getFee(pool, stable)
+        .call()
+        .await
+    {
+        Ok(raw) => {
+            // `getFee` already reports basis points, NOT the 1e6 units the
+            // pool stores internally. Verified against Base mainnet: for the
+            // WETH/VIRTUAL volatile pool it returns 100, and the canonical
+            // Aerodrome router's `getAmountsOut` for 1 WETH yields exactly
+            // the `get_amount_out` result for fee_bps = 100 (4012811088698330580287),
+            // not the 0.03% result (4041148427538663142175). A fee the local
+            // math cannot accept is dropped (None) so the caller keeps the
+            // configured value instead of adopting an unusable one.
+            let bps = raw.saturating_to::<u64>();
+            if bps >= 10_000 {
+                return Ok(None);
+            }
+            Ok(Some(bps))
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// Resolve the pool address for a token pair from a venue's factory.
@@ -1060,8 +1115,35 @@ pub async fn fetch_cl_pair_tokens<P: Provider>(provider: &P, pool: Address) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{n128, quote_calldata, unsigned_tx_rlp_len, L1FeeOracle};
+    use super::{get_amount_out, n128, quote_calldata, unsigned_tx_rlp_len, L1FeeOracle};
     use alloy::primitives::{Address, U256};
+
+    /// Pins the fee units `fetch_aerodrome_fee_bps` returns against the
+    /// canonical on-chain reference. Read from Base mainnet at the WETH/VIRTUAL
+    /// volatile pool: reserves are VIRTUAL 3178595976004592429331773 and WETH
+    /// 783200919205544720468, so a 1 WETH -> VIRTUAL swap has reserve_in =
+    /// 783200919205544720468. `AerodromeFactory.getFee(pool, false)` returns
+    /// 100 and the router's `getAmountsOut(1e18)` returns
+    /// 4012811088698330580287, which matches `get_amount_out(..., 100)`
+    /// exactly. The 30 bps reading (the factory's `volatileFee` default)
+    /// yields 4041148427538663142175 instead — the value the bot used to quote.
+    #[test]
+    fn aerodrome_fee_is_basis_points_not_1e6_units() {
+        let reserve_in = U256::from(783200919205544720468u128); // WETH
+        let reserve_out = U256::from(3178595976004592429331773u128); // VIRTUAL
+        let amount_in = U256::from(10u64).pow(U256::from(18u64));
+
+        assert_eq!(
+            get_amount_out(amount_in, reserve_in, reserve_out, 100),
+            Some(U256::from(4012811088698330580287u128)),
+            "100 bps must reproduce the router's getAmountsOut result"
+        );
+        assert_ne!(
+            get_amount_out(amount_in, reserve_in, reserve_out, 30),
+            Some(U256::from(4012811088698330580287u128)),
+            "30 bps is the factory default, not this pool's fee"
+        );
+    }
 
     #[test]
     fn unsigned_tx_rlp_len_is_monotonic_in_calldata() {

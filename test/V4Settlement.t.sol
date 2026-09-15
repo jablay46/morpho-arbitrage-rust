@@ -3,6 +3,11 @@ pragma solidity ^0.8.24;
 
 import {FlashArbitrage} from "../contracts/FlashArbitrage.sol";
 
+/// Minimal cheatcode interface (no forge-std dependency).
+interface Vm {
+    function expectRevert(bytes calldata) external;
+}
+
 /// File-scope mirror of the PoolManager interface in FlashArbitrage.sol so
 /// the test can name the PoolKey/SwapParams types without importing the
 /// production file's interfaces (they are private to that file).
@@ -143,6 +148,8 @@ contract FlashArbitrageHarness is FlashArbitrage {
 }
 
 contract V4SettlementTest {
+    Vm constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
+
     address constant MOCK_MORPHO = address(0x0000000000000000000000000000000000000a11);
 
     function buildLeg(address manager, bool zeroForOne)
@@ -279,5 +286,51 @@ contract V4SettlementTest {
         assert(mgr.lastTakeTo() == address(arb));
         assert(!mgr.lastZeroForOne());
         assert(mgr.lastAmountSpecified() == -int256(2_000_000));
+    }
+
+    /// Regression test for the unchecked-transfer finding. `_v4Settle` used a
+    /// bare `IERC20.transfer` whose returned bool was discarded, so an input
+    /// token that fails without reverting produced a swap that *looked*
+    /// settled while the manager's debt went unpaid. With `_safeTransfer` the
+    /// failure is raised at the transfer itself, as `TransferFailed`.
+    function testV4SettleRejectsFalseReturningInputTransfer() public {
+        FalseReturnToken a = new FalseReturnToken();
+        FalseReturnToken b = new FalseReturnToken();
+        MockPoolManager mgr = new MockPoolManager();
+        FlashArbitrageHarness arb = new FlashArbitrageHarness(MOCK_MORPHO);
+        mgr.setArbitrage(address(arb));
+
+        // currency0 is whoever sorts lower; the input currency is the token
+        // whose transfer lies about succeeding.
+        (address currency0, address currency1) =
+            address(a) < address(b) ? (address(a), address(b)) : (address(b), address(a));
+        FalseReturnToken inTok = FalseReturnToken(currency0);
+        inTok.mint(address(arb), 1_000_000);
+
+        IPoolManagerLike.PoolKey memory key = poolKey(currency0, currency1);
+        bytes32 pid =
+            PoolKeyChecksum.checksum(key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks);
+        FlashArbitrage.SwapLeg memory leg = buildLeg(address(mgr), true);
+        leg.poolId = pid;
+
+        mgr.setSwapDelta(packZ1(-int256(1_000_000), int256(990_000)));
+
+        vm.expectRevert(
+            abi.encodeWithSignature("TransferFailed(address,address)", currency0, address(mgr))
+        );
+        arb.harnessSwap(leg, currency0, currency1, 1_000_000);
+    }
+}
+
+/// ERC20 whose `transfer` returns `false` without reverting and moves nothing.
+contract FalseReturnToken {
+    mapping(address => uint256) public balanceOf;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address, uint256) external pure returns (bool) {
+        return false;
     }
 }

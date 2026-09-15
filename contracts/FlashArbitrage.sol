@@ -195,6 +195,7 @@ contract FlashArbitrage {
     error NotPendingOwner();
     error NotMorpho();
     error Reentrant();
+    error ZeroAddress();
     error UnknownLegKind(uint8 kind);
     error Unprofitable(uint256 profit, uint256 minProfit);
     error LosingTrade(uint256 balBefore, uint256 balAfter);
@@ -284,7 +285,15 @@ contract FlashArbitrage {
 
     /// Step 1 of ownership transfer: current owner nominates a successor.
     /// Two-step so a typo'd address can't permanently brick control.
+    ///
+    /// A zero nomination is rejected instead of accepted: it matches the
+    /// OpenZeppelin behaviour every operator expects, catches a typo that
+    /// would otherwise silently clear a legitimate pending transfer, and
+    /// reserves `pendingOwner == address(0)` as the unambiguous "no
+    /// nomination in flight" state shared with the constructor and
+    /// [`acceptOwnership`].
     function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
         pendingOwner = newOwner;
         emit OwnershipTransferStarted(owner, newOwner);
     }
@@ -496,8 +505,16 @@ contract FlashArbitrage {
         // Settle the input debt: sync snapshots the manager's balance, then
         // transfer the EXACT input consumed (from the delta, not amountIn — a
         // price limit or hook may have consumed less) and settle.
-        IUniswapV4PoolManager(manager).sync(zeroForOne ? key.currency0 : key.currency1);
-        IERC20(zeroForOne ? key.currency0 : key.currency1).transfer(manager, actualIn);
+        //
+        // `_safeTransfer` (not a bare `transfer`) so a token that fails
+        // without reverting is caught here. A raw `transfer` discards the
+        // returned bool, so a `false`/no-op transfer would leave the debt
+        // unsettled while this function reported a successful swap; the
+        // failure would then surface only if the manager happened to revert
+        // in `settle()`, which is not a guarantee this contract can lean on.
+        address inputCurrency = zeroForOne ? key.currency0 : key.currency1;
+        IUniswapV4PoolManager(manager).sync(inputCurrency);
+        _safeTransfer(inputCurrency, manager, actualIn);
         IUniswapV4PoolManager(manager).settle();
     }
 

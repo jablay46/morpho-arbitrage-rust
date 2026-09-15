@@ -152,6 +152,23 @@ contract HardeningTest {
 
     // --- Ownership transfer (two-step) ---
 
+    /// A zero nomination must be rejected, not silently accepted: accepting
+    /// it cleared a legitimate pending transfer without any signal.
+    function testTransferOwnershipRejectsZeroAddress() public {
+        FlashArbitrage arb = new FlashArbitrage(MOCK_MORPHO);
+        address alice = vm.addr(0xaaaa);
+
+        arb.transferOwnership(alice);
+        assert(arb.pendingOwner() == alice);
+
+        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
+        arb.transferOwnership(address(0));
+
+        // The pending nomination survives the rejected call.
+        assert(arb.pendingOwner() == alice);
+        assert(arb.owner() == address(this));
+    }
+
     function testTwoStepOwnershipTransfer() public {
         FlashArbitrage arb = new FlashArbitrage(MOCK_MORPHO);
         address alice = vm.addr(0xaaaa);

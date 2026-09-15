@@ -153,8 +153,20 @@ fn build_leg(venue: &Venue, min_out: U256, token_in: Address, token_out: Address
 }
 
 /// Scale a simulated output down by the slippage tolerance.
+///
+/// `expected` can legitimately reach ~2^250 (see `build_params`), and the
+/// `(10_000 - slippage_bps)` factor makes the product need ~264 bits, so a
+/// plain U256 multiply wraps silently (`ruint`'s `Mul` is wrapping, not
+/// checked) and would collapse the bound to a tiny number or zero — exactly
+/// when the trade is largest and the sandwich protection matters most.
+/// Multiply in U512 and clamp: the true result is a strict discount of
+/// `expected`, so it always fits in U256 and the clamp is unreachable for
+/// well-formed input. `slippage_bps < 10_000` is enforced at config load, so
+/// the subtraction cannot underflow.
 fn with_slippage(expected: U256, slippage_bps: u64) -> U256 {
-    expected * U256::from(10_000u64 - slippage_bps) / U256::from(10_000u64)
+    let tolerance = U512::from(10_000u64 - slippage_bps);
+    let scaled = U512::from(expected) * tolerance / U512::from(10_000u64);
+    scaled.to::<U256>()
 }
 
 /// Resolve the chosen venue pair to its swap legs and build the calldata.
@@ -183,19 +195,19 @@ pub fn build_params(cfg: &Config, opp: &Opportunity, min_profit: U256) -> ArbPar
     // positive quote) fall back to the raw amount_out — the compounded bound
     // degenerates harmlessly.
     //
-    // The whole scaling chain can overflow U256 even though every FINAL
+    // The compounding step can overflow U256 even though every FINAL
     // value fits: `amount_out` reaches ~2^250 for a deep-recollateralized
     // loan, so `amount_out * leg_a_min` needs ~378 bits and the intermediate
     // quotient (~2^250) times the 9950 tolerance still needs ~263 bits.
-    // Run the two-step scaling in U512 and only clamp to U256 at the end.
+    // Run the two-step scaling in U512 and only clamp to U256 at the end;
+    // `leg_a_min` itself is already width-safe inside `with_slippage`.
     //
     // The final bound is mathematically at most `amount_out` (leg_a_min <=
     // quote_out and the tolerance is a strict discount), so the checked
     // conversion cannot fail.
     let leg_b_min = if opp.quote_out.is_zero() {
         // Defensive fallback (valid opportunities always have a positive
-        // quote); the single-width tolerance can hit the same wrap only on
-        // this unreachable path.
+        // quote); amount_out is bounded by the same tolerance discount.
         with_slippage(opp.amount_out, cfg.slippage_bps)
     } else {
         let product = opp.amount_out.widening_mul(leg_a_min);
@@ -419,7 +431,7 @@ where
         }
     }
     let tx = est_tx
-        .with_gas_limit((gas_limit as f64 * 1.33) as u64)
+        .with_gas_limit(gas_limit.saturating_mul(133) / 100)
         .with_nonce(nonce);
     let pending = provider.send_transaction(tx).await?;
     let tx_hash = *pending.tx_hash();
@@ -607,6 +619,32 @@ mod tests {
             payload,
             "re-encoding must reproduce the exact Solidity bytes"
         );
+    }
+
+    /// `with_slippage` must not wrap for outputs near the U256 ceiling.
+    /// `expected * (10_000 - bps)` needs ~264 bits at `expected ~= 2^250`, so
+    /// the old single-width multiply wrapped (ruint's `Mul` is wrapping) and
+    /// collapsed the bound — worst exactly when the trade is largest.
+    #[test]
+    fn with_slippage_does_not_wrap_near_u256_max() {
+        // 2^250 is the documented upper bound for `amount_out`.
+        let expected = U256::from(1u64) << 250;
+        let got = with_slippage(expected, 50);
+        // Exact 99.5% of 2^250, computed in U512 independently.
+        let exact =
+            (U512::from(expected) * U512::from(9950u64) / U512::from(10_000u64)).to::<U256>();
+        assert_eq!(got, exact);
+        assert!(
+            got > U256::from(1u64) << 249,
+            "wrapped result would be tiny, got {got}"
+        );
+        // The formerly-fatal threshold: the multiply overflows past
+        // U256::MAX / 9950, which 2^250 comfortably exceeds.
+        assert!(expected > U256::MAX / U256::from(9950u64));
+        // And a full-width input still behaves (no clamp surprises).
+        let max = with_slippage(U256::MAX, 0);
+        assert_eq!(max, U256::MAX);
+        assert_eq!(with_slippage(U256::ZERO, 50), U256::ZERO);
     }
 
     #[test]
