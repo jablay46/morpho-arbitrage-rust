@@ -125,6 +125,18 @@ library PoolIdLibrary {
  *      - Added events for off-chain monitoring/indexing.
  *      - Added a bounds check on the Slipstream tickSpacing cast so an
  *        out-of-range `feeTier` reverts instead of silently wrapping.
+ *      - `_swap` now reverts `UnknownLegKind` instead of falling off the end
+ *        of its dispatch chain as a silent no-op.
+ *      - `execute` reverts `CallbackNotInvoked` unless the flash-loan callback
+ *        actually ran, so a `morpho` that never borrows can't be mistaken for
+ *        a successful trade.
+ *      - Added `sweepETH` (native ETH had no recovery path) and a
+ *        `ZeroAddress` check on the immutable `morpho` constructor argument.
+ *      - Added a payable `receive()` and a native branch in `_v4Settle`:
+ *        Uniswap V4's `address(0)` currency is native, so a native-output leg
+ *        needs a payable receiver for the manager's ETH `take`, and a
+ *        native-input leg must settle with `settle{value: actualIn}()` rather
+ *        than an ERC20 transfer to `address(0)`.
  */
 contract FlashArbitrage {
     uint8 internal constant KIND_UNISWAP_V2 = 0;
@@ -181,6 +193,13 @@ contract FlashArbitrage {
     uint256 private constant _ENTERED = 2;
     uint256 private _reentrancyStatus = _NOT_ENTERED;
 
+    /// Proof that `onMorphoFlashLoan` actually ran for the in-flight
+    /// `execute`. Cleared before the flash loan starts and set by the
+    /// callback; a `flashLoan` that returns without ever entering the
+    /// callback (wrong/degraded `morpho` implementation) would otherwise be
+    /// a silent no-op that still looks like a mined, successful arb tx.
+    bool private _callbackInvoked;
+
     event ArbExecuted(
         address indexed token,
         address indexed quote,
@@ -206,6 +225,8 @@ contract FlashArbitrage {
     error V4SwapDeltaMismatch();
     error V4MinOutput(uint256 out, uint256 minOut);
     error V4AmountTooLarge(uint256 amountIn);
+    error CallbackNotInvoked();
+    error ZeroAddress();
 
     /// Canonical TickMath bounds, identical for Uniswap V3 and V4. Used as the
     /// unrestricted sqrt price limit in `unlockCallback` (the exact values the
@@ -215,6 +236,9 @@ contract FlashArbitrage {
         1461446703485210103287273052203988822378723970342; // getSqrtRatioAtTick(MAX_TICK)
 
     constructor(address _morpho) {
+        // `morpho` is immutable with no setter, so a bad address can only be
+        // fixed by redeploying: reject the degenerate case up front.
+        if (_morpho == address(0)) revert ZeroAddress();
         morpho = _morpho;
         owner = msg.sender;
         emit OwnershipTransferred(address(0), msg.sender);
@@ -233,8 +257,13 @@ contract FlashArbitrage {
     }
 
     /// Called by the Rust bot. Starts the flash loan with the encoded params.
+    /// Reverts unless the callback actually ran: a `morpho` that returns
+    /// without borrowing would otherwise make this a silent success no-op
+    /// (no loan, no swap, no revert) that still burns gas on every scan.
     function execute(ArbParams calldata params) external onlyOwner nonReentrant {
+        _callbackInvoked = false;
         IMorphoBlue(morpho).flashLoan(params.token, params.amount, abi.encode(params));
+        if (!_callbackInvoked) revert CallbackNotInvoked();
     }
 
     /// Morpho Blue flash loan callback; only Morpho may call this.
@@ -244,6 +273,9 @@ contract FlashArbitrage {
     function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
         if (msg.sender != morpho) revert NotMorpho();
         if (_reentrancyStatus != _ENTERED) revert Reentrant();
+        // Mark the in-flight `execute` as genuinely served. Any revert below
+        // unwinds this write along with the whole transaction.
+        _callbackInvoked = true;
 
         ArbParams memory params = abi.decode(data, (ArbParams));
 
@@ -280,6 +312,22 @@ contract FlashArbitrage {
         uint256 amount = IERC20(token).balanceOf(address(this));
         _safeTransfer(token, owner, amount);
         emit Swept(token, owner, amount);
+    }
+
+    /// Accept native ETH. Uniswap V4's `address(0)` currency is native, so a
+    /// V4 leg's output reaches this contract through the PoolManager's ETH
+    /// `call` and fails without a payable receiver. ETH sent here outside a
+    /// swap (a router value refund) is recoverable via `sweepETH`.
+    receive() external payable {}
+
+    /// Rescue native ETH. `sweep` cannot: it always issues an ERC20
+    /// `transfer`, so ETH reaching this contract (a Uniswap V4 leg whose
+    /// currency is native, a router value refund) would be locked forever.
+    function sweepETH() external onlyOwner nonReentrant {
+        uint256 amount = address(this).balance;
+        (bool ok,) = owner.call{value: amount}("");
+        if (!ok) revert TransferFailed(address(0), owner);
+        emit Swept(address(0), owner, amount);
     }
 
     /// Step 1 of ownership transfer: current owner nominates a successor.
@@ -365,6 +413,11 @@ contract FlashArbitrage {
         if (leg.kind == KIND_UNISWAP_V4) {
             return _swapV4(leg, from, to, amountIn);
         }
+        // Unreachable for kinds the bot emits (0..4), but without this any
+        // future/unknown kind was a silent no-op: the leg would return 0 with
+        // the approval already granted (see the `_approve` above), leaving a
+        // zero-profit "successful" cycle instead of a diagnosable revert.
+        revert UnknownLegKind(leg.kind);
     }
 
     /// Uniswap V4 swap through the singleton PoolManager's unlock/lock pattern:
@@ -493,12 +546,24 @@ contract FlashArbitrage {
             address(this),
             amountOut
         );
-        // Settle the input debt: sync snapshots the manager's balance, then
-        // transfer the EXACT input consumed (from the delta, not amountIn — a
-        // price limit or hook may have consumed less) and settle.
-        IUniswapV4PoolManager(manager).sync(zeroForOne ? key.currency0 : key.currency1);
-        IERC20(zeroForOne ? key.currency0 : key.currency1).transfer(manager, actualIn);
-        IUniswapV4PoolManager(manager).settle();
+        // Settle the input debt with the EXACT input consumed (from the
+        // delta, not amountIn — a price limit or hook may have consumed
+        // less). Uniswap V4 identifies native currency as address(0):
+        // the manager credits call value directly, so `sync` is
+        // meaningless there and an ERC20 `transfer` to address(0) reverts.
+        // The native branch therefore requires the contract to already hold
+        // at least `actualIn` ETH (e.g. left over from a native-output leg);
+        // the call reverts otherwise rather than settling short.
+        address inputCurrency = zeroForOne ? key.currency0 : key.currency1;
+        if (inputCurrency == address(0)) {
+            IUniswapV4PoolManager(manager).settle{value: actualIn}();
+        } else {
+            // sync snapshots the manager's balance, then the input is
+            // transferred and `settle` credits the observed difference.
+            IUniswapV4PoolManager(manager).sync(inputCurrency);
+            IERC20(inputCurrency).transfer(manager, actualIn);
+            IUniswapV4PoolManager(manager).settle();
+        }
     }
 
     function _approve(address token, address spender, uint256 amount) internal {

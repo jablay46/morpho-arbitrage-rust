@@ -570,11 +570,26 @@ Tips produksi:
   tidak mengunci kontrak permanen. Bot otomatis memvalidasi `owner()` ulang
   secara periodik dan berhenti dengan error eksplisit bila kontrak berpindah
   ke key yang tidak dipegangnya — lihat bagian transfer kepemilikan.
-- Reentrancy guard (`nonReentrant`) pada `execute`/`onMorphoFlashLoan`/`sweep`
+- Reentrancy guard (`nonReentrant`) pada `execute`/`onMorphoFlashLoan`/`sweep`/`sweepETH`
   — token dengan transfer hook tidak bisa menyusup masuk ulang ke tengah
   flashloan.
 - Event `ArbExecuted`/`Swept`/`OwnershipTransfer*` ter-emit untuk monitoring
-  off-chain.
+  off-chain. **Bot memverifikasi `ArbExecuted` pada receipt**: transaksi yang
+  mined tapi tidak memancarkan event (callback flash loan tidak pernah jalan)
+  dilaporkan sebagai `error`, bukan sukses.
+- `execute` revert `CallbackNotInvoked` bila callback Morpho tidak pernah
+  dijalankan, sehingga `MORPHO` yang salah tidak lagi tampak sebagai trade
+  sukses yang diam-diam tidak melakukan apa pun. `_swap` juga revert
+  `UnknownLegKind` untuk `kind` di luar 0..4 (dulu no-op senyap).
+- `morpho` divalidasi bukan `address(0)` di constructor (immutable, tidak ada
+  setter — deployment salah hanya bisa diperbaiki dengan redeploy).
+- ETH native (mis. dari leg Uniswap V4 yang currency-nya native, atau refund
+  value router) bisa ditarik owner dengan `sweepETH()`; `sweep(address)` tidak
+  bisa menanganinya karena selalu memanggil ERC20 `transfer`. Leg V4 dengan
+  currency native juga benar-benar bisa jalan: kontrak punya `receive()`
+  payable untuk menerima output native dari PoolManager, dan `_v4Settle`
+  melunasi debt native dengan `settle{value: actualIn}()` (bukan transfer
+  ERC20 ke `address(0)`).
 - Pertahanan berlapis: `minOut` per leg → `minProfit` on-chain →
   `eth_estimateGas` sebagai gate simulasi. Kegagalan terburuk adalah rugi gas,
   bukan kehilangan principal (flash loan yang gagal otomatis revert).

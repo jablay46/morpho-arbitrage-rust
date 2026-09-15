@@ -111,6 +111,13 @@ sol! {
     interface IFlashArbitrage {
         function execute(ArbParams params) external;
         function owner() external view returns (address);
+
+        event ArbExecuted(
+            address indexed token,
+            address indexed quote,
+            uint256 amount,
+            uint256 profit
+        );
     }
 }
 
@@ -282,6 +289,91 @@ pub async fn estimate_gas_local<P: Provider>(
     crate::sim::simulate_call(provider, contract, owner, calldata, block, Some(env))
 }
 
+/// Outcome of inspecting a mined `execute` receipt.
+///
+/// A receipt `status == true` only says the *transaction* did not revert; it
+/// does not prove the arbitrage did anything. `ArbExecuted` is the contract's
+/// only signal that the flash-loan callback ran, both legs swapped, the loan
+/// was repaid and profit (if any) was swept. Treating a status-only success as
+/// confirmation would report a successful trade for a transaction that moved
+/// nothing (a wrong/degraded `morpho`, or a contract deployed before the
+/// `CallbackNotInvoked` guard existed).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReceiptVerdict {
+    /// `ArbExecuted` found for `expected_token` from `contract`, with the
+    /// on-chain profit.
+    Confirmed {
+        token: Address,
+        amount: U256,
+        profit: U256,
+    },
+    /// Transaction reverted; `gas lost` — the on-chain backstops did their job.
+    Reverted,
+    /// Mined successfully but the contract never reported the arb cycle.
+    MissingEvent,
+}
+
+impl std::fmt::Display for ReceiptVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReceiptVerdict::Confirmed { amount, profit, .. } => {
+                write!(f, "confirmed: ArbExecuted amount={amount} profit={profit}")
+            }
+            ReceiptVerdict::Reverted => write!(f, "reverted on-chain (gas lost)"),
+            ReceiptVerdict::MissingEvent => write!(
+                f,
+                "mined without ArbExecuted: the flash-loan callback never ran \
+                 (wrong morpho address or a contract predating the \
+                 CallbackNotInvoked guard)"
+            ),
+        }
+    }
+}
+
+/// Decode the `ArbExecuted` log that `contract` emits for `expected_token`.
+///
+/// Scanning logs (instead of matching `topics[0]` by hand) validates the
+/// emitter and the indexed `token` at the same time, so a look-alike event
+/// from another address cannot be mistaken for confirmation. Returns `None`
+/// when no matching log exists.
+pub fn decode_arb_executed(
+    logs: &[alloy::rpc::types::eth::Log],
+    contract: Address,
+    expected_token: Address,
+) -> Option<(U256, U256)> {
+    logs.iter().find_map(|log| {
+        if log.address() != contract {
+            return None;
+        }
+        match log.log_decode::<IFlashArbitrage::ArbExecuted>() {
+            Ok(decoded) if decoded.inner.data.token == expected_token => {
+                Some((decoded.inner.data.amount, decoded.inner.data.profit))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Classify a broadcast receipt: confirmed only when the contract's
+/// `ArbExecuted` event is present for the loan token that was requested.
+pub fn verdict_from_receipt(
+    receipt: &alloy::rpc::types::eth::TransactionReceipt,
+    contract: Address,
+    expected_token: Address,
+) -> ReceiptVerdict {
+    if !receipt.status() {
+        return ReceiptVerdict::Reverted;
+    }
+    match decode_arb_executed(receipt.logs(), contract, expected_token) {
+        Some((amount, profit)) => ReceiptVerdict::Confirmed {
+            token: expected_token,
+            amount,
+            profit,
+        },
+        None => ReceiptVerdict::MissingEvent,
+    }
+}
+
 /// Broadcast `execute` and return as soon as the node accepts the tx,
 /// without waiting for inclusion. Waiting for the receipt would block the
 /// scan loop for at least one block per trade, blinding the bot to the
@@ -302,19 +394,43 @@ where
     P: Provider + 'static,
 {
     let arb = IFlashArbitrage::new(contract, provider);
+    let expected_token = params.token;
     let pending = arb.execute(params).send().await?;
     let tx_hash = *pending.tx_hash();
     tokio::spawn(async move {
         match pending.get_receipt().await {
-            Ok(receipt) if receipt.status() => {
-                tracing::info!(tx = %receipt.transaction_hash, "arbitrage transaction confirmed");
-            }
-            Ok(receipt) => {
-                tracing::warn!(
-                    tx = %receipt.transaction_hash,
-                    "arbitrage transaction reverted on-chain (gas lost; minProfit backstop held)"
-                );
-            }
+            Ok(receipt) => match verdict_from_receipt(&receipt, contract, expected_token) {
+                ReceiptVerdict::Confirmed { amount, profit, .. } => {
+                    tracing::info!(
+                        tx = %receipt.transaction_hash,
+                        amount = %amount,
+                        profit = %profit,
+                        "arbitrage transaction confirmed"
+                    );
+                }
+                ReceiptVerdict::Reverted => {
+                    tracing::warn!(
+                        tx = %receipt.transaction_hash,
+                        "arbitrage transaction reverted on-chain (gas lost; minProfit backstop held)"
+                    );
+                }
+                // Mined, but the contract never reported the cycle. This is
+                // the silent no-op the CallbackNotInvoked guard now blocks on
+                // new deployments; for an older deployment it is the only
+                // symptom, so surface it loudly instead of as a success.
+                ReceiptVerdict::MissingEvent => {
+                    tracing::error!(
+                        tx = %receipt.transaction_hash,
+                        contract = %contract,
+                        token = %expected_token,
+                        "arbitrage transaction mined WITHOUT ArbExecuted: the \
+                         flash-loan callback never ran, no trade happened. Check \
+                         that MORPHO/ARB_CONTRACT point at the real Morpho Blue \
+                         and the arb contract, and redeploy if the contract \
+                         predates the CallbackNotInvoked guard"
+                    );
+                }
+            },
             Err(e) => {
                 tracing::warn!(tx = %tx_hash, error = %e, "failed to fetch transaction receipt");
             }
@@ -364,6 +480,7 @@ where
 {
     use alloy::network::TransactionBuilder;
 
+    let expected_token = params.token;
     let calldata =
         alloy::primitives::Bytes::from(IFlashArbitrage::executeCall { params }.abi_encode());
     // The sync submit path must set fee, gas and nonce fields explicitly:
@@ -436,15 +553,34 @@ where
     let receipt_task = tokio::spawn(async move {
         let receipt = pending.get_receipt().await;
         match &receipt {
-            Ok(r) if r.status() => {
-                tracing::info!(tx = %r.transaction_hash, "arbitrage transaction flash-confirmed");
-            }
-            Ok(r) => {
-                tracing::warn!(
-                    tx = %r.transaction_hash,
-                    "arbitrage transaction reverted (gas lost; minProfit backstop held)"
-                );
-            }
+            Ok(r) => match verdict_from_receipt(r, contract, expected_token) {
+                ReceiptVerdict::Confirmed { amount, profit, .. } => {
+                    tracing::info!(
+                        tx = %r.transaction_hash,
+                        amount = %amount,
+                        profit = %profit,
+                        "arbitrage transaction flash-confirmed"
+                    );
+                }
+                ReceiptVerdict::Reverted => {
+                    tracing::warn!(
+                        tx = %r.transaction_hash,
+                        "arbitrage transaction reverted (gas lost; minProfit backstop held)"
+                    );
+                }
+                ReceiptVerdict::MissingEvent => {
+                    tracing::error!(
+                        tx = %r.transaction_hash,
+                        contract = %contract,
+                        token = %expected_token,
+                        "arbitrage transaction mined WITHOUT ArbExecuted: the \
+                         flash-loan callback never ran, no trade happened. Check \
+                         that MORPHO/ARB_CONTRACT point at the real Morpho Blue \
+                         and the arb contract, and redeploy if the contract \
+                         predates the CallbackNotInvoked guard"
+                    );
+                }
+            },
             Err(e) => {
                 tracing::warn!(tx = %tx_hash, error = %e, "failed to fetch transaction receipt");
             }
@@ -983,6 +1119,212 @@ mod tests {
             decoded.feeTier,
             alloy::primitives::Uint::<24, 1>::from(500u32)
         );
+    }
+
+    // --- receipt verdict (audit finding: status-only success) ---
+    //
+    // A receipt must not be reported as a successful trade unless the contract
+    // emitted `ArbExecuted` for the requested loan token. Build the receipts
+    // with the real alloy types (consensus receipt + rpc log) so these tests
+    // exercise the same decode path a live receipt takes.
+
+    use alloy::sol_types::SolEvent;
+
+    /// `ReceiptEnvelope` has no `Default`, so build the EIP-1559 variant.
+    fn envelope(
+        status: bool,
+        logs: Vec<alloy::rpc::types::eth::Log>,
+    ) -> alloy::consensus::ReceiptEnvelope<alloy::rpc::types::eth::Log> {
+        use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+        ReceiptEnvelope::Eip1559(ReceiptWithBloom::<Receipt<_>> {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(status),
+                cumulative_gas_used: 0,
+                logs,
+            },
+            logs_bloom: Default::default(),
+        })
+    }
+
+    fn receipt(
+        status: bool,
+        logs: Vec<alloy::rpc::types::eth::Log>,
+    ) -> alloy::rpc::types::eth::TransactionReceipt {
+        alloy::rpc::types::eth::TransactionReceipt {
+            inner: envelope(status, logs),
+            transaction_hash: Default::default(),
+            transaction_index: None,
+            block_hash: None,
+            block_number: None,
+            gas_used: 0,
+            effective_gas_price: 0,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+        }
+    }
+
+    /// The exact log the contract emits: indexed token/quote topics plus the
+    /// ABI-encoded (amount, profit) data.
+    fn arb_executed_log(
+        token: Address,
+        quote: Address,
+        amount: U256,
+        profit: U256,
+    ) -> alloy::rpc::types::eth::Log {
+        let event = IFlashArbitrage::ArbExecuted {
+            token,
+            quote,
+            amount,
+            profit,
+        };
+        alloy::rpc::types::eth::Log {
+            inner: alloy::primitives::Log {
+                address: CONTRACT,
+                data: event.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: None,
+            ..Default::default()
+        }
+    }
+
+    const CONTRACT: Address = address!("9999999999999999999999999999999999999999");
+    const LOAN: Address = address!("1111111111111111111111111111111111111111");
+    const QUOTE: Address = address!("2222222222222222222222222222222222222222");
+
+    #[test]
+    fn verdict_confirms_on_matching_arb_executed() {
+        let r = receipt(
+            true,
+            vec![arb_executed_log(
+                LOAN,
+                QUOTE,
+                U256::from(1234),
+                U256::from(56),
+            )],
+        );
+        assert_eq!(
+            verdict_from_receipt(&r, CONTRACT, LOAN),
+            ReceiptVerdict::Confirmed {
+                token: LOAN,
+                amount: U256::from(1234),
+                profit: U256::from(56)
+            }
+        );
+    }
+
+    /// A reverted tx is a revert even if it somehow carried the event.
+    #[test]
+    fn verdict_reports_revert_on_failed_status() {
+        let r = receipt(
+            false,
+            vec![arb_executed_log(LOAN, QUOTE, U256::from(1), U256::from(1))],
+        );
+        assert_eq!(
+            verdict_from_receipt(&r, CONTRACT, LOAN),
+            ReceiptVerdict::Reverted
+        );
+    }
+
+    /// Status success with no logs at all — the silent no-op case.
+    #[test]
+    fn verdict_reports_missing_event_on_logless_success() {
+        let r = receipt(true, vec![]);
+        assert_eq!(
+            verdict_from_receipt(&r, CONTRACT, LOAN),
+            ReceiptVerdict::MissingEvent
+        );
+    }
+
+    /// A log with the right shape but emitted by another contract must not
+    /// confirm our trade.
+    #[test]
+    fn verdict_ignores_event_from_other_emitter() {
+        let mut log = arb_executed_log(LOAN, QUOTE, U256::from(1), U256::from(1));
+        log.inner.address = address!("8888888888888888888888888888888888888888");
+        let r = receipt(true, vec![log]);
+        assert_eq!(
+            verdict_from_receipt(&r, CONTRACT, LOAN),
+            ReceiptVerdict::MissingEvent
+        );
+    }
+
+    /// An `ArbExecuted` for a different loan token must not confirm ours.
+    #[test]
+    fn verdict_ignores_event_for_other_token() {
+        let r = receipt(
+            true,
+            vec![arb_executed_log(QUOTE, LOAN, U256::from(1), U256::from(1))],
+        );
+        assert_eq!(
+            verdict_from_receipt(&r, CONTRACT, LOAN),
+            ReceiptVerdict::MissingEvent
+        );
+    }
+
+    /// A fee-free cycle (profit 0) is still a confirmed trade: the event, not
+    /// a positive profit, is what proves the cycle ran.
+    #[test]
+    fn verdict_confirms_zero_profit_cycle() {
+        let r = receipt(
+            true,
+            vec![arb_executed_log(
+                LOAN,
+                QUOTE,
+                U256::from(1_000_000),
+                U256::from(0),
+            )],
+        );
+        assert_eq!(
+            verdict_from_receipt(&r, CONTRACT, LOAN),
+            ReceiptVerdict::Confirmed {
+                token: LOAN,
+                amount: U256::from(1_000_000),
+                profit: U256::ZERO
+            }
+        );
+    }
+
+    /// The mixed case: an unrelated log ahead of the real one must not stop
+    /// the scan.
+    #[test]
+    fn verdict_scans_past_unrelated_logs() {
+        use alloy::primitives::LogData;
+        let unrelated = alloy::rpc::types::eth::Log {
+            inner: alloy::primitives::Log {
+                address: CONTRACT,
+                data: LogData::new_unchecked(vec![B256::ZERO], Default::default()),
+            },
+            block_hash: None,
+            block_number: None,
+            ..Default::default()
+        };
+        let r = receipt(
+            true,
+            vec![
+                unrelated,
+                arb_executed_log(LOAN, QUOTE, U256::from(7), U256::from(3)),
+            ],
+        );
+        assert_eq!(
+            verdict_from_receipt(&r, CONTRACT, LOAN),
+            ReceiptVerdict::Confirmed {
+                token: LOAN,
+                amount: U256::from(7),
+                profit: U256::from(3)
+            }
+        );
+    }
+
+    /// The missing-event message must be actionable, not a generic failure.
+    #[test]
+    fn missing_event_verdict_message_is_actionable() {
+        let msg = ReceiptVerdict::MissingEvent.to_string();
+        assert!(msg.contains("ArbExecuted"));
+        assert!(msg.contains("callback never ran"));
     }
 
     #[test]
