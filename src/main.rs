@@ -11,8 +11,8 @@ use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
     fetch_cl_pair_tokens, fetch_pair_tokens, fetch_quotes, fetch_scan_snapshot,
-    fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id, PairTokens,
-    QuoteRequest,
+    fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id,
+    verify_quoter_factory, PairTokens, QuoteRequest,
 };
 use morpho_arbitrage_bot::executor::{self, OwnershipMismatch};
 use morpho_arbitrage_bot::sim::SimOutcome;
@@ -162,6 +162,15 @@ impl VenueCache {
                         venue.fee_bps
                     );
                 }
+            }
+            if venue.kind == VenueKind::Slipstream || venue.kind == VenueKind::UniswapV3 {
+                // Guard against a quoter wired to the other CL deployment:
+                // Aerodrome's legacy and successor factories both mint pools
+                // for this pair at the same tickSpacing, and a mismatched
+                // quoter returns a plausible price for the *other* pool
+                // instead of reverting (see `verify_quoter_factory`).
+                verify_quoter_factory(provider, resolve_quoter(cfg, venue), venue.factory, idx)
+                    .await?;
             }
             let tokens = if venue.kind == VenueKind::UniswapV3 {
                 v3_idx.push(idx);

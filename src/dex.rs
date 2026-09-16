@@ -227,6 +227,16 @@ sol! {
         function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address pool);
     }
 
+    // QuoterV2 exposes the factory it prices for. Used to prove a venue's
+    // quoter and pool belong to the same deployment: Aerodrome runs at least
+    // two CL factories whose pools share tickSpacing values (1, 10, ...), so
+    // a mismatched quoter does not revert — it silently prices a *different*
+    // pool of the same pair and spacing, which is worse than a failure.
+    #[sol(rpc)]
+    interface IQuoterFactory {
+        function factory() external view returns (address);
+    }
+
     // Aerodrome router can resolve its default factory.
     #[sol(rpc)]
     interface IAerodromeRouter {
@@ -1209,6 +1219,46 @@ pub async fn fetch_cl_pair_tokens<P: Provider>(provider: &P, pool: Address) -> R
     let token0 = pool_contract.token0().call().await?;
     let token1 = pool_contract.token1().call().await?;
     Ok(PairTokens { token0, token1 })
+}
+
+/// Prove `quoter` prices pools created by `factory`.
+///
+/// Aerodrome has migrated CL to a second factory (0xf8f2eB49...61Ef) beside
+/// the legacy one (0x5e7BB104...809A). Both mint pools for the same pair at
+/// the same tickSpacing, and both quoters accept the same `inputSingle`
+/// calldata, so pairing a venue's pool with the wrong deployment's quoter does
+/// not revert — the quoter resolves its *own* factory's pool for that
+/// (pair, tickSpacing) and returns a plausible but unrelated price. Observed
+/// on Base: the legacy quoter returned 53_757 for 1 WETH through a ts=10 leg
+/// whose real pool quotes ~3.16e6 (the legacy ts=10 pool is nearly empty).
+/// An unprofitable cycle simply never fires, so nothing surfaces the error.
+///
+/// A `factory()` cross-check turns that silent mispricing into a startup
+/// failure. Non-contract quoters (e.g. a V4 quoter, which has no factory) are
+/// left alone: only a positive mismatch is fatal.
+pub async fn verify_quoter_factory<P: Provider>(
+    provider: &P,
+    quoter: Address,
+    factory: Address,
+    idx: usize,
+) -> Result<()> {
+    if quoter.is_zero() || factory.is_zero() {
+        return Ok(());
+    }
+    let on_chain = match IQuoterFactory::new(quoter, provider).factory().call().await {
+        Ok(f) => f,
+        // No `factory()` on this quoter (or a non-standard ABI): nothing to
+        // cross-check against, so do not block startup on it.
+        Err(_) => return Ok(()),
+    };
+    if on_chain != factory {
+        eyre::bail!(
+            "venue {idx}: quoter {quoter} prices factory {on_chain}, but the venue \
+             is configured with factory {factory}. This quoter would silently price \
+             a different pool of the same pair and tickSpacing"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

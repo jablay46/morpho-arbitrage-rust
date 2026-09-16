@@ -311,7 +311,7 @@ Variabel yang tersedia:
 | `OWNER_REFRESH_SECS` | Tidak | Frekuensi re-check `owner()` kontrak (detik). Owner bisa berpindah saat runtime (transfer dua langkah); cache di-refresh dan divalidasi terhadap wallet signing. Bila berpindah ke key lain, bot berhenti dengan error eksplisit. Default `60`. |
 | `GAS_PRICE_WEI` | Tidak | Override gas price; default diambil on-chain. |
 | `QUOTER_V2` | Tidak | Alamat QuoterV2 untuk pricing V3. Default `0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a` (**khusus Base**; chain lain wajib diisi, mis. Ethereum mainnet `0x61fFE014bA17989E743c5F6cB21bF9697530B21e`). |
-| `QUOTER_SLIPSTREAM` | Tidak | Alamat Quoter Aerodrome Slipstream untuk pricing venue `slipstream`. Default `0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0` (**khusus Base**). |
+| `QUOTER_SLIPSTREAM` | Tidak | Alamat Quoter Aerodrome Slipstream untuk pricing venue `slipstream`. Default `0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0` (**khusus Base**). Quoter default ini hanya melayani CL factory lama; venue trên factory baru wajib mengisi `quoter` per-venue (lihat [dua CL factory](#dua-cl-factory-aerodrome-di-base)). |
 | `QUOTER_V4` | Tidak | Alamat Uniswap V4 Quoter untuk pricing venue `v4`. Default `0x0d5e0f971ed27fbff6c2837bf31316121532048d` (**khusus Base**). |
 | `POLL_INTERVAL_MS` | Tidak | Interval polling untuk mode `scan` tanpa WSS. Default `500`. |
 | `SWEEP_INTERVAL_BLOCKS` | Tidak | Interval sweep penuh (block) sebagai safety net di mode event-driven: scan dipicu event pool, tapi tetap dipaksa minimal tiap N block. Default `10`. |
@@ -333,7 +333,7 @@ kind = "v2"                      # v2 | aero | v3 | slipstream | v4
 fee_bps = 30                     # fee pool dalam basis point (default 30; untuk V2/Aero)
 factory = "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
 stable = false                   # true untuk pool stable Aerodrome
-fee_tier = 3000                  # fee tier V3 (500/3000/10000); untuk slipstream = tickSpacing (1/50/100/200/2000)
+fee_tier = 3000                  # fee tier V3 (500/3000/10000); untuk slipstream = tickSpacing (1/10/50/100/200/2000)
 pool_id = "0x0000..."            # Uniswap V4 pool ID (default 0)
 quoter = "0x0000..."             # override QuoterV2 per-venue (V3, opsional)
 ```
@@ -342,7 +342,7 @@ quoter = "0x0000..."             # override QuoterV2 per-venue (V3, opsional)
 - `kind` = `v2` (default) | `aero` | `v3` | `slipstream` | `v4`.
 - `fee_bps` = fee pool dalam basis point (default 30; untuk V2/Aero).
 - `fee_tier` = fee tier Uniswap V3 dalam hundredths of a bip (500/3000/10000).
-  Untuk `slipstream` field ini membawa **tickSpacing** pool (1/50/100/200/2000).
+  Untuk `slipstream` field ini membawa **tickSpacing** pool (1/10/50/100/200/2000).
   Untuk `v4` field ini membawa **fee PoolKey** (hundredths of a bip).
 - `stable` = `true` untuk pool stable Aerodrome.
 - Untuk `v4`: `pool_id` wajib diisi (pool ID = `keccak256(abi.encode(PoolKey))`),
@@ -471,6 +471,56 @@ fee_tier = 100
 pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
 quoter = "0x0000000000000000000000000000000000000000"
 ```
+
+### Dua CL factory Aerodrome di Base
+
+Aerodrome memigrasikan CL ke factory **kedua**. Keduanya masih hidup dan
+sama-sama men-*mint* pool untuk pasangan yang sama pada tickSpacing yang
+sama, jadi pasangan `(factory, router, quoter)` harus konsisten — tidak boleh
+dicampur antar generasi:
+
+| | Factory lama | Factory baru |
+|---|---|---|
+| CLFactory | `0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A` | `0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef` |
+| SwapRouter | `0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5` | `0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F` |
+| QuoterV2 | `0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0` | `0x514c8B5f54112481E28028F1166Bd78501089259` |
+| tickSpacing | `1`, `100` | `1`, `10`, `50` |
+
+Router kedua memakai selector `exactInputSingle` yang sama dengan router lama
+(`0xa026383e`), jadi `kind = "slipstream"` sudah menangani keduanya tanpa
+perubahan kontrak.
+
+**Kenapa mismatch berbahaya.** Kedua quoter menerima calldata yang identik.
+Quoter generasi salah tidak revert — ia me-resolve pool milik factory-nya
+sendiri untuk `(pair, tickSpacing)` itu dan mengembalikan harga yang masuk
+akal tapi berasal dari pool lain. Terukur di Base: quoter lama mengembalikan
+`53_757` untuk 1 WETH lewat leg ts=10, padahal pool ts=10 yang benar
+meng-quote ~`3.16e6` (pool ts=10 milik factory lama hampir kosong). Karena
+peluang yang tidak profitable hanya tidak pernah dieksekusi, tidak ada yang
+memunculkan error ini. Bot karena itu memverifikasi `quoter.factory()` ==
+`factory` venue saat startup dan menolak jalan bila tidak cocok.
+
+Karena quoter baru berbeda dari default, quoter-nya **wajib** diisi per-venue
+(tidak ada env var global untuk ini — satu quoter global tidak bisa
+membedakan dua factory). Contoh venue ts=10 di factory baru:
+
+```toml
+[[venues]]
+pair = "0x42d4a22CaD0F5a49681a5715cE994Af73A43B76b"
+router = "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"   # router BARU
+kind = "slipstream"
+fee_bps = 30
+factory = "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"  # factory BARU
+stable = false
+fee_tier = 10                                           # tickSpacing, bukan fee
+pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+quoter = "0x514c8B5f54112481E28028F1166Bd78501089259"   # quoter BARU — wajib
+```
+
+Perhatikan bahwa `fee_tier` untuk `slipstream` adalah tickSpacing, sehingga
+pool dengan fee dinamis (mis. ts=10 di factory baru, teramati bergerak 3–6
+bps lewat `swapFeeModule`) tidak butuh field fee sama sekali — bot membaca
+`fee()` pool on-chain saat caching state CL.
 
 ## 6. Menjalankan Bot
 
