@@ -1,5 +1,15 @@
-# WETH/cbBTC — 6 venues: UniV2 | Aero 30bps | UniV3 500 | PancakeV3 100 (custom quoter) | Slipstream ts=1/100
+# WETH/cbBTC — 8 venues: UniV2 | Aero 30bps | UniV3 500 | PancakeV3 100 (custom quoter) | Slipstream ts=1/100 + Aerodrome CL baru ts=1/10
 # Use with: CONFIG_FILE=config.weth-cbbtc.toml
+#
+# Venue 0 (UniV2 0x4fe4A5f5...) is nearly empty (~0.5 WETH / 0.016 cbBTC
+# reserves); it almost never wins but costs a quote per scan. Drop it if you
+# only care about the deep pools below.
+#
+# Aerodrome migrated CL to a SECOND factory (0xf8f2eB49...) beside the legacy
+# one (0x5e7BB104...). Both mint pools for the same pair at the same
+# tickSpacing, so a venue pointing at one factory MUST use that factory's
+# router (0x698Cb2b6...) and quoter (0x514c8B5f...). Startup verifies the
+# quoter↔factory pairing and refuses to run on a mismatch.
 
 [[venues]]
 pair = "0x4fe4A5f570b046E3704ACd72fef6c508A310D3AA"
@@ -66,3 +76,32 @@ stable = false
 fee_tier = 100
 pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
 quoter = "0x0000000000000000000000000000000000000000"
+
+# Aerodrome CL (factory baru 0xf8f2eB49...) V3 pool WETH/cbBTC ts=1.
+# Pool tertebal-2 pada ukuran <=10 WETH, tapi likuiditasnya sangat terkonsentrasi:
+# slippage melonjak >1200 bps pada 100 WETH. Cocok untuk size kecil-menengah.
+[[venues]]
+pair = "0x7C7420DD105E2779316423Ba3E973f434315EFA9"
+router = "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"
+kind = "slipstream"
+fee_bps = 30
+factory = "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"
+stable = false
+fee_tier = 1
+pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+quoter = "0x514c8B5f54112481E28028F1166Bd78501089259"
+
+# Aerodrome CL (factory baru 0xf8f2eB49...) V3 pool WETH/cbBTC ts=10.
+# Pool TERDALAM untuk pasangan ini: slippage ~4 bps bahkan pada 100 WETH.
+# fee()-nya dinamis (diamati bergerak 3-6 bps via swapFeeModule), dibaca
+# on-chain per cache, jadi tidak dikonfigurasi di sini.
+[[venues]]
+pair = "0x42d4a22CaD0F5a49681a5715cE994Af73A43B76b"
+router = "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"
+kind = "slipstream"
+fee_bps = 30
+factory = "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"
+stable = false
+fee_tier = 10
+pool_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+quoter = "0x514c8B5f54112481E28028F1166Bd78501089259"

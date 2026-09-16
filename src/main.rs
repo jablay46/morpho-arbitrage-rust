@@ -11,8 +11,8 @@ use morpho_arbitrage_bot::cl_math::cl_quote_exact_in;
 use morpho_arbitrage_bot::config::{Config, VenueKind};
 use morpho_arbitrage_bot::dex::{
     fetch_cl_pair_tokens, fetch_pair_tokens, fetch_quotes, fetch_scan_snapshot,
-    fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id, PairTokens,
-    QuoteRequest,
+    fetch_v3_pair_tokens, orient_reserves, probe_flashblocks_ws, read_block_id,
+    verify_cl_pool_matches_factory, verify_quoter_factory, PairTokens, QuoteRequest,
 };
 use morpho_arbitrage_bot::executor::{self, OwnershipMismatch};
 use morpho_arbitrage_bot::sim::SimOutcome;
@@ -115,22 +115,19 @@ impl VenueCache {
         let mut v4_pool_ids = Vec::new();
         let mut pool_addrs = Vec::with_capacity(cfg.venues.len());
         for (idx, venue) in cfg.venues.iter().enumerate() {
+            let query = morpho_arbitrage_bot::dex::PoolQuery {
+                kind: venue.kind,
+                factory: venue.factory,
+                router: venue.router,
+                token_a: cfg.loan_token,
+                token_b: cfg.quote_token,
+                stable: venue.stable,
+                fee_tier: venue.fee_tier,
+            };
             // Auto-resolve the pool from the venue's factory when the
             // config says "auto" (pair = Address::ZERO).
             let pool = if venue.pair == Address::ZERO {
-                let pool = morpho_arbitrage_bot::dex::resolve_pool(
-                    provider,
-                    &morpho_arbitrage_bot::dex::PoolQuery {
-                        kind: venue.kind,
-                        factory: venue.factory,
-                        router: venue.router,
-                        token_a: cfg.loan_token,
-                        token_b: cfg.quote_token,
-                        stable: venue.stable,
-                        fee_tier: venue.fee_tier,
-                    },
-                )
-                .await?;
+                let pool = morpho_arbitrage_bot::dex::resolve_pool(provider, &query).await?;
                 info!(venue = idx, pool = %pool, kind = ?venue.kind, "pool auto-resolved");
                 pool
             } else {
@@ -161,6 +158,26 @@ impl VenueCache {
                          every quote from this venue)",
                         venue.fee_bps
                     );
+                }
+            }
+            if venue.kind == VenueKind::Slipstream || venue.kind == VenueKind::UniswapV3 {
+                // Guard against a quoter wired to the other CL deployment:
+                // Aerodrome's legacy and successor factories both mint pools
+                // for this pair at the same tickSpacing, and a mismatched
+                // quoter returns a plausible price for the *other* pool
+                // instead of reverting (see `verify_quoter_factory`).
+                verify_quoter_factory(provider, resolve_quoter(cfg, venue), venue.factory, idx)
+                    .await?;
+                // An explicit `pair` is otherwise taken on trust: the quoter
+                // check only proves which factory the quoter prices, not that
+                // this pool belongs to it. A same-token pool from another
+                // deployment (e.g. the legacy and successor Aerodrome CL
+                // factories both have a WETH/cbBTC ts=1 pool) would supply
+                // cached state while quotes and execution target the
+                // factory's pool. `pair = "auto"` needs no check — it was
+                // resolved from this same factory lookup above.
+                if venue.pair != Address::ZERO {
+                    verify_cl_pool_matches_factory(provider, &query, pool, idx).await?;
                 }
             }
             let tokens = if venue.kind == VenueKind::UniswapV3 {

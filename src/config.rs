@@ -5,6 +5,24 @@ use serde::Deserialize;
 use std::env;
 use std::str::FromStr;
 
+/// tickSpacing values a Slipstream CL venue may be configured with. Pools are
+/// discriminated by tickSpacing, not by a fee, and every spacing here is live
+/// on Base: the legacy CLFactory exposes {1, 100}, its successor {1, 10, 50},
+/// and 200/2000 come from the shared set. A spacing outside this list cannot
+/// resolve to a pool, so it is rejected at startup rather than quoting a pool
+/// that does not exist.
+const VALID_TICK_SPACINGS: [u32; 6] = [1, 10, 50, 100, 200, 2000];
+
+/// Render [`VALID_TICK_SPACINGS`] for the rejection message so the accepted set
+/// lives in exactly one place.
+fn valid_tick_spacings_display() -> String {
+    VALID_TICK_SPACINGS
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Router family of a venue; must match `KIND_*` constants in the contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum VenueKind {
@@ -397,10 +415,11 @@ impl Config {
                 // Slipstream CL pools are discriminated by tickSpacing (not a
                 // fee), stored in `fee_tier` (uint24) so the leg carries it to
                 // both the quoter call and the on-chain exactInputSingle.
-                if kind == VenueKind::Slipstream && !matches!(fee_tier, 1 | 50 | 100 | 200 | 2000) {
+                if kind == VenueKind::Slipstream && !VALID_TICK_SPACINGS.contains(&fee_tier) {
                     return Err(eyre!(
                         "DEX_VENUES '{entry}': slipstream fee_tier must be a tickSpacing \
-                         in {{1, 50, 100, 200, 2000}}"
+                         in {{{}}}",
+                        valid_tick_spacings_display()
                     ));
                 }
                 // "auto" = resolve the pool from the factory at startup.
@@ -450,12 +469,11 @@ impl Config {
         if venue.fee_bps >= 10_000 {
             return Err(eyre!("venue {idx}: fee_bps {} too high", venue.fee_bps));
         }
-        if venue.kind == VenueKind::Slipstream
-            && !matches!(venue.fee_tier, 1 | 50 | 100 | 200 | 2000)
-        {
+        if venue.kind == VenueKind::Slipstream && !VALID_TICK_SPACINGS.contains(&venue.fee_tier) {
             return Err(eyre!(
                 "venue {idx}: slipstream fee_tier must be a tickSpacing \
-                 in {{1, 50, 100, 200, 2000}}"
+                 in {{{}}}",
+                valid_tick_spacings_display()
             ));
         }
         if venue.pair.is_zero() && venue.factory.is_zero() && venue.kind != VenueKind::Aerodrome {
@@ -864,6 +882,42 @@ mod tests {
             hooks: Address::ZERO,
             zero_for_one: false,
             quoter: Address::ZERO,
+        }
+    }
+
+    #[test]
+    fn accepts_tickspacings_from_both_aerodrome_cl_factories() {
+        // ts=10 only exists on the successor CLFactory, but it must validate:
+        // rejecting it would make the deepest WETH/cbBTC CL pool (and every
+        // other ts=10/50 pool) unreachable.
+        let loan = Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let quote = Address::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        for ts in VALID_TICK_SPACINGS {
+            let mut v = venue();
+            v.kind = VenueKind::Slipstream;
+            v.fee_tier = ts;
+            v.factory = Address::from_str("0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef").unwrap();
+            assert!(
+                Config::validate_venue(loan, quote, 0, &v).is_ok(),
+                "tickSpacing {ts} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_tickspacing_outside_the_live_set() {
+        let loan = Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let quote = Address::from_str("0x0000000000000000000000000000000000000002").unwrap();
+        for ts in [0, 5, 60, 199, 500, 9999, 2001] {
+            let mut v = venue();
+            v.kind = VenueKind::Slipstream;
+            v.fee_tier = ts;
+            v.factory = Address::from_str("0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef").unwrap();
+            let err = Config::validate_venue(loan, quote, 0, &v).unwrap_err();
+            assert!(
+                err.to_string().contains("tickSpacing"),
+                "tickSpacing {ts} gave unexpected error: {err}"
+            );
         }
     }
 

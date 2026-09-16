@@ -227,6 +227,16 @@ sol! {
         function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address pool);
     }
 
+    // QuoterV2 exposes the factory it prices for. Used to prove a venue's
+    // quoter and pool belong to the same deployment: Aerodrome runs at least
+    // two CL factories whose pools share tickSpacing values (1, 10, ...), so
+    // a mismatched quoter does not revert — it silently prices a *different*
+    // pool of the same pair and spacing, which is worse than a failure.
+    #[sol(rpc)]
+    interface IQuoterFactory {
+        function factory() external view returns (address);
+    }
+
     // Aerodrome router can resolve its default factory.
     #[sol(rpc)]
     interface IAerodromeRouter {
@@ -1211,6 +1221,114 @@ pub async fn fetch_cl_pair_tokens<P: Provider>(provider: &P, pool: Address) -> R
     Ok(PairTokens { token0, token1 })
 }
 
+/// Prove `quoter` prices pools created by `factory`.
+///
+/// Aerodrome has migrated CL to a second factory (0xf8f2eB49...61Ef) beside
+/// the legacy one (0x5e7BB104...809A). Both mint pools for the same pair at
+/// the same tickSpacing, and both quoters accept the same `inputSingle`
+/// calldata, so pairing a venue's pool with the wrong deployment's quoter does
+/// not revert — the quoter resolves its *own* factory's pool for that
+/// (pair, tickSpacing) and returns a plausible but unrelated price. Observed
+/// on Base: the legacy quoter returned 53_757 for 1 WETH through a ts=10 leg
+/// whose real pool quotes ~3.16e6 (the legacy ts=10 pool is nearly empty).
+/// An unprofitable cycle simply never fires, so nothing surfaces the error.
+///
+/// A `factory()` cross-check turns that silent mispricing into a startup
+/// failure.
+///
+/// Only an *empty successful return* is read as "this quoter has no
+/// `factory()`". That shape is positive evidence: the call went through and
+/// the address answered the selector with no data, which is what a
+/// non-quoter contract with a fallback (and an account with no code at all)
+/// does. A JSON-RPC error response is NOT evidence of anything, because
+/// throttling and a genuinely missing selector are indistinguishable — both
+/// arrive as `{"code":3,"message":"execution reverted"}` from a plain
+/// provider. So every such failure aborts startup instead of being read as
+/// "unsupported", which is the same conservative reading this file already
+/// applies to the Aerodrome fee lookup.
+pub async fn verify_quoter_factory<P: Provider>(
+    provider: &P,
+    quoter: Address,
+    factory: Address,
+    idx: usize,
+) -> Result<()> {
+    if quoter.is_zero() || factory.is_zero() {
+        return Ok(());
+    }
+    let on_chain = match IQuoterFactory::new(quoter, provider).factory().call().await {
+        Ok(f) => f,
+        // The address answered `factory()` with no data: either it has no such
+        // function and a fallback swallowed the call, or it holds no code.
+        // Neither can be the mismatched-but-valid quoter this guard hunts, so
+        // there is nothing to cross-check and startup may continue.
+        Err(alloy::contract::Error::ZeroData(..)) => return Ok(()),
+        // Everything else — transport failure, HTTP error, timeout, rate
+        // limit, or any revert — leaves the pairing unproven. Refuse to start
+        // rather than assume the quoter is merely unsupported: a transient
+        // failure read as "unsupported" is exactly how an unvalidated quoter
+        // reaches the hot path.
+        Err(e) => {
+            return Err(e).wrap_err_with(|| {
+                format!(
+                    "venue {idx}: verifying that quoter {quoter} prices factory {factory} \
+                     failed. This is not proof that the quoter lacks `factory()` (a \
+                     rate-limited or otherwise failing provider reports the same way as a \
+                     missing selector), so the pairing cannot be trusted; refusing to start"
+                )
+            })
+        }
+    };
+    if on_chain != factory {
+        eyre::bail!(
+            "venue {idx}: quoter {quoter} prices factory {on_chain}, but the venue \
+             is configured with factory {factory}. This quoter would silently price \
+             a different pool of the same pair and tickSpacing"
+        );
+    }
+    Ok(())
+}
+
+/// Prove an explicit `pool` is the pool `factory` deploys for the cycle's pair
+/// at the configured fee tier / tick spacing.
+///
+/// [`verify_quoter_factory`] only ties the *quoter* to the factory. An explicit
+/// `pair` is otherwise never checked against the factory, so a same-token pool
+/// from another deployment could feed cached state while quotes and execution
+/// target a pool the factory does not own. On Base this is concrete rather
+/// than theoretical: the legacy and successor Aerodrome CL factories both
+/// deploy a WETH/cbBTC pool at tickSpacing 1, at different addresses
+/// (0x22AeE369... vs 0x7C7420DD...).
+///
+/// The factory's own `getPool` answer is the authority on which pool it will
+/// trade, so startup aborts on a lookup failure, a zero result, or a mismatch.
+/// Auto-resolved pools (`pair = "auto"`) need no separate check: they come
+/// from this same lookup.
+pub async fn verify_cl_pool_matches_factory<P: Provider>(
+    provider: &P,
+    q: &PoolQuery,
+    pool: Address,
+    idx: usize,
+) -> Result<()> {
+    if q.factory.is_zero() || pool.is_zero() {
+        return Ok(());
+    }
+    let (factory, token_a, token_b, fee_tier) = (q.factory, q.token_a, q.token_b, q.fee_tier);
+    let resolved = resolve_pool(provider, q).await.wrap_err_with(|| {
+        format!(
+            "venue {idx}: factory {factory} could not resolve the {token_a}/{token_b} pool \
+             at fee_tier/tickSpacing {fee_tier}; refusing to start with an unverified pool"
+        )
+    })?;
+    if resolved != pool {
+        eyre::bail!(
+            "venue {idx}: factory {factory} resolves {token_a}/{token_b} at \
+             fee_tier/tickSpacing {fee_tier} to pool {resolved}, but the config names pool \
+             {pool}. Scanning and execution would trade different pools of the same pair"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{get_amount_out, n128, quote_calldata, unsigned_tx_rlp_len, L1FeeOracle};
@@ -1487,5 +1605,255 @@ mod tests {
         let amount_word = &cd[4 + 32 * 7..4 + 32 * 8];
         let decoded = U256::from_be_slice(amount_word);
         assert_eq!(decoded, U256::from(1000u64));
+    }
+
+    /// A quoter that answers `factory()` with a different address is the bug
+    /// this guard exists for: its quotes are valid, just for another pool of
+    /// the same pair and tickSpacing.
+    #[tokio::test]
+    async fn quoter_pricing_another_factory_is_rejected() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let quoter = Address::repeat_byte(0xb1);
+        let configured = Address::repeat_byte(0xa1);
+        let actual = Address::repeat_byte(0xa2);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&mock_word_address(actual));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = super::verify_quoter_factory(&provider, quoter, configured, 3)
+            .await
+            .expect_err("a quoter pricing another factory must not validate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prices factory") && msg.contains("venue 3"),
+            "expected a quoter/factory mismatch naming the venue, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quoter_matching_the_factory_passes() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let quoter = Address::repeat_byte(0xb1);
+        let factory = Address::repeat_byte(0xa1);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&mock_word_address(factory));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        super::verify_quoter_factory(&provider, quoter, factory, 0)
+            .await
+            .expect("a quoter pricing the configured factory must validate");
+    }
+
+    /// An empty *successful* return is positive evidence the address has no
+    /// `factory()` (a fallback swallowed the call, or there is no code), so
+    /// there is nothing to cross-check. This is the only shape that may skip
+    /// the guard.
+    #[tokio::test]
+    async fn quoter_empty_return_is_unsupported_not_fatal() {
+        use alloy::primitives::Bytes;
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        super::verify_quoter_factory(
+            &provider,
+            Address::repeat_byte(0xc1),
+            Address::repeat_byte(0xa1),
+            0,
+        )
+        .await
+        .expect("an address with no factory() has nothing to cross-check");
+    }
+
+    /// Regression: every non-empty failure used to be read as "method
+    /// unsupported", so a throttled or otherwise broken provider let an
+    /// unvalidated quoter through. A JSON-RPC error response is not evidence
+    /// that the method is missing — throttling and a missing selector are
+    /// indistinguishable on the wire — so it must abort startup.
+    #[tokio::test]
+    async fn quoter_rpc_error_response_is_fatal() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        // The exact payload a plain Base provider returns for both a throttled
+        // request and a missing selector; it must not be read as "unsupported".
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("execution reverted");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = super::verify_quoter_factory(
+            &provider,
+            Address::repeat_byte(0xc1),
+            Address::repeat_byte(0xa1),
+            2,
+        )
+        .await
+        .expect_err("an unproven pairing must not be read as unsupported");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to start") && msg.contains("venue 2"),
+            "expected a refusal naming the venue, got: {msg}"
+        );
+    }
+
+    /// The specific case the review called out: a rate-limited provider must
+    /// not be mistaken for a quoter without `factory()`.
+    #[tokio::test]
+    async fn quoter_rate_limit_is_fatal() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("rate limit exceeded");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = super::verify_quoter_factory(
+            &provider,
+            Address::repeat_byte(0xc1),
+            Address::repeat_byte(0xa1),
+            0,
+        )
+        .await
+        .expect_err("a rate-limited lookup proves nothing about the pairing");
+        assert!(
+            err.to_string().contains("refusing to start"),
+            "a rate limit must be reported as an unproven pairing, got: {err}"
+        );
+    }
+
+    /// A zero quoter or factory has nothing to cross-check, so it must not
+    /// consume an RPC round-trip or block startup.
+    #[tokio::test]
+    async fn zero_quoter_or_factory_skips_the_check() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        // An empty queue makes any RPC call fail, so a passing guard here
+        // proves the check short-circuited instead of calling out.
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+
+        super::verify_quoter_factory(&provider, Address::ZERO, Address::repeat_byte(0xa1), 0)
+            .await
+            .expect("a zero quoter skips the check");
+        super::verify_quoter_factory(&provider, Address::repeat_byte(0xc1), Address::ZERO, 0)
+            .await
+            .expect("a zero factory skips the check");
+    }
+
+    /// A `PoolQuery` for a slipstream venue, the only fields the explicit-pool
+    /// guard reads.
+    fn slipstream_query(factory: Address, fee_tier: u32) -> crate::dex::PoolQuery {
+        crate::dex::PoolQuery {
+            kind: crate::config::VenueKind::Slipstream,
+            factory,
+            router: Address::ZERO,
+            token_a: Address::repeat_byte(0xaa),
+            token_b: Address::repeat_byte(0xbb),
+            stable: false,
+            fee_tier,
+        }
+    }
+
+    /// The factory's `getPool` answer is the authority on which pool it
+    /// trades, so an explicit pool that disagrees with it must be refused.
+    #[tokio::test]
+    async fn explicit_pool_from_another_factory_is_rejected() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let factory = Address::repeat_byte(0xf1);
+        let configured_pool = Address::repeat_byte(0xc1);
+        let factory_pool = Address::repeat_byte(0xc2);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&mock_word_address(factory_pool));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = super::verify_cl_pool_matches_factory(
+            &provider,
+            &slipstream_query(factory, 1),
+            configured_pool,
+            4,
+        )
+        .await
+        .expect_err("a pool the factory does not own must not validate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("but the config names pool") && msg.contains("venue 4"),
+            "expected a pool/factory mismatch naming the venue, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_pool_matching_the_factory_passes() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let factory = Address::repeat_byte(0xf1);
+        let pool = Address::repeat_byte(0xc1);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&mock_word_address(pool));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        super::verify_cl_pool_matches_factory(&provider, &slipstream_query(factory, 1), pool, 0)
+            .await
+            .expect("the factory's own pool must validate");
+    }
+
+    /// Unlike the quoter guard, an empty return here means the factory itself
+    /// is not a factory, so there is no pool to trust and startup must stop.
+    #[tokio::test]
+    async fn explicit_pool_with_unresolvable_factory_is_fatal() {
+        use alloy::primitives::Bytes;
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = super::verify_cl_pool_matches_factory(
+            &provider,
+            &slipstream_query(Address::repeat_byte(0xf1), 1),
+            Address::repeat_byte(0xc1),
+            5,
+        )
+        .await
+        .expect_err("a factory that cannot resolve the pair must block startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not resolve") && msg.contains("venue 5"),
+            "expected an unresolvable-factory error naming the venue, got: {msg}"
+        );
+    }
+
+    /// `pair = "auto"` was resolved from this same lookup, so an explicit-pool
+    /// check would be redundant; a zero pool must short-circuit (the empty
+    /// mock queue fails any RPC call).
+    #[tokio::test]
+    async fn zero_explicit_pool_skips_the_check() {
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+
+        super::verify_cl_pool_matches_factory(
+            &provider,
+            &slipstream_query(Address::repeat_byte(0xf1), 1),
+            Address::ZERO,
+            0,
+        )
+        .await
+        .expect("a zero pool has nothing to verify");
     }
 }
