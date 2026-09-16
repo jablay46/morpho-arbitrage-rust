@@ -500,6 +500,24 @@ peluang yang tidak profitable hanya tidak pernah dieksekusi, tidak ada yang
 memunculkan error ini. Bot karena itu memverifikasi `quoter.factory()` ==
 `factory` venue saat startup dan menolak jalan bila tidak cocok.
 
+Verifikasi yang sama juga menolak jalan bila `factory()` sendiri gagal
+dipanggil. Provider yang ter-*rate limit* dan selector yang memang tidak ada
+menghasilkan respons yang identik — `{"code":3,"message":"execution
+reverted"}` — sehingga kegagalan itu **bukan** bukti bahwa kontrak tidak punya
+`factory()`. Hanya *return sukses yang kosong* (`0x`) yang dibaca sebagai
+"tidak ada `factory()`", bentuk yang diberikan kontrak non-quoter dengan
+fallback. Konsekuensinya: startup gagal (dan bisa di-retry) alih-alih lanjut
+dengan quoter yang belum tervalidasi.
+
+Venue dengan `pair` eksplisit juga diperiksa terhadap factory-nya: bot
+memanggil `getPool(pair, tickSpacing)` di factory venue dan menolak jalan bila
+alamatnya berbeda dari `pair` di config. Pada Base ini nyata — kedua CL
+factory Aerodrome sama-sama punya pool WETH/cbBTC ts=1 di alamat berbeda
+(`0x22AeE369...` vs `0x7C7420DD...`), jadi pool milik generasi lain tidak bisa
+dipakai sebagai sumber state sementara quote dan eksekusi menuju pool milik
+factory venue. Venue `pair = "auto"` tidak butuh pemeriksaan ini karena
+alamatnya sudah berasal dari lookup yang sama.
+
 Karena quoter baru berbeda dari default, quoter-nya **wajib** diisi per-venue
 (tidak ada env var global untuk ini — satu quoter global tidak bisa
 membedakan dua factory). Contoh venue ts=10 di factory baru:
