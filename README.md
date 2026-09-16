@@ -17,6 +17,7 @@ Aerodrome, dan Uniswap V3 — dengan memindai semua pasangan arah terurut.
 8. [Mode Produksi](#7-mode-produksi)
 9. [Troubleshooting](#8-troubleshooting)
 10. [Catatan Keamanan](#catatan-keamanan)
+11. [Lisensi](#lisensi)
 
 ## Arsitektur
 
@@ -661,3 +662,9 @@ Tips produksi:
 - Pertahanan berlapis: `minOut` per leg → `minProfit` on-chain →
   `eth_estimateGas` sebagai gate simulasi. Kegagalan terburuk adalah rugi gas,
   bukan kehilangan principal (flash loan yang gagal otomatis revert).
+
+## Lisensi
+
+Dirilis di bawah [MIT License](LICENSE) — bebas dipakai, dimodifikasi, dan
+didistribusikan, termasuk untuk keperluan komersial, dengan syarat menyertakan
+copyright notice dan teks lisensi. Software disediakan "as-is" tanpa jaminan.
