@@ -136,6 +136,33 @@ impl VenueCache {
             } else {
                 venue.pair
             };
+            // Aerodrome is the only kind whose factory lookup ignores the
+            // fee, so a stale `fee_bps` would silently misprice every quote
+            // from this venue (a 30-vs-100 bps mix-up is ~0.7% of notional —
+            // far more than any realistic edge). Prove the factory resolves
+            // this pair to the configured pool and owns it, then read the
+            // canonical per-pool fee and refuse to start on a mismatch. Any
+            // failure to verify aborts startup.
+            if venue.kind == VenueKind::Aerodrome && !pool.is_zero() {
+                let onchain = morpho_arbitrage_bot::dex::fetch_aerodrome_fee_bps(
+                    provider,
+                    venue.factory,
+                    venue.router,
+                    cfg.loan_token,
+                    cfg.quote_token,
+                    pool,
+                    venue.stable,
+                )
+                .await?;
+                if onchain != venue.fee_bps {
+                    eyre::bail!(
+                        "venue {idx}: Aerodrome pool {pool} charges {onchain} bps on-chain \
+                         but fee_bps is {}; fix the config (a wrong fee silently misprices \
+                         every quote from this venue)",
+                        venue.fee_bps
+                    );
+                }
+            }
             let tokens = if venue.kind == VenueKind::UniswapV3 {
                 v3_idx.push(idx);
                 v3_pairs.push(pool);

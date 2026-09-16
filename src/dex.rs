@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use std::str::FromStr;
 use tracing::{debug, warn};
 
@@ -208,6 +208,12 @@ sol! {
     #[sol(rpc)]
     interface IAerodromeFactory {
         function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
+        /// Whether this factory created (and therefore owns) `pool`. Used as
+        /// positive evidence before trusting a `getFee` reading — see
+        /// `fetch_aerodrome_fee_bps`.
+        function isPool(address pool) external view returns (bool);
+        /// Per-pool swap fee, already in basis points (100 = 1%).
+        function getFee(address pool, bool stable) external view returns (uint256);
     }
 
     #[sol(rpc)]
@@ -376,6 +382,160 @@ pub struct PoolQuery {
     pub fee_tier: u32,
 }
 
+/// Resolve the Aerodrome factory for a venue: the configured address, or the
+/// router's `defaultFactory` when the config leaves it zero.
+///
+/// Shared by [`resolve_pool`] and [`fetch_aerodrome_fee_bps`] so that pool
+/// lookup and fee validation cannot end up talking to different factories.
+pub async fn resolve_aerodrome_factory<P: Provider>(
+    provider: &P,
+    factory: Address,
+    router: Address,
+) -> Result<Address> {
+    if factory != Address::ZERO {
+        return Ok(factory);
+    }
+    IAerodromeRouter::new(router, provider)
+        .defaultFactory()
+        .call()
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "resolving the Aerodrome router {router} default factory failed; refusing \
+                 to start with an unvalidated fee_bps"
+            )
+        })
+}
+
+/// The swap fee (in basis points) the Aerodrome factory charges on `pool`.
+///
+/// V2/V3/CL venues get their fee from the pool key or the pool's own state,
+/// so a wrong config fee fails loudly (a V3 fee tier selects a different
+/// pool; a Slipstream/V3 pool reports its `fee()`). Aerodrome is the odd one
+/// out: `getPool(tokenA, tokenB, stable)` ignores the fee entirely, so
+/// `fee_bps` is purely an operator-supplied number that silently misprices
+/// the venue when wrong. Volatile pools are NOT uniformly 30 bps — the
+/// factory's `volatileFee` (30) is only the default, and individual pools
+/// can carry 100 bps (seen on WETH/VIRTUAL on Base).
+///
+/// # Only positive evidence is trusted
+///
+/// The reading and the decision to trust it are built on calls that
+/// *succeed*, never on the shape of a failure:
+///
+/// 1. `getPool(token_a, token_b, stable)` must resolve to exactly `pool` —
+///    the factory's own answer for this pair and stable class.
+/// 2. `isPool(pool)` must return `true` — the factory created this pool.
+/// 3. `getFee(pool, stable)` must return a usable rate, compared against the
+///    config.
+///
+/// Step 1 is what ties the validated fee to the pool that will actually be
+/// traded. Ownership (step 2) alone is not enough, because one factory can
+/// own both pools of a pair: WETH/VIRTUAL on Base has a volatile pool (100
+/// bps) and a stable pool (5 bps), both owned. A config that names the stable
+/// pool while `stable = false` passes an ownership-only check — the fee read
+/// would then be that of the stable pool — yet scanning calls `getPool` with
+/// `stable = false` and quotes the volatile pool while execution is handed
+/// the stable pool address. Requiring the resolution to agree with the
+/// configured pair and flag makes all three views name the same pool.
+///
+/// Step 2 keeps a factory that reports a pool address it does not own from
+/// being trusted, since `getFee` is meaningless in that case.
+///
+/// Every failure of these calls aborts startup, including a factory that
+/// cannot answer. An earlier revision tried to treat a reverting or
+/// empty-returning factory as "unsupported, keep the configured fee", which
+/// does not work: throttling is reported with the same error shape as a
+/// missing selector. A 429 surfaced as a JSON-RPC error response during this
+/// change's own testing and would have been read as "legacy fork" — silently
+/// keeping an unvalidated fee, which is precisely the mispricing this
+/// function exists to prevent. Distinguishing the two by inspecting the
+/// response is not possible in general, so the conservative reading wins:
+/// a rate this bot cannot verify is a reason to stop, not to guess.
+pub async fn fetch_aerodrome_fee_bps<P: Provider>(
+    provider: &P,
+    factory: Address,
+    router: Address,
+    token_a: Address,
+    token_b: Address,
+    pool: Address,
+    stable: bool,
+) -> Result<u64> {
+    let factory = resolve_aerodrome_factory(provider, factory, router).await?;
+    let contract = IAerodromeFactory::new(factory, provider);
+    let resolved = contract
+        .getPool(token_a, token_b, stable)
+        .call()
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "Aerodrome factory {factory} could not resolve the {token_a}/{token_b} pool \
+                 with stable={stable}; refusing to start with an unvalidated fee_bps"
+            )
+        })?;
+    if resolved == Address::ZERO {
+        return Err(eyre::eyre!(
+            "Aerodrome factory {factory} has no stable={stable} pool for {token_a}/{token_b}, \
+             so the configured pool {pool} does not belong to this pair; fix the pair, tokens \
+             or stable flag in the config"
+        ));
+    }
+    if resolved != pool {
+        return Err(eyre::eyre!(
+            "Aerodrome factory {factory} resolves {token_a}/{token_b} with stable={stable} to \
+             pool {resolved}, but the config names pool {pool}; scanning and execution would \
+             trade different pools. Fix the pair or stable flag in the config"
+        ));
+    }
+    let owns_pool = contract.isPool(pool).call().await.wrap_err_with(|| {
+        format!(
+            "Aerodrome factory {factory} cannot confirm it owns pool {pool} (isPool failed); \
+             check the factory address rather than trusting the configured fee_bps"
+        )
+    })?;
+    if !owns_pool {
+        return Err(eyre::eyre!(
+            "Aerodrome factory {factory} does not own pool {pool}; getFee would just report \
+             the factory-wide default, so the configured fee_bps cannot be validated against \
+             this pool. Fix the factory or pair address in the config"
+        ));
+    }
+    let raw = contract
+        .getFee(pool, stable)
+        .call()
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "reading getFee({pool}, {stable}) from Aerodrome factory {factory} failed; \
+             refusing to start with an unvalidated fee_bps (a transient RPC failure is \
+             not evidence the factory lacks the getter)"
+            )
+        })?;
+    // `getFee` already reports basis points, NOT the 1e6 units the pool
+    // stores internally. Verified against Base mainnet: for the
+    // WETH/VIRTUAL volatile pool it returns 100, and the canonical Aerodrome
+    // router's `getAmountsOut` for 1 WETH yields exactly the
+    // `get_amount_out` result for fee_bps = 100 (4012811088698330580287),
+    // not the 0.03% result (4041148427538663142175). A rate this bot cannot
+    // price is an error, not something to paper over: 10_000 bps (or more)
+    // would mean the pool keeps the entire input, and a value that does not
+    // fit `u64` cannot be a fee at all.
+    let bps: u64 = raw.try_into().map_err(|_| {
+        eyre::eyre!(
+            "Aerodrome factory {factory} reports getFee({pool}, {stable}) = {raw}, \
+             which is not a usable basis-point fee (>= 10_000 or unrepresentable); \
+             refusing to start"
+        )
+    })?;
+    if bps >= 10_000 {
+        return Err(eyre::eyre!(
+            "Aerodrome factory {factory} reports getFee({pool}, {stable}) = {raw} bps, \
+             which is not a usable basis-point fee (>= 10_000); refusing to start"
+        ));
+    }
+    Ok(bps)
+}
+
 /// Resolve the pool address for a token pair from a venue's factory.
 /// `factory` of zero for Aerodrome means the router's default factory
 /// (resolved on-chain).
@@ -398,14 +558,7 @@ pub async fn resolve_pool<P: Provider>(provider: &P, q: &PoolQuery) -> Result<Ad
                 .await?
         }
         VenueKind::Aerodrome => {
-            let factory = if factory == Address::ZERO {
-                IAerodromeRouter::new(router, provider)
-                    .defaultFactory()
-                    .call()
-                    .await?
-            } else {
-                factory
-            };
+            let factory = resolve_aerodrome_factory(provider, factory, router).await?;
             IAerodromeFactory::new(factory, provider)
                 .getPool(token_a, token_b, stable)
                 .call()
@@ -1060,8 +1213,131 @@ pub async fn fetch_cl_pair_tokens<P: Provider>(provider: &P, pool: Address) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{n128, quote_calldata, unsigned_tx_rlp_len, L1FeeOracle};
+    use super::{get_amount_out, n128, quote_calldata, unsigned_tx_rlp_len, L1FeeOracle};
     use alloy::primitives::{Address, U256};
+
+    /// Pins the fee units `fetch_aerodrome_fee_bps` returns against the
+    /// canonical on-chain reference. Read from Base mainnet at the WETH/VIRTUAL
+    /// volatile pool: reserves are VIRTUAL 3178595976004592429331773 and WETH
+    /// 783200919205544720468, so a 1 WETH -> VIRTUAL swap has reserve_in =
+    /// 783200919205544720468. `AerodromeFactory.getFee(pool, false)` returns
+    /// 100 and the router's `getAmountsOut(1e18)` returns
+    /// 4012811088698330580287, which matches `get_amount_out(..., 100)`
+    /// exactly. The 30 bps reading (the factory's `volatileFee` default)
+    /// yields 4041148427538663142175 instead — the value the bot used to quote.
+    #[test]
+    fn aerodrome_fee_is_basis_points_not_1e6_units() {
+        let reserve_in = U256::from(783200919205544720468u128); // WETH
+        let reserve_out = U256::from(3178595976004592429331773u128); // VIRTUAL
+        let amount_in = U256::from(10u64).pow(U256::from(18u64));
+
+        assert_eq!(
+            get_amount_out(amount_in, reserve_in, reserve_out, 100),
+            Some(U256::from(4012811088698330580287u128)),
+            "100 bps must reproduce the router's getAmountsOut result"
+        );
+        assert_ne!(
+            get_amount_out(amount_in, reserve_in, reserve_out, 30),
+            Some(U256::from(4012811088698330580287u128)),
+            "30 bps is the factory default, not this pool's fee"
+        );
+    }
+
+    /// `eth_call` results are ABI-encoded 32-byte words, so a mock response
+    /// has to be the padded word rather than the bare value.
+    fn mock_word_address(a: Address) -> alloy::primitives::Bytes {
+        alloy::primitives::Bytes::from(a.into_word().to_vec())
+    }
+
+    fn mock_word_bool(v: bool) -> alloy::primitives::Bytes {
+        let mut word = [0u8; 32];
+        word[31] = u8::from(v);
+        alloy::primitives::Bytes::from(word.to_vec())
+    }
+
+    fn mock_word_u256(v: U256) -> alloy::primitives::Bytes {
+        alloy::primitives::Bytes::from(v.to_be_bytes::<32>().to_vec())
+    }
+
+    /// One factory can own both pools of a pair, so `isPool` alone cannot
+    /// tell the two apart. Base mainnet: WETH/VIRTUAL has a volatile pool
+    /// (100 bps) and a stable pool (5 bps), both owned by the canonical
+    /// factory. A config naming the stable pool with `stable = false` used to
+    /// pass validation — the fee read came from the stable pool — while
+    /// scanning quoted the volatile pool and execution was handed the stable
+    /// address. The factory's own `getPool` answer is what pins the pair and
+    /// stable flag to the pool being validated.
+    #[tokio::test]
+    async fn aerodrome_pool_of_the_other_stable_class_is_rejected() {
+        use super::fetch_aerodrome_fee_bps;
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let factory = Address::repeat_byte(0xfa);
+        let router = Address::repeat_byte(0xf0);
+        let weth = Address::repeat_byte(0xaa);
+        let virtual_ = Address::repeat_byte(0xbb);
+        let volatile_pool = Address::repeat_byte(0xc1);
+        let stable_pool = Address::repeat_byte(0xc2);
+
+        // `getPool(weth, virtual, false)` resolves to the volatile pool, so a
+        // config naming the stable pool must be refused before any fee read.
+        let asserter = Asserter::new();
+        asserter.push_success(&mock_word_address(volatile_pool));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let err = fetch_aerodrome_fee_bps(
+            &provider,
+            factory,
+            router,
+            weth,
+            virtual_,
+            stable_pool,
+            false,
+        )
+        .await
+        .expect_err("a stable pool must not validate under stable = false");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("but the config names pool"),
+            "expected a pool-mismatch error, got: {msg}"
+        );
+    }
+
+    /// The same pool passes once the config agrees with the factory: the
+    /// mismatch above is caused by the stable flag, not by the pool itself.
+    #[tokio::test]
+    async fn aerodrome_pool_matching_the_stable_class_is_accepted() {
+        use super::fetch_aerodrome_fee_bps;
+        use alloy::providers::ProviderBuilder;
+        use alloy::transports::mock::Asserter;
+
+        let factory = Address::repeat_byte(0xfa);
+        let router = Address::repeat_byte(0xf0);
+        let weth = Address::repeat_byte(0xaa);
+        let virtual_ = Address::repeat_byte(0xbb);
+        let stable_pool = Address::repeat_byte(0xc2);
+
+        // getPool -> stable_pool, isPool -> true, getFee -> 5 bps.
+        let asserter = Asserter::new();
+        asserter.push_success(&mock_word_address(stable_pool));
+        asserter.push_success(&mock_word_bool(true));
+        asserter.push_success(&mock_word_u256(U256::from(5u64)));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let bps = fetch_aerodrome_fee_bps(
+            &provider,
+            factory,
+            router,
+            weth,
+            virtual_,
+            stable_pool,
+            true,
+        )
+        .await
+        .expect("the factory's own pool must validate");
+        assert_eq!(bps, 5);
+    }
 
     #[test]
     fn unsigned_tx_rlp_len_is_monotonic_in_calldata() {
